@@ -134,7 +134,7 @@ public final class MPVMetalSampleBufferRenderer {
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVMetalSampleBufferRendererDiagnostics) -> Void)?
 
-    private let options: MPVMetalSampleBufferRendererOptions
+    private var options: MPVMetalSampleBufferRendererOptions
     private let eventQueue = DispatchQueue(label: "mpvkit.sample-buffer.events", qos: .utility)
     private var mpv: OpaquePointer?
     private var renderContext: OpaquePointer?
@@ -317,6 +317,32 @@ public final class MPVMetalSampleBufferRenderer {
         _ = reason
         performOnMain {
             self.forceRenderBurst(count: count)
+        }
+    }
+
+    public func updateOptions(_ newOptions: MPVMetalSampleBufferRendererOptions) {
+        performOnMain {
+            guard self.options != newOptions else { return }
+            let previousMaximumFrameSize = self.options.maximumFrameSize
+            let previousPreferredFramesPerSecond = self.options.preferredFramesPerSecond
+            let previousPreferredPiPFramesPerSecond = self.options.preferredPiPFramesPerSecond
+            self.options = newOptions
+
+            if previousPreferredFramesPerSecond != newOptions.preferredFramesPerSecond
+                || previousPreferredPiPFramesPerSecond != newOptions.preferredPiPFramesPerSecond {
+                self.applyDisplayLinkFrameRate()
+            }
+
+            if previousMaximumFrameSize != newOptions.maximumFrameSize {
+                self.pixelBufferPool = nil
+                self.pixelBufferPoolAuxAttributes = nil
+                self.formatDescription = nil
+                self.poolWidth = 0
+                self.poolHeight = 0
+            }
+
+            self.forceRenderBurst(count: 6)
+            self.onDiagnostics?(self.diagnosticsSnapshot())
         }
     }
 
@@ -552,6 +578,13 @@ public final class MPVMetalSampleBufferRenderer {
     private func startDisplayLink() {
         stopDisplayLink()
         let link = CADisplayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
+        displayLink = link
+        applyDisplayLinkFrameRate()
+        link.add(to: .main, forMode: .common)
+    }
+
+    private func applyDisplayLinkFrameRate() {
+        guard let link = displayLink else { return }
         let fps = max(1, options.preferredFramesPerSecond)
         if #available(iOS 15.0, *) {
             link.preferredFrameRateRange = CAFrameRateRange(
@@ -562,8 +595,6 @@ public final class MPVMetalSampleBufferRenderer {
         } else {
             link.preferredFramesPerSecond = fps
         }
-        link.add(to: .main, forMode: .common)
-        displayLink = link
     }
 
     private func stopDisplayLink() {
@@ -1050,6 +1081,7 @@ public final class MPVMetalSampleBufferRenderer {
     public func seek(to seconds: Double) { _ = seconds }
     public func seek(by seconds: Double) { _ = seconds }
     public func primeFrames(reason: String = "manual", count: Int = 6) { _ = reason; _ = count }
+    public func updateOptions(_ newOptions: MPVMetalSampleBufferRendererOptions) { _ = newOptions }
     public func setSpeed(_ speed: Double) { _ = speed }
     public func getSpeed() -> Double { 1.0 }
     public func audioTracks() -> [MPVMetalSampleBufferTrack] { [] }
