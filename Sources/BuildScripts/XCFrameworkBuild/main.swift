@@ -390,6 +390,7 @@ private class BuildMPV: BaseBuild {
             "-Duchardet=enabled",
             "-Dvulkan=enabled",
             "-Dmoltenvk=enabled",  // from patch option
+            "-Dios-sample-buffer=enabled",
 
             "-Djavascript=disabled",
             "-Dzimg=disabled",

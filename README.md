@@ -16,6 +16,14 @@ Forked from [kingslay/FFmpegKit](https://github.com/kingslay/FFmpegKit)
 
 Metal support only a patch version ([#7857](https://github.com/mpv-player/mpv/pull/7857)) and does not officially support it yet. Encountering any issues is not strange. 
 
+## Experimental iOS sample-buffer output
+
+This fork exposes an iOS-only `MPVMetalSampleBufferRenderer` module through the `MPVKitSampleBuffer` and `MPVKitSampleBuffer-GPL` products, and also through the existing `MPVKit` / `MPVKit-GPL` products. The renderer owns an `AVSampleBufferDisplayLayer`, creates IOSurface-backed `CVPixelBuffer` frames with Metal compatibility, wraps them in `CMSampleBuffer`, and queues them for inline playback or AVKit Picture in Picture.
+
+The current bridge is intentionally conservative: it uses libmpv's sample-buffer render path into app-owned buffers and probes Metal texture compatibility. The lower-level MoltenVK offscreen render target is kept behind the `ios-sample-buffer` build option so it can be completed and validated on macOS/iPhone without breaking the existing MoltenVK layer path.
+
+Use the iOS demo app and select **Metal Sample Buffer** to smoke-test the API. Keep the existing OpenGL or MoltenVK layer renderer as fallback until device testing validates PiP start, PiP stop restore, subtitles, timing, heat, and long playback.
+
 ## Installation
 
 ### Swift Package Manager

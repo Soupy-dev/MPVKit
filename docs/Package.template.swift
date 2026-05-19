@@ -8,14 +8,48 @@ let package = Package(
     products: [
         .library(
             name: "MPVKit",
-            targets: ["_MPVKit"]
+            targets: ["_MPVKit", "MPVKitSampleBuffer"]
         ),
         .library(
             name: "MPVKit-GPL",
-            targets: ["_MPVKit-GPL"]
+            targets: ["_MPVKit-GPL", "MPVKitSampleBufferGPL"]
+        ),
+        .library(
+            name: "MPVKitSampleBuffer",
+            targets: ["MPVKitSampleBuffer"]
+        ),
+        .library(
+            name: "MPVKitSampleBuffer-GPL",
+            targets: ["MPVKitSampleBufferGPL"]
         ),
     ],
     targets: [
+        .target(
+            name: "MPVKitSampleBuffer",
+            dependencies: ["Libmpv", "_FFmpeg", "Libuchardet", "Libbluray"],
+            path: "Sources/MPVKitSampleBuffer",
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("Metal"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("UIKit", .when(platforms: [.iOS])),
+            ]
+        ),
+        .target(
+            name: "MPVKitSampleBufferGPL",
+            dependencies: ["Libmpv-GPL", "_FFmpeg-GPL", "Libuchardet", "Libbluray"],
+            path: "Sources/MPVKitSampleBufferGPL",
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("Metal"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("UIKit", .when(platforms: [.iOS])),
+            ]
+        ),
         .target(
             name: "_MPVKit",
             dependencies: [

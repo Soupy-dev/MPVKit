@@ -1,0 +1,12 @@
+diff --git forkSrcPrefix/meson.options forkDstPrefix/meson.options
+index 6ed28af20a09501b4997ca81e86bb198e75327fd..91f0f06dbe5b2dd5dc2c7f5366eec5c08a01d96a 100644
+--- forkSrcPrefix/meson.options
++++ forkDstPrefix/meson.options
+@@ -102,6 +102,7 @@ option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES int
+ option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
+ option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
+ option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
++option('ios-sample-buffer', type: 'feature', value: 'auto', description: 'iOS app-owned sample-buffer render bridge')
+ 
+ # macOS features
+ option('macos-10-15-4-features', type: 'feature', value: 'auto', description: 'macOS 10.15.4 SDK Features')

@@ -1,0 +1,143 @@
+name: Metal Sample Buffer
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_native_build:
+        description: "Build iOS and iOS simulator xcframework artifacts"
+        required: false
+        default: "false"
+      luna_repository:
+        description: "Optional owner/repo for a Luna compile smoke test"
+        required: false
+        default: ""
+      luna_ref:
+        description: "Optional Luna branch, tag, or SHA"
+        required: false
+        default: "main"
+
+jobs:
+  package-and-demo:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer || true
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Static acceptance checks
+        run: |
+          set -euo pipefail
+          test -d Sources/MPVKitSampleBuffer
+          test -d Sources/MPVKitSampleBufferGPL
+          ! grep -R -n -E 'OpenGL|GLK|EAGL|CVOpenGLESTexture' Sources/MPVKitSampleBuffer Sources/MPVKitSampleBufferGPL
+          grep -R -n 'MPVMetalSampleBufferRenderer' Sources/MPVKitSampleBuffer Sources/MPVKitSampleBufferGPL
+          grep -R -n '#if os(iOS)' Sources/MPVKitSampleBuffer Sources/MPVKitSampleBufferGPL
+          grep -R -n 'unsupportedPlatform' Sources/MPVKitSampleBuffer Sources/MPVKitSampleBufferGPL
+          test -d Demo/Demo-iOS/Demo-iOS/Player/OpenGL
+          grep -R -n 'ios-sample-buffer' Sources/BuildScripts/patch/libmpv Sources/BuildScripts/XCFrameworkBuild/main.swift
+
+      - name: Resolve demo packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Demo/Demo-iOS/Demo-iOS.xcodeproj \
+            -scheme Demo-iOS
+
+      - name: Build Demo-iOS for simulator
+        run: |
+          xcodebuild \
+            -project Demo/Demo-iOS/Demo-iOS.xcodeproj \
+            -scheme Demo-iOS \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+  native-artifacts:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_native_build == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install autoconf automake libtool ninja rename
+          python -m pip install meson==1.4.2
+
+      - name: Build LGPL iOS artifacts
+        run: |
+          make build platform=ios
+          mkdir -p artifacts/lgpl
+          cp dist/release/*.zip dist/release/Package.swift artifacts/lgpl/
+          shasum -a 256 artifacts/lgpl/*.zip artifacts/lgpl/Package.swift > artifacts/lgpl/checksums.sha256
+
+      - name: Build GPL iOS artifacts
+        run: |
+          make clean
+          make build enable-gpl platform=ios
+          mkdir -p artifacts/gpl
+          cp dist/release/*.zip dist/release/Package.swift artifacts/gpl/
+          shasum -a 256 artifacts/gpl/*.zip artifacts/gpl/Package.swift > artifacts/gpl/checksums.sha256
+
+      - name: Upload sample-buffer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpvkit-ios-sample-buffer-artifacts
+          path: |
+            artifacts/**
+          if-no-files-found: error
+
+  luna-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.luna_repository != ''
+    runs-on: macos-15
+    steps:
+      - name: Checkout MPVKit fork
+        uses: actions/checkout@v4
+        with:
+          path: MPVKit
+
+      - name: Checkout Luna
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.luna_repository }}
+          ref: ${{ inputs.luna_ref }}
+          path: Luna
+
+      - name: Point Luna at this MPVKit checkout
+        run: |
+          set -euo pipefail
+          cd Luna
+          ruby <<'RUBY'
+          path = "Luna.xcodeproj/project.pbxproj"
+          text = File.read(path)
+          text = text.gsub(%r{(\s*[A-F0-9]+ /\* XCRemoteSwiftPackageReference "MPVKit" \*/ = \{\n)\s*isa = XCRemoteSwiftPackageReference;\n\s*repositoryURL = "[^"]*/MPVKit";\n\s*requirement = \{\n\s*(?:branch = [^;]+;\n\s*)?(?:kind = [^;]+;\n\s*)?(?:minimumVersion = [^;]+;\n\s*)?\};\n\s*\};}) do
+            "#{$1}\t\t\tisa = XCLocalSwiftPackageReference;\n\t\t\trelativePath = ../MPVKit;\n\t\t};"
+          end
+          File.write(path, text)
+          RUBY
+          if [ -f Build.local.xcconfig.example ] && [ ! -f Build.local.xcconfig ]; then
+            cp Build.local.xcconfig.example Build.local.xcconfig
+          fi
+          cat >> Build.local.xcconfig <<'EOF'
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) LUNA_MPVKIT_FORK_EXPOSES_METAL_SAMPLE_BUFFER_PIP LUNA_MPVKIT_METAL_SAMPLE_BUFFER_PIP_IMPLEMENTED
+          EOF
+
+      - name: Build Luna for simulator
+        run: |
+          xcodebuild \
+            -project Luna/Luna.xcodeproj \
+            -scheme Luna \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
