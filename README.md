@@ -1,3 +1,10 @@
+MPVkit for Eclipse. Adds in better support for Eclipse needs
+
+
+
+
+
+
 # MPVKit
 
 [![mpv](https://img.shields.io/badge/mpv-v0.41.0-blue.svg)](https://github.com/mpv-player/mpv)
