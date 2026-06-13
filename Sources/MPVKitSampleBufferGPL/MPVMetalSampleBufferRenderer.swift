@@ -136,6 +136,7 @@ public final class MPVMetalSampleBufferRenderer {
 
     private var options: MPVMetalSampleBufferRendererOptions
     private let eventQueue = DispatchQueue(label: "mpvkit.sample-buffer.events", qos: .utility)
+    private let eventQueueGroup = DispatchGroup()
     private var mpv: OpaquePointer?
     private var renderContext: OpaquePointer?
     private var displayLink: CADisplayLink?
@@ -149,6 +150,7 @@ public final class MPVMetalSampleBufferRenderer {
     private var cachedDuration: Double = 0
     private var isPaused = true
     private var isRunning = false
+    private var isStopping = false
     private var isRenderScheduled = false
     private var forcedFrameCount = 0
     private var frameCount = 0
@@ -196,6 +198,7 @@ public final class MPVMetalSampleBufferRenderer {
         }
 
         guard !isRunning else { return }
+        isStopping = false
         guard metalDevice != nil else {
             throw MPVMetalSampleBufferRendererError.metalUnavailable
         }
@@ -256,6 +259,7 @@ public final class MPVMetalSampleBufferRenderer {
         }
 
         stopDisplayLink()
+        isStopping = true
         if let context = renderContext {
             mpv_render_context_set_update_callback(context, nil, nil)
             mpv_render_context_free(context)
@@ -263,6 +267,10 @@ public final class MPVMetalSampleBufferRenderer {
         }
         if let handle = mpv {
             mpv_set_wakeup_callback(handle, nil, nil)
+            mpv_wakeup(handle)
+        }
+        eventQueueGroup.wait()
+        if let handle = mpv {
             mpv_terminate_destroy(handle)
             mpv = nil
         }
@@ -270,6 +278,7 @@ public final class MPVMetalSampleBufferRenderer {
         pixelBufferPool = nil
         formatDescription = nil
         isRunning = false
+        isStopping = false
         isRenderScheduled = false
         forcedFrameCount = 0
         updateState(.stopped)
@@ -492,15 +501,18 @@ public final class MPVMetalSampleBufferRenderer {
         mpv_set_wakeup_callback(handle, { userdata in
             guard let userdata else { return }
             let renderer = Unmanaged<MPVMetalSampleBufferRenderer>.fromOpaque(userdata).takeUnretainedValue()
+            let group = renderer.eventQueueGroup
+            group.enter()
             renderer.eventQueue.async { [weak renderer] in
+                defer { group.leave() }
                 renderer?.readEvents()
             }
         }, Unmanaged.passUnretained(self).toOpaque())
     }
 
     private func readEvents() {
-        guard let handle = mpv else { return }
-        while true {
+        guard let handle = mpv, !isStopping else { return }
+        while !isStopping {
             guard let eventPointer = mpv_wait_event(handle, 0) else { break }
             let event = eventPointer.pointee
             if event.event_id == MPV_EVENT_NONE {
@@ -904,11 +916,18 @@ public final class MPVMetalSampleBufferRenderer {
 
     private func updateHTTPHeaders(_ headers: [String: String]?) {
         guard let headers, !headers.isEmpty else {
-            setOption("http-header-fields", "")
+            clearProperty("http-header-fields")
             return
         }
-        let headerValue = headers.map { "\($0.key): \($0.value)" }.joined(separator: ",")
-        setOption("http-header-fields", headerValue)
+        let headerValue = headers
+            .filter { !$0.key.isEmpty && !$0.value.isEmpty }
+            .map { "\($0.key): \($0.value)" }
+            .joined(separator: "\r\n")
+        if headerValue.isEmpty {
+            clearProperty("http-header-fields")
+        } else {
+            setStringProperty("http-header-fields", headerValue)
+        }
     }
 
     private func updateState(_ newState: MPVMetalSampleBufferRendererState) {
@@ -940,15 +959,22 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
+    private func clearProperty(_ name: String) {
+        guard let handle = mpv else { return }
+        _ = name.withCString { namePointer in
+            mpv_set_property(handle, namePointer, MPV_FORMAT_NONE, nil)
+        }
+    }
+
     private func setFlagProperty(_ name: String, _ value: Bool) {
         guard let handle = mpv else { return }
-        var data: Int = value ? 1 : 0
+        var data: Int32 = value ? 1 : 0
         _ = name.withCString { mpv_set_property(handle, $0, MPV_FORMAT_FLAG, &data) }
     }
 
     private func getFlagProperty(_ name: String) -> Bool {
         guard let handle = mpv else { return false }
-        var data: Int64 = 0
+        var data: Int32 = 0
         _ = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_FLAG, &data) }
         return data != 0
     }
