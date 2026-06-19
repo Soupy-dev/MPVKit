@@ -16,6 +16,7 @@ public enum MPVMetalSampleBufferRendererState: Equatable {
 }
 
 public enum MPVMetalSampleBufferPresentationBackend: String, Equatable {
+    case metalHighBitDepthHDRIOSurface
     case metalHDRIOSurface
     case metalIOSurface
     case softwareIOSurface
@@ -28,6 +29,7 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
     public var createsMetalCompatibilityProbe: Bool
     public var prefersMetalPresentation: Bool
     public var prefersHDRPresentation: Bool
+    public var prefersHighBitDepthRendering: Bool
 
     public init(
         maximumFrameSize: CGSize = CGSize(width: 1280, height: 720),
@@ -35,7 +37,8 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
         preferredPiPFramesPerSecond: Int = 24,
         createsMetalCompatibilityProbe: Bool = true,
         prefersMetalPresentation: Bool = true,
-        prefersHDRPresentation: Bool = true
+        prefersHDRPresentation: Bool = true,
+        prefersHighBitDepthRendering: Bool = true
     ) {
         self.maximumFrameSize = maximumFrameSize
         self.preferredFramesPerSecond = preferredFramesPerSecond
@@ -43,6 +46,7 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
         self.createsMetalCompatibilityProbe = createsMetalCompatibilityProbe
         self.prefersMetalPresentation = prefersMetalPresentation
         self.prefersHDRPresentation = prefersHDRPresentation
+        self.prefersHighBitDepthRendering = prefersHighBitDepthRendering
     }
 }
 
@@ -71,6 +75,9 @@ public struct MPVMetalSampleBufferRendererDiagnostics: Equatable {
     public let metalPresentationFrameCount: Int
     public let metalPresentationFailureCount: Int
     public let pixelFormatDescription: String
+    public let sourcePixelFormatDescription: String
+    public let highBitDepthRenderingActive: Bool
+    public let highBitDepthRenderingFailureCount: Int
     public let hdrMetadataApplied: Bool
     public let videoColorPrimaries: String
     public let videoTransferFunction: String
@@ -137,6 +144,7 @@ public enum MPVMetalSampleBufferRendererError: Error, LocalizedError, Equatable 
 }
 
 #if os(iOS)
+import Darwin
 import Libmpv
 import Metal
 import QuartzCore
@@ -189,18 +197,24 @@ public final class MPVMetalSampleBufferRenderer {
     private var metalCommandQueue: MTLCommandQueue?
     private var metalTextureCache: CVMetalTextureCache?
     private var hdrConversionPipeline: MTLComputePipelineState?
+    private var highBitDepthConversionPipeline: MTLComputePipelineState?
     private var metalCompatibilityProbeSucceeded = false
     private var presentationBackend: MPVMetalSampleBufferPresentationBackend = .softwareIOSurface
     private var lastPixelFormatDescription = "BGRA8"
+    private var lastSourcePixelFormatDescription = "bgr0/BGRA8"
     private var lastPixelFormatType = kCVPixelFormatType_32BGRA
     private var hdrMetadataApplied = false
     private var hdrPresentationDisabled = false
+    private var highBitDepthRenderingDisabled = false
+    private var highBitDepthRenderingActive = false
+    private var highBitDepthRenderingFailureCount = 0
     private var formatDescriptionMetadataSignature = ""
     private var videoColorPrimaries = ""
     private var videoTransferFunction = ""
     private var videoYCbCrMatrix = ""
     private var videoSignalPeak: Double = 0
     private var swFormat = Array("bgr0".utf8CString)
+    private var highBitDepthSwFormat = Array("rgba64".utf8CString)
 
     public init(
         displayLayer: AVSampleBufferDisplayLayer,
@@ -251,11 +265,13 @@ public final class MPVMetalSampleBufferRenderer {
         setOption("idle", "yes")
         setOption("keep-open", "yes")
         setOption("vo", "libmpv")
-        setOption("profile", "fast")
+        setOption("profile", options.prefersHighBitDepthRendering ? "high-quality" : "fast")
         setOption("hwdec", "videotoolbox-copy")
         setOption("vd-lavc-dr", "no")
         setOption("video-sync", "audio")
         setOption("framedrop", "vo")
+        setOption("dither-depth", "auto")
+        setOption("target-colorspace-hint", "yes")
         setOption("sub-auto", "fuzzy")
         setOption("subs-fallback", "yes")
         setOption("sub-ass-override", "yes")
@@ -320,8 +336,11 @@ public final class MPVMetalSampleBufferRenderer {
         hdrPresentationDisabled = false
         formatDescriptionMetadataSignature = ""
         lastPixelFormatDescription = "BGRA8"
+        lastSourcePixelFormatDescription = "bgr0/BGRA8"
         lastPixelFormatType = kCVPixelFormatType_32BGRA
         hdrMetadataApplied = false
+        highBitDepthRenderingDisabled = false
+        highBitDepthRenderingActive = false
         updateState(.stopped)
     }
 
@@ -377,6 +396,7 @@ public final class MPVMetalSampleBufferRenderer {
             let previousPreferredFramesPerSecond = self.options.preferredFramesPerSecond
             let previousPreferredPiPFramesPerSecond = self.options.preferredPiPFramesPerSecond
             let previousPrefersHDRPresentation = self.options.prefersHDRPresentation
+            let previousPrefersHighBitDepthRendering = self.options.prefersHighBitDepthRendering
             self.options = newOptions
 
             if previousPreferredFramesPerSecond != newOptions.preferredFramesPerSecond
@@ -391,8 +411,11 @@ public final class MPVMetalSampleBufferRenderer {
                 self.poolWidth = 0
                 self.poolHeight = 0
             }
-            if previousPrefersHDRPresentation != newOptions.prefersHDRPresentation {
+            if previousPrefersHDRPresentation != newOptions.prefersHDRPresentation
+                || previousPrefersHighBitDepthRendering != newOptions.prefersHighBitDepthRendering {
                 self.hdrPresentationDisabled = false
+                self.highBitDepthRenderingDisabled = false
+                self.highBitDepthRenderingActive = false
                 self.formatDescription = nil
                 self.formatDescriptionMetadataSignature = ""
             }
@@ -498,11 +521,14 @@ public final class MPVMetalSampleBufferRenderer {
             metalPresentationFrameCount: metalPresentationFrameCount,
             metalPresentationFailureCount: metalPresentationFailureCount,
             pixelFormatDescription: lastPixelFormatDescription,
+            sourcePixelFormatDescription: lastSourcePixelFormatDescription,
+            highBitDepthRenderingActive: highBitDepthRenderingActive,
+            highBitDepthRenderingFailureCount: highBitDepthRenderingFailureCount,
             hdrMetadataApplied: hdrMetadataApplied,
             videoColorPrimaries: videoColorPrimaries,
             videoTransferFunction: videoTransferFunction,
             videoSignalPeak: videoSignalPeak,
-            renderAPI: "libmpv-\(MPV_RENDER_API_TYPE_SW)",
+            renderAPI: "libmpv-\(MPV_RENDER_API_TYPE_SW):\(lastSourcePixelFormatDescription)",
             backendDescription: backendDescription()
         )
     }
@@ -740,6 +766,15 @@ public final class MPVMetalSampleBufferRenderer {
             recreatePixelBufferPool(width: width, height: height)
         }
 
+        if shouldUseHighBitDepthRendering,
+           renderHighBitDepthFrame(context: context, width: width, height: height) {
+            return
+        }
+
+        renderBGRAFrame(context: context, width: width, height: height)
+    }
+
+    private func renderBGRAFrame(context: OpaquePointer, width: Int, height: Int) {
         guard let buffer = makePixelBuffer(width: width, height: height) else {
             allocationFailureCount += 1
             return
@@ -783,6 +818,8 @@ public final class MPVMetalSampleBufferRenderer {
             return
         }
 
+        highBitDepthRenderingActive = false
+        lastSourcePixelFormatDescription = "bgr0/BGRA8"
         probeMetalCompatibility(buffer: buffer, width: width, height: height)
         let presentationBuffer = makeMetalPresentationBuffer(from: buffer, width: width, height: height) ?? buffer
         if !enqueue(buffer: presentationBuffer), presentationBuffer !== buffer {
@@ -790,6 +827,83 @@ public final class MPVMetalSampleBufferRenderer {
             presentationBackend = .metalIOSurface
             _ = enqueue(buffer: buffer)
         }
+    }
+
+    private func renderHighBitDepthFrame(context: OpaquePointer, width: Int, height: Int) -> Bool {
+        guard options.prefersMetalPresentation,
+              let cache = metalTextureCache,
+              let commandQueue = metalCommandQueue else {
+            return false
+        }
+
+        let bytesPerPixel = MemoryLayout<UInt16>.size * 4
+        let stride = alignedBytesPerRow(width: width, bytesPerPixel: bytesPerPixel)
+        let byteCount = stride * height
+        var rawPointer: UnsafeMutableRawPointer?
+        guard posix_memalign(&rawPointer, 64, byteCount) == 0, let baseAddress = rawPointer else {
+            allocationFailureCount += 1
+            highBitDepthRenderingFailureCount += 1
+            return false
+        }
+        defer { free(baseAddress) }
+        memset(baseAddress, 0, byteCount)
+
+        var result: Int32 = -1
+        var size = [Int32(width), Int32(height)]
+        var strideValue = stride
+        result = size.withUnsafeMutableBufferPointer { sizePointer in
+            highBitDepthSwFormat.withUnsafeMutableBufferPointer { formatPointer in
+                withUnsafeMutablePointer(to: &strideValue) { stridePointer in
+                    var params = [
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE, data: UnsafeMutableRawPointer(sizePointer.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT, data: UnsafeMutableRawPointer(formatPointer.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE, data: UnsafeMutableRawPointer(stridePointer)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER, data: baseAddress),
+                        mpv_render_param()
+                    ]
+                    return params.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                        guard let baseAddress = buffer.baseAddress else { return -1 }
+                        return mpv_render_context_render(context, baseAddress)
+                    }
+                }
+            }
+        }
+        lastRenderStatus = result
+        guard result >= 0 else {
+            highBitDepthRenderingDisabled = true
+            highBitDepthRenderingActive = false
+            highBitDepthRenderingFailureCount += 1
+            reportError("sample-buffer rgba64 render failed status=\(result)")
+            return false
+        }
+
+        guard let presentationBuffer = makeHighBitDepthHDRPresentationBuffer(
+            sourceBaseAddress: baseAddress,
+            sourceStride: stride,
+            width: width,
+            height: height,
+            cache: cache,
+            commandQueue: commandQueue
+        ) else {
+            highBitDepthRenderingDisabled = true
+            highBitDepthRenderingActive = false
+            highBitDepthRenderingFailureCount += 1
+            return false
+        }
+
+        highBitDepthRenderingActive = true
+        lastSourcePixelFormatDescription = "rgba64/RGBA16"
+        presentationBackend = .metalHighBitDepthHDRIOSurface
+        metalPresentationFrameCount += 1
+        if enqueue(buffer: presentationBuffer) {
+            return true
+        }
+
+        hdrPresentationDisabled = true
+        highBitDepthRenderingDisabled = true
+        highBitDepthRenderingActive = false
+        highBitDepthRenderingFailureCount += 1
+        return false
     }
 
     private func currentTargetSize() -> CGSize? {
@@ -913,6 +1027,11 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
+    private func alignedBytesPerRow(width: Int, bytesPerPixel: Int, alignment: Int = 64) -> Int {
+        let rowBytes = width * bytesPerPixel
+        return ((rowBytes + alignment - 1) / alignment) * alignment
+    }
+
     private func makeMetalPresentationBuffer(from sourceBuffer: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
         guard options.prefersMetalPresentation,
               let cache = metalTextureCache,
@@ -1009,6 +1128,15 @@ public final class MPVMetalSampleBufferRenderer {
         options.prefersHDRPresentation && !hdrPresentationDisabled && streamLooksHDR
     }
 
+    private var shouldUseHighBitDepthRendering: Bool {
+        shouldUseHDRPresentation
+            && options.prefersHighBitDepthRendering
+            && !highBitDepthRenderingDisabled
+            && options.prefersMetalPresentation
+            && metalTextureCache != nil
+            && metalCommandQueue != nil
+    }
+
     private var streamLooksHDR: Bool {
         let transfer = videoTransferFunction.lowercased()
         let primaries = videoColorPrimaries.lowercased()
@@ -1102,6 +1230,79 @@ public final class MPVMetalSampleBufferRenderer {
         return destinationBuffer
     }
 
+    private func makeHighBitDepthHDRPresentationBuffer(
+        sourceBaseAddress: UnsafeRawPointer,
+        sourceStride: Int,
+        width: Int,
+        height: Int,
+        cache: CVMetalTextureCache,
+        commandQueue: MTLCommandQueue
+    ) -> CVPixelBuffer? {
+        guard let pipeline = highBitDepthConversionPipeline ?? makeHighBitDepthConversionPipeline(),
+              let sourceBuffer = metalDevice?.makeBuffer(
+                bytes: sourceBaseAddress,
+                length: sourceStride * height,
+                options: .storageModeShared
+              ),
+              let destinationBuffer = makePixelBuffer(
+                width: width,
+                height: height,
+                pixelFormat: kCVPixelFormatType_64RGBAHalf,
+                usesPool: false
+              ) else {
+            metalPresentationFailureCount += 1
+            return nil
+        }
+        highBitDepthConversionPipeline = pipeline
+
+        var destinationTextureRef: CVMetalTexture?
+        let destinationStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            destinationBuffer,
+            nil,
+            .rgba16Float,
+            width,
+            height,
+            0,
+            &destinationTextureRef
+        )
+        var sourceStridePixels = UInt32(sourceStride / MemoryLayout<UInt16>.size / 4)
+        guard destinationStatus == kCVReturnSuccess,
+              let destinationTextureRef,
+              let destinationTexture = CVMetalTextureGetTexture(destinationTextureRef),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            metalPresentationFailureCount += 1
+            CVMetalTextureCacheFlush(cache, 0)
+            return nil
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(sourceBuffer, offset: 0, index: 0)
+        encoder.setBytes(&sourceStridePixels, length: MemoryLayout<UInt32>.size, index: 1)
+        encoder.setTexture(destinationTexture, index: 0)
+        let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
+        let threadgroups = MTLSize(
+            width: (width + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+            height: (height + threadsPerThreadgroup.height - 1) / threadsPerThreadgroup.height,
+            depth: 1
+        )
+        encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        CVMetalTextureCacheFlush(cache, 0)
+
+        guard commandBuffer.status == .completed else {
+            metalPresentationFailureCount += 1
+            reportError("High-bit-depth HDR Metal presentation conversion failed status=\(commandBuffer.status.rawValue)")
+            return nil
+        }
+
+        return destinationBuffer
+    }
+
     private func makeHDRConversionPipeline() -> MTLComputePipelineState? {
         guard let metalDevice else { return nil }
         let source = """
@@ -1132,8 +1333,42 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
+    private func makeHighBitDepthConversionPipeline() -> MTLComputePipelineState? {
+        guard let metalDevice else { return nil }
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void mpvkit_rgba64_to_rgba16f(
+            const device ushort4 *sourcePixels [[buffer(0)]],
+            constant uint &sourceStridePixels [[buffer(1)]],
+            texture2d<half, access::write> destinationTexture [[texture(0)]],
+            uint2 gid [[thread_position_in_grid]]
+        ) {
+            if (gid.x >= destinationTexture.get_width() || gid.y >= destinationTexture.get_height()) {
+                return;
+            }
+            ushort4 rawColor = sourcePixels[gid.y * sourceStridePixels + gid.x];
+            float4 color = float4(rawColor) / 65535.0;
+            destinationTexture.write(half4(color), gid);
+        }
+        """
+        do {
+            let library = try metalDevice.makeLibrary(source: source, options: nil)
+            guard let function = library.makeFunction(name: "mpvkit_rgba64_to_rgba16f") else {
+                return nil
+            }
+            return try metalDevice.makeComputePipelineState(function: function)
+        } catch {
+            reportError("High-bit-depth HDR Metal presentation pipeline failed: \(error)")
+            return nil
+        }
+    }
+
     private func backendDescription() -> String {
         switch presentationBackend {
+        case .metalHighBitDepthHDRIOSurface:
+            return "libmpv sample-buffer renderer with rgba64 source and Metal RGBA16F IOSurface HDR presentation"
         case .metalHDRIOSurface:
             return "libmpv sample-buffer renderer with HDR-capable Metal RGBA16F IOSurface presentation"
         case .metalIOSurface:
@@ -1587,6 +1822,9 @@ public final class MPVMetalSampleBufferRenderer {
             metalPresentationFrameCount: 0,
             metalPresentationFailureCount: 0,
             pixelFormatDescription: "unsupported",
+            sourcePixelFormatDescription: "unsupported",
+            highBitDepthRenderingActive: false,
+            highBitDepthRenderingFailureCount: 0,
             hdrMetadataApplied: false,
             videoColorPrimaries: "",
             videoTransferFunction: "",
