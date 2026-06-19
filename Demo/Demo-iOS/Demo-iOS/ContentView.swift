@@ -6,7 +6,7 @@ import UIKit
 
 struct ContentView: View {
     @ObservedObject var coordinator = MPVMetalPlayerView.Coordinator()
-    @ObservedObject var sampleBufferCoordinator = MetalSampleBufferPlayerView.Coordinator()
+    @ObservedObject fileprivate var sampleBufferCoordinator = MetalSampleBufferPlayerView.Coordinator()
     @State var loading = false
     @State private var mode: DemoMode = .metalLayer
 

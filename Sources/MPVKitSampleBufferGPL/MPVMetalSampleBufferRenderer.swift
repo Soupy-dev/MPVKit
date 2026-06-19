@@ -704,16 +704,18 @@ public final class MPVMetalSampleBufferRenderer {
             var stride = CVPixelBufferGetBytesPerRow(buffer)
             result = size.withUnsafeMutableBufferPointer { sizePointer in
                 swFormat.withUnsafeMutableBufferPointer { formatPointer in
-                    var params = [
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE, data: UnsafeMutableRawPointer(sizePointer.baseAddress)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT, data: UnsafeMutableRawPointer(formatPointer.baseAddress)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE, data: UnsafeMutableRawPointer(&stride)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER, data: baseAddress),
-                        mpv_render_param()
-                    ]
-                    return params.withUnsafeMutableBufferPointer { buffer -> Int32 in
-                        guard let baseAddress = buffer.baseAddress else { return -1 }
-                        return mpv_render_context_render(context, baseAddress)
+                    withUnsafeMutablePointer(to: &stride) { stridePointer in
+                        var params = [
+                            mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE, data: UnsafeMutableRawPointer(sizePointer.baseAddress)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT, data: UnsafeMutableRawPointer(formatPointer.baseAddress)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE, data: UnsafeMutableRawPointer(stridePointer)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER, data: baseAddress),
+                            mpv_render_param()
+                        ]
+                        return params.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                            guard let baseAddress = buffer.baseAddress else { return -1 }
+                            return mpv_render_context_render(context, baseAddress)
+                        }
                     }
                 }
             }
