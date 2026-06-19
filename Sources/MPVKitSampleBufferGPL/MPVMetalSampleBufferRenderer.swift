@@ -15,22 +15,30 @@ public enum MPVMetalSampleBufferRendererState: Equatable {
     case failed(String)
 }
 
+public enum MPVMetalSampleBufferPresentationBackend: String, Equatable {
+    case metalIOSurface
+    case softwareIOSurface
+}
+
 public struct MPVMetalSampleBufferRendererOptions: Equatable {
     public var maximumFrameSize: CGSize
     public var preferredFramesPerSecond: Int
     public var preferredPiPFramesPerSecond: Int
     public var createsMetalCompatibilityProbe: Bool
+    public var prefersMetalPresentation: Bool
 
     public init(
         maximumFrameSize: CGSize = CGSize(width: 1280, height: 720),
         preferredFramesPerSecond: Int = 30,
         preferredPiPFramesPerSecond: Int = 24,
-        createsMetalCompatibilityProbe: Bool = true
+        createsMetalCompatibilityProbe: Bool = true,
+        prefersMetalPresentation: Bool = true
     ) {
         self.maximumFrameSize = maximumFrameSize
         self.preferredFramesPerSecond = preferredFramesPerSecond
         self.preferredPiPFramesPerSecond = preferredPiPFramesPerSecond
         self.createsMetalCompatibilityProbe = createsMetalCompatibilityProbe
+        self.prefersMetalPresentation = prefersMetalPresentation
     }
 }
 
@@ -55,6 +63,9 @@ public struct MPVMetalSampleBufferRendererDiagnostics: Equatable {
     public let displayLayerStatus: String
     public let displayLayerReadyForMoreMediaData: Bool
     public let metalCompatibilityProbeSucceeded: Bool
+    public let presentationBackend: MPVMetalSampleBufferPresentationBackend
+    public let metalPresentationFrameCount: Int
+    public let metalPresentationFailureCount: Int
     public let backendDescription: String
 }
 
@@ -158,13 +169,17 @@ public final class MPVMetalSampleBufferRenderer {
     private var renderFailureCount = 0
     private var allocationFailureCount = 0
     private var enqueueFailureCount = 0
+    private var metalPresentationFrameCount = 0
+    private var metalPresentationFailureCount = 0
     private var lastRenderStatus: Int32 = 0
     private var lastFrameSize: CGSize = .zero
     private var lastPresentationTime: Double = 0
     private var state: MPVMetalSampleBufferRendererState = .idle
     private var metalDevice: MTLDevice?
+    private var metalCommandQueue: MTLCommandQueue?
     private var metalTextureCache: CVMetalTextureCache?
     private var metalCompatibilityProbeSucceeded = false
+    private var presentationBackend: MPVMetalSampleBufferPresentationBackend = .softwareIOSurface
     private var swFormat = Array("bgr0".utf8CString)
 
     public init(
@@ -176,6 +191,7 @@ public final class MPVMetalSampleBufferRenderer {
         self.metalDevice = MTLCreateSystemDefaultDevice()
         configureDisplayLayer()
         if let metalDevice {
+            metalCommandQueue = metalDevice.makeCommandQueue()
             var cache: CVMetalTextureCache?
             if CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, metalDevice, nil, &cache) == kCVReturnSuccess {
                 metalTextureCache = cache
@@ -447,7 +463,10 @@ public final class MPVMetalSampleBufferRenderer {
             displayLayerStatus: statusName,
             displayLayerReadyForMoreMediaData: displayLayer.isReadyForMoreMediaData,
             metalCompatibilityProbeSucceeded: metalCompatibilityProbeSucceeded,
-            backendDescription: "libmpv software renderer into Metal-compatible IOSurface sample buffers"
+            presentationBackend: presentationBackend,
+            metalPresentationFrameCount: metalPresentationFrameCount,
+            metalPresentationFailureCount: metalPresentationFailureCount,
+            backendDescription: backendDescription()
         )
     }
 
@@ -673,30 +692,35 @@ public final class MPVMetalSampleBufferRenderer {
             return
         }
 
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else {
+        let lockStatus = CVPixelBufferLockBaseAddress(buffer, [])
+        guard lockStatus == kCVReturnSuccess else {
             allocationFailureCount += 1
+            reportError("pixel buffer lock failed status=\(lockStatus)")
             return
         }
-
-        var size = [Int32(width), Int32(height)]
-        var stride = CVPixelBufferGetBytesPerRow(buffer)
-        let result = size.withUnsafeMutableBufferPointer { sizePointer in
-            swFormat.withUnsafeMutableBufferPointer { formatPointer in
-                var params = [
-                    mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE, data: UnsafeMutableRawPointer(sizePointer.baseAddress)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT, data: UnsafeMutableRawPointer(formatPointer.baseAddress)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE, data: UnsafeMutableRawPointer(&stride)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER, data: baseAddress),
-                    mpv_render_param()
-                ]
-                return params.withUnsafeMutableBufferPointer { buffer -> Int32 in
-                    guard let baseAddress = buffer.baseAddress else { return -1 }
-                    return mpv_render_context_render(context, baseAddress)
+        let result: Int32
+        if let baseAddress = CVPixelBufferGetBaseAddress(buffer) {
+            var size = [Int32(width), Int32(height)]
+            var stride = CVPixelBufferGetBytesPerRow(buffer)
+            result = size.withUnsafeMutableBufferPointer { sizePointer in
+                swFormat.withUnsafeMutableBufferPointer { formatPointer in
+                    var params = [
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE, data: UnsafeMutableRawPointer(sizePointer.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT, data: UnsafeMutableRawPointer(formatPointer.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE, data: UnsafeMutableRawPointer(&stride)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER, data: baseAddress),
+                        mpv_render_param()
+                    ]
+                    return params.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                        guard let baseAddress = buffer.baseAddress else { return -1 }
+                        return mpv_render_context_render(context, baseAddress)
+                    }
                 }
             }
+        } else {
+            result = -1
         }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
         lastRenderStatus = result
         guard result >= 0 else {
             renderFailureCount += 1
@@ -705,7 +729,8 @@ public final class MPVMetalSampleBufferRenderer {
         }
 
         probeMetalCompatibility(buffer: buffer, width: width, height: height)
-        enqueue(buffer: buffer)
+        let presentationBuffer = makeMetalPresentationBuffer(from: buffer, width: width, height: height) ?? buffer
+        enqueue(buffer: presentationBuffer)
     }
 
     private func currentTargetSize() -> CGSize? {
@@ -799,6 +824,90 @@ public final class MPVMetalSampleBufferRenderer {
         metalCompatibilityProbeSucceeded = status == kCVReturnSuccess && texture != nil
         if status == kCVReturnSuccess {
             CVMetalTextureCacheFlush(cache, 0)
+        }
+    }
+
+    private func makeMetalPresentationBuffer(from sourceBuffer: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
+        guard options.prefersMetalPresentation,
+              let cache = metalTextureCache,
+              let commandQueue = metalCommandQueue,
+              let destinationBuffer = makePixelBuffer(width: width, height: height) else {
+            presentationBackend = .softwareIOSurface
+            return nil
+        }
+
+        var sourceTextureRef: CVMetalTexture?
+        var destinationTextureRef: CVMetalTexture?
+        let sourceStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            sourceBuffer,
+            nil,
+            .bgra8Unorm,
+            width,
+            height,
+            0,
+            &sourceTextureRef
+        )
+        let destinationStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            destinationBuffer,
+            nil,
+            .bgra8Unorm,
+            width,
+            height,
+            0,
+            &destinationTextureRef
+        )
+        guard sourceStatus == kCVReturnSuccess,
+              destinationStatus == kCVReturnSuccess,
+              let sourceTextureRef,
+              let destinationTextureRef,
+              let sourceTexture = CVMetalTextureGetTexture(sourceTextureRef),
+              let destinationTexture = CVMetalTextureGetTexture(destinationTextureRef),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            metalPresentationFailureCount += 1
+            presentationBackend = .softwareIOSurface
+            CVMetalTextureCacheFlush(cache, 0)
+            return nil
+        }
+
+        blitEncoder.copy(
+            from: sourceTexture,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: MTLSize(width: width, height: height, depth: 1),
+            to: destinationTexture,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        )
+        blitEncoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        CVMetalTextureCacheFlush(cache, 0)
+
+        guard commandBuffer.status == .completed else {
+            metalPresentationFailureCount += 1
+            presentationBackend = .softwareIOSurface
+            reportError("Metal presentation blit failed status=\(commandBuffer.status.rawValue)")
+            return nil
+        }
+
+        presentationBackend = .metalIOSurface
+        metalPresentationFrameCount += 1
+        return destinationBuffer
+    }
+
+    private func backendDescription() -> String {
+        switch presentationBackend {
+        case .metalIOSurface:
+            return "libmpv sample-buffer renderer with Metal-backed IOSurface presentation"
+        case .softwareIOSurface:
+            return "libmpv sample-buffer renderer with software IOSurface presentation"
         }
     }
 
@@ -1138,6 +1247,9 @@ public final class MPVMetalSampleBufferRenderer {
             displayLayerStatus: "unsupported",
             displayLayerReadyForMoreMediaData: false,
             metalCompatibilityProbeSucceeded: false,
+            presentationBackend: .softwareIOSurface,
+            metalPresentationFrameCount: 0,
+            metalPresentationFailureCount: 0,
             backendDescription: "unsupported"
         )
     }

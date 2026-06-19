@@ -20,7 +20,7 @@ Metal support only a patch version ([#7857](https://github.com/mpv-player/mpv/pu
 
 This fork exposes an iOS-only `MPVMetalSampleBufferRenderer` module through the `MPVKitSampleBuffer` and `MPVKitSampleBuffer-GPL` products, and also through the existing `MPVKit` / `MPVKit-GPL` products. The renderer owns an `AVSampleBufferDisplayLayer`, creates IOSurface-backed `CVPixelBuffer` frames with Metal compatibility, wraps them in `CMSampleBuffer`, and queues them for inline playback or AVKit Picture in Picture.
 
-The current bridge is intentionally conservative: it uses libmpv's sample-buffer render path into app-owned buffers and probes Metal texture compatibility. The lower-level MoltenVK offscreen render target is kept behind the `ios-sample-buffer` build option so it can be completed and validated on macOS/iPhone without breaking the existing MoltenVK layer path.
+The current bridge is GPU-presented by default: it renders libmpv frames into app-owned IOSurface buffers, creates Metal textures from those buffers, and blits into a fresh Metal-backed IOSurface before enqueueing the sample buffer. Diagnostics expose whether the active presentation backend is `metalIOSurface` or `softwareIOSurface`, plus Metal presentation frame/failure counts, so host apps can prove that PiP is using the Metal-backed path and fall back deliberately when a device cannot provide the required Metal pieces.
 
 Use the iOS demo app and select **Metal Sample Buffer** to smoke-test the API. Keep the existing OpenGL or MoltenVK layer renderer as fallback until device testing validates PiP start, PiP stop restore, subtitles, timing, heat, and long playback.
 
