@@ -127,43 +127,43 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libmpv-GPL.xcframework.zip",
-            checksum: "6fae3e1447e7ebf5154359128d4ab53f31bc1d95c853d70f02791a15a12b01c7"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libmpv-GPL.xcframework.zip",
+            checksum: "985c26349a0a15e73d9a8a284f9ab19e2d75a030db05a1bee92e153c6dd77cbd"
         ),
         .binaryTarget(
             name: "Libavcodec-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavcodec-GPL.xcframework.zip",
-            checksum: "a2187dc2921a9ebc44e2b4537d7be4eda84a124026dbefddc248699d4cfbb54b"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavcodec-GPL.xcframework.zip",
+            checksum: "f6d976ca88ef35a83b36496c85dbc3913ec031574766aecb07fe279f61fbb4bc"
         ),
         .binaryTarget(
             name: "Libavdevice-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavdevice-GPL.xcframework.zip",
-            checksum: "6327be0e2e173c6c57862f9b7ac4296ca8ed99c1535c3731174b4eb3fea014de"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavdevice-GPL.xcframework.zip",
+            checksum: "cc4647f73949a8d5ef88f15f30615c7b547dffd872035e26e4c14482560c1532"
         ),
         .binaryTarget(
             name: "Libavformat-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavformat-GPL.xcframework.zip",
-            checksum: "92e0148091c4d5829c0b943a76a7b91e23ee086f8e7b97f4cbcd7bbc67517763"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavformat-GPL.xcframework.zip",
+            checksum: "afcbaad8481d8588ca3f4170dc5e64b97099cc6f5257fe18d4b84a38fa1931b5"
         ),
         .binaryTarget(
             name: "Libavfilter-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavfilter-GPL.xcframework.zip",
-            checksum: "82001a918cc1bc3850c201900ec8bbaed8143c13ca9f5653236d0482d5827404"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavfilter-GPL.xcframework.zip",
+            checksum: "58d07d98e33d150ea0a64f9a27f297520b819909b6b791a21a75c5af558eec66"
         ),
         .binaryTarget(
             name: "Libavutil-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavutil-GPL.xcframework.zip",
-            checksum: "c4465991d53b93cc4b316c17601c72013fd6b714bfed3f5023528bb219faaf3c"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavutil-GPL.xcframework.zip",
+            checksum: "730724bf6c8d7c3cacc576c3977852a9c7f6b12b2658b4c7e5468d9df33d8b58"
         ),
         .binaryTarget(
             name: "Libswresample-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libswresample-GPL.xcframework.zip",
-            checksum: "0e780331d62d9a3b1179fb33f2a9a08b3ff10f4706d3f1d29c0329da5bf2a6f9"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libswresample-GPL.xcframework.zip",
+            checksum: "6ffdb3b209f47c287ad47648f6e73f8796acadb4563e0b05eadd313ee53c497e"
         ),
         .binaryTarget(
             name: "Libswscale-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libswscale-GPL.xcframework.zip",
-            checksum: "81929c31ad373d46966449846d328b9d14057ebc9972cae6faa1670a5725d843"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libswscale-GPL.xcframework.zip",
+            checksum: "8ff2842c92009723338f46c12a0f8ec9a8bdcc89d78bc38b79a3dea148293038"
         ),
         //AUTO_GENERATE_TARGETS_BEGIN//
 
@@ -287,38 +287,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavcodec.xcframework.zip",
-            checksum: "f18473c565d5b035d4c6e6c918c13612ec603a1d084910ec46d42776b4fb4490"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavcodec.xcframework.zip",
+            checksum: "60562215124988920dab8112514c100f01d3957fdddd9d1920747d72baf5e434"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavdevice.xcframework.zip",
-            checksum: "01aa8a5d324c76eff80a395c65f037091de771bb557ed3072dd1117637fce7cc"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavdevice.xcframework.zip",
+            checksum: "a4198aef5412970eb8515d244fe3ade6f6da13f88755daf5bdb30c0164b9af84"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavformat.xcframework.zip",
-            checksum: "01b54b91da8d7ed90ce68646a774fa8dc59dde7d6a7623f482f43d7945aec749"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavformat.xcframework.zip",
+            checksum: "772e02348db09763bf96188cfaaadbc1a4db073b19ea222b2a52407ce7aec31b"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavfilter.xcframework.zip",
-            checksum: "59fce41e31093810e4d37933b6f8f9171236528e9aee3cead1ec4a39a4e4b195"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavfilter.xcframework.zip",
+            checksum: "afa03c512992e64c9d1be66c3dae0afd3dc035a5813e5199712d658798ed7a77"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavutil.xcframework.zip",
-            checksum: "9fb119a691259ac9fc506d6a2a0c336268293843686a9bf772a33c0bbef5a7de"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libavutil.xcframework.zip",
+            checksum: "1a856ca3203cab8c2591a67ef35eaea3fd2d7071de6971526211aca091815478"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libswresample.xcframework.zip",
-            checksum: "c2416c6e8a49752a1534a6456e5037fe9ea35c52e654543f0c57e21ea8182f03"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libswresample.xcframework.zip",
+            checksum: "ecb8c6df5503013d273bbbe29db0fd4ad8156bb1bfeb792b5fcb568d9a23441c"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libswscale.xcframework.zip",
-            checksum: "c91137c4e38c10cb11a1d3af4a7d4ab4e168c3f96c72cb0f71ebac386ff7e8ff"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libswscale.xcframework.zip",
+            checksum: "f7d3852779315e418d0524a6b46ee71c150e688a61e267956430e46c14ef6f13"
         ),
 
         .binaryTarget(
@@ -335,8 +335,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libmpv.xcframework.zip",
-            checksum: "b5f7ad0c26acd270cd067d7dd600188d4def40fcd433c7e266c4464f46b28759"
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.2/Libmpv.xcframework.zip",
+            checksum: "12870618dd4b20f39f3f758cd299afc0929723511a4da3591d4f6366a8f11769"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
