@@ -16,6 +16,7 @@ public enum MPVMetalSampleBufferRendererState: Equatable {
 }
 
 public enum MPVMetalSampleBufferPresentationBackend: String, Equatable {
+    case metalHDRIOSurface
     case metalIOSurface
     case softwareIOSurface
 }
@@ -26,19 +27,22 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
     public var preferredPiPFramesPerSecond: Int
     public var createsMetalCompatibilityProbe: Bool
     public var prefersMetalPresentation: Bool
+    public var prefersHDRPresentation: Bool
 
     public init(
         maximumFrameSize: CGSize = CGSize(width: 1280, height: 720),
         preferredFramesPerSecond: Int = 30,
         preferredPiPFramesPerSecond: Int = 24,
         createsMetalCompatibilityProbe: Bool = true,
-        prefersMetalPresentation: Bool = true
+        prefersMetalPresentation: Bool = true,
+        prefersHDRPresentation: Bool = true
     ) {
         self.maximumFrameSize = maximumFrameSize
         self.preferredFramesPerSecond = preferredFramesPerSecond
         self.preferredPiPFramesPerSecond = preferredPiPFramesPerSecond
         self.createsMetalCompatibilityProbe = createsMetalCompatibilityProbe
         self.prefersMetalPresentation = prefersMetalPresentation
+        self.prefersHDRPresentation = prefersHDRPresentation
     }
 }
 
@@ -66,6 +70,12 @@ public struct MPVMetalSampleBufferRendererDiagnostics: Equatable {
     public let presentationBackend: MPVMetalSampleBufferPresentationBackend
     public let metalPresentationFrameCount: Int
     public let metalPresentationFailureCount: Int
+    public let pixelFormatDescription: String
+    public let hdrMetadataApplied: Bool
+    public let videoColorPrimaries: String
+    public let videoTransferFunction: String
+    public let videoSignalPeak: Double
+    public let renderAPI: String
     public let backendDescription: String
 }
 
@@ -178,8 +188,18 @@ public final class MPVMetalSampleBufferRenderer {
     private var metalDevice: MTLDevice?
     private var metalCommandQueue: MTLCommandQueue?
     private var metalTextureCache: CVMetalTextureCache?
+    private var hdrConversionPipeline: MTLComputePipelineState?
     private var metalCompatibilityProbeSucceeded = false
     private var presentationBackend: MPVMetalSampleBufferPresentationBackend = .softwareIOSurface
+    private var lastPixelFormatDescription = "BGRA8"
+    private var lastPixelFormatType = kCVPixelFormatType_32BGRA
+    private var hdrMetadataApplied = false
+    private var hdrPresentationDisabled = false
+    private var formatDescriptionMetadataSignature = ""
+    private var videoColorPrimaries = ""
+    private var videoTransferFunction = ""
+    private var videoYCbCrMatrix = ""
+    private var videoSignalPeak: Double = 0
     private var swFormat = Array("bgr0".utf8CString)
 
     public init(
@@ -297,6 +317,11 @@ public final class MPVMetalSampleBufferRenderer {
         isStopping = false
         isRenderScheduled = false
         forcedFrameCount = 0
+        hdrPresentationDisabled = false
+        formatDescriptionMetadataSignature = ""
+        lastPixelFormatDescription = "BGRA8"
+        lastPixelFormatType = kCVPixelFormatType_32BGRA
+        hdrMetadataApplied = false
         updateState(.stopped)
     }
 
@@ -351,6 +376,7 @@ public final class MPVMetalSampleBufferRenderer {
             let previousMaximumFrameSize = self.options.maximumFrameSize
             let previousPreferredFramesPerSecond = self.options.preferredFramesPerSecond
             let previousPreferredPiPFramesPerSecond = self.options.preferredPiPFramesPerSecond
+            let previousPrefersHDRPresentation = self.options.prefersHDRPresentation
             self.options = newOptions
 
             if previousPreferredFramesPerSecond != newOptions.preferredFramesPerSecond
@@ -364,6 +390,11 @@ public final class MPVMetalSampleBufferRenderer {
                 self.formatDescription = nil
                 self.poolWidth = 0
                 self.poolHeight = 0
+            }
+            if previousPrefersHDRPresentation != newOptions.prefersHDRPresentation {
+                self.hdrPresentationDisabled = false
+                self.formatDescription = nil
+                self.formatDescriptionMetadataSignature = ""
             }
 
             self.forceRenderBurst(count: 6)
@@ -466,6 +497,12 @@ public final class MPVMetalSampleBufferRenderer {
             presentationBackend: presentationBackend,
             metalPresentationFrameCount: metalPresentationFrameCount,
             metalPresentationFailureCount: metalPresentationFailureCount,
+            pixelFormatDescription: lastPixelFormatDescription,
+            hdrMetadataApplied: hdrMetadataApplied,
+            videoColorPrimaries: videoColorPrimaries,
+            videoTransferFunction: videoTransferFunction,
+            videoSignalPeak: videoSignalPeak,
+            renderAPI: "libmpv-\(MPV_RENDER_API_TYPE_SW)",
             backendDescription: backendDescription()
         )
     }
@@ -509,7 +546,11 @@ public final class MPVMetalSampleBufferRenderer {
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("track-list", MPV_FORMAT_NONE),
             ("sid", MPV_FORMAT_NONE),
-            ("aid", MPV_FORMAT_NONE)
+            ("aid", MPV_FORMAT_NONE),
+            ("video-params/primaries", MPV_FORMAT_STRING),
+            ("video-params/gamma", MPV_FORMAT_STRING),
+            ("video-params/colormatrix", MPV_FORMAT_STRING),
+            ("video-params/sig-peak", MPV_FORMAT_DOUBLE)
         ]
         for (name, format) in properties {
             _ = name.withCString { mpv_observe_property(handle, 0, $0, format) }
@@ -593,6 +634,9 @@ public final class MPVMetalSampleBufferRenderer {
             }
         case "track-list", "sid", "aid":
             forceRenderBurst(count: 2)
+        case "video-params/primaries", "video-params/gamma", "video-params/colormatrix", "video-params/sig-peak":
+            refreshVideoColorMetadata()
+            forceRenderBurst(count: 2)
         default:
             break
         }
@@ -604,6 +648,15 @@ public final class MPVMetalSampleBufferRenderer {
         if width > 0, height > 0 {
             videoSize = CGSize(width: width, height: height)
         }
+    }
+
+    private func refreshVideoColorMetadata() {
+        videoColorPrimaries = getStringProperty("video-params/primaries") ?? ""
+        videoTransferFunction = getStringProperty("video-params/gamma") ?? ""
+        videoYCbCrMatrix = getStringProperty("video-params/colormatrix") ?? ""
+        videoSignalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
+        formatDescription = nil
+        formatDescriptionMetadataSignature = ""
     }
 
     private func startDisplayLink() {
@@ -732,7 +785,11 @@ public final class MPVMetalSampleBufferRenderer {
 
         probeMetalCompatibility(buffer: buffer, width: width, height: height)
         let presentationBuffer = makeMetalPresentationBuffer(from: buffer, width: width, height: height) ?? buffer
-        enqueue(buffer: presentationBuffer)
+        if !enqueue(buffer: presentationBuffer), presentationBuffer !== buffer {
+            hdrPresentationDisabled = true
+            presentationBackend = .metalIOSurface
+            _ = enqueue(buffer: buffer)
+        }
     }
 
     private func currentTargetSize() -> CGSize? {
@@ -753,15 +810,7 @@ public final class MPVMetalSampleBufferRenderer {
         formatDescription = nil
         poolWidth = width
         poolHeight = height
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!,
-            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue!,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue!
-        ]
+        let attrs = pixelBufferAttributes(width: width, height: height, pixelFormat: kCVPixelFormatType_32BGRA)
         let poolAttrs: [CFString: Any] = [
             kCVPixelBufferPoolMinimumBufferCountKey: 4
         ]
@@ -778,9 +827,14 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
-    private func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+    private func makePixelBuffer(
+        width: Int,
+        height: Int,
+        pixelFormat: OSType = kCVPixelFormatType_32BGRA,
+        usesPool: Bool = true
+    ) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
-        if let pool = pixelBufferPool {
+        if usesPool, pixelFormat == kCVPixelFormatType_32BGRA, let pool = pixelBufferPool {
             let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
                 kCFAllocatorDefault,
                 pool,
@@ -792,32 +846,40 @@ public final class MPVMetalSampleBufferRenderer {
             }
         }
 
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!,
-            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue!,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue!
-        ]
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &buffer)
+        let attrs = pixelBufferAttributes(width: width, height: height, pixelFormat: pixelFormat)
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs as CFDictionary, &buffer)
         if status != kCVReturnSuccess {
             reportError("pixel buffer allocation failed status=\(status)")
         }
         return buffer
     }
 
+    private func pixelBufferAttributes(width: Int, height: Int, pixelFormat: OSType) -> [CFString: Any] {
+        var attrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!
+        ]
+        if pixelFormat == kCVPixelFormatType_32BGRA {
+            attrs[kCVPixelBufferCGImageCompatibilityKey] = kCFBooleanTrue!
+            attrs[kCVPixelBufferCGBitmapContextCompatibilityKey] = kCFBooleanTrue!
+        }
+        return attrs
+    }
+
     private func probeMetalCompatibility(buffer: CVPixelBuffer, width: Int, height: Int) {
         guard options.createsMetalCompatibilityProbe,
-              let cache = metalTextureCache else { return }
+              let cache = metalTextureCache,
+              let textureFormat = metalTexturePixelFormat(for: CVPixelBufferGetPixelFormatType(buffer)) else { return }
         var texture: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault,
             cache,
             buffer,
             nil,
-            .bgra8Unorm,
+            textureFormat,
             width,
             height,
             0,
@@ -829,11 +891,50 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
+    private func metalTexturePixelFormat(for pixelFormat: OSType) -> MTLPixelFormat? {
+        switch pixelFormat {
+        case kCVPixelFormatType_32BGRA:
+            return .bgra8Unorm
+        case kCVPixelFormatType_64RGBAHalf:
+            return .rgba16Float
+        default:
+            return nil
+        }
+    }
+
+    private func pixelFormatDescription(_ pixelFormat: OSType) -> String {
+        switch pixelFormat {
+        case kCVPixelFormatType_32BGRA:
+            return "BGRA8"
+        case kCVPixelFormatType_64RGBAHalf:
+            return "RGBA16F"
+        default:
+            return "unknown(\(pixelFormat))"
+        }
+    }
+
     private func makeMetalPresentationBuffer(from sourceBuffer: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
         guard options.prefersMetalPresentation,
               let cache = metalTextureCache,
-              let commandQueue = metalCommandQueue,
-              let destinationBuffer = makePixelBuffer(width: width, height: height) else {
+              let commandQueue = metalCommandQueue else {
+            presentationBackend = .softwareIOSurface
+            return nil
+        }
+
+        if shouldUseHDRPresentation,
+           let hdrBuffer = makeHDRMetalPresentationBuffer(
+            from: sourceBuffer,
+            width: width,
+            height: height,
+            cache: cache,
+            commandQueue: commandQueue
+           ) {
+            presentationBackend = .metalHDRIOSurface
+            metalPresentationFrameCount += 1
+            return hdrBuffer
+        }
+
+        guard let destinationBuffer = makePixelBuffer(width: width, height: height) else {
             presentationBackend = .softwareIOSurface
             return nil
         }
@@ -904,8 +1005,137 @@ public final class MPVMetalSampleBufferRenderer {
         return destinationBuffer
     }
 
+    private var shouldUseHDRPresentation: Bool {
+        options.prefersHDRPresentation && !hdrPresentationDisabled && streamLooksHDR
+    }
+
+    private var streamLooksHDR: Bool {
+        let transfer = videoTransferFunction.lowercased()
+        let primaries = videoColorPrimaries.lowercased()
+        return videoSignalPeak > 1.0
+            || transfer.contains("pq")
+            || transfer.contains("hlg")
+            || transfer.contains("2084")
+            || primaries.contains("2020")
+    }
+
+    private func makeHDRMetalPresentationBuffer(
+        from sourceBuffer: CVPixelBuffer,
+        width: Int,
+        height: Int,
+        cache: CVMetalTextureCache,
+        commandQueue: MTLCommandQueue
+    ) -> CVPixelBuffer? {
+        guard let pipeline = hdrConversionPipeline ?? makeHDRConversionPipeline(),
+              let destinationBuffer = makePixelBuffer(
+                width: width,
+                height: height,
+                pixelFormat: kCVPixelFormatType_64RGBAHalf,
+                usesPool: false
+              ) else {
+            metalPresentationFailureCount += 1
+            hdrPresentationDisabled = true
+            return nil
+        }
+        hdrConversionPipeline = pipeline
+
+        var sourceTextureRef: CVMetalTexture?
+        var destinationTextureRef: CVMetalTexture?
+        let sourceStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            sourceBuffer,
+            nil,
+            .bgra8Unorm,
+            width,
+            height,
+            0,
+            &sourceTextureRef
+        )
+        let destinationStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            destinationBuffer,
+            nil,
+            .rgba16Float,
+            width,
+            height,
+            0,
+            &destinationTextureRef
+        )
+        guard sourceStatus == kCVReturnSuccess,
+              destinationStatus == kCVReturnSuccess,
+              let sourceTextureRef,
+              let destinationTextureRef,
+              let sourceTexture = CVMetalTextureGetTexture(sourceTextureRef),
+              let destinationTexture = CVMetalTextureGetTexture(destinationTextureRef),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            metalPresentationFailureCount += 1
+            hdrPresentationDisabled = true
+            CVMetalTextureCacheFlush(cache, 0)
+            return nil
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(sourceTexture, index: 0)
+        encoder.setTexture(destinationTexture, index: 1)
+        let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
+        let threadgroups = MTLSize(
+            width: (width + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+            height: (height + threadsPerThreadgroup.height - 1) / threadsPerThreadgroup.height,
+            depth: 1
+        )
+        encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        CVMetalTextureCacheFlush(cache, 0)
+
+        guard commandBuffer.status == .completed else {
+            metalPresentationFailureCount += 1
+            hdrPresentationDisabled = true
+            reportError("HDR Metal presentation conversion failed status=\(commandBuffer.status.rawValue)")
+            return nil
+        }
+
+        return destinationBuffer
+    }
+
+    private func makeHDRConversionPipeline() -> MTLComputePipelineState? {
+        guard let metalDevice else { return nil }
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void mpvkit_bgra8_to_rgba16f(
+            texture2d<float, access::read> sourceTexture [[texture(0)]],
+            texture2d<half, access::write> destinationTexture [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]]
+        ) {
+            if (gid.x >= destinationTexture.get_width() || gid.y >= destinationTexture.get_height()) {
+                return;
+            }
+            float4 color = sourceTexture.read(gid);
+            destinationTexture.write(half4(color), gid);
+        }
+        """
+        do {
+            let library = try metalDevice.makeLibrary(source: source, options: nil)
+            guard let function = library.makeFunction(name: "mpvkit_bgra8_to_rgba16f") else {
+                return nil
+            }
+            return try metalDevice.makeComputePipelineState(function: function)
+        } catch {
+            reportError("HDR Metal presentation pipeline failed: \(error)")
+            return nil
+        }
+    }
+
     private func backendDescription() -> String {
         switch presentationBackend {
+        case .metalHDRIOSurface:
+            return "libmpv sample-buffer renderer with HDR-capable Metal RGBA16F IOSurface presentation"
         case .metalIOSurface:
             return "libmpv sample-buffer renderer with Metal-backed IOSurface presentation"
         case .softwareIOSurface:
@@ -913,13 +1143,18 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
-    private func enqueue(buffer: CVPixelBuffer) {
+    @discardableResult
+    private func enqueue(buffer: CVPixelBuffer) -> Bool {
         if displayLayer.status == .failed {
+            if lastPixelFormatType == kCVPixelFormatType_64RGBAHalf {
+                hdrPresentationDisabled = true
+            }
             resetDisplayLayer(removingDisplayedImage: true)
         }
 
+        applyColorAttachments(to: buffer)
         let needsFlush = updateFormatDescriptionIfNeeded(for: buffer)
-        guard let description = formatDescription else { return }
+        guard let description = formatDescription else { return false }
         let mediaSeconds = cachedPosition.isFinite ? max(0, cachedPosition) : 0
         lastPresentationTime = mediaSeconds
         let presentationTime = CMTime(seconds: mediaSeconds, preferredTimescale: 1000)
@@ -939,8 +1174,11 @@ public final class MPVMetalSampleBufferRenderer {
 
         guard result == noErr, let sampleBuffer else {
             enqueueFailureCount += 1
+            if CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_64RGBAHalf {
+                hdrPresentationDisabled = true
+            }
             reportError("sample buffer creation failed status=\(result)")
-            return
+            return false
         }
 
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
@@ -969,17 +1207,20 @@ public final class MPVMetalSampleBufferRenderer {
         )
         onFrame?(frame)
         onDiagnostics?(diagnosticsSnapshot())
+        return true
     }
 
     private func updateFormatDescriptionIfNeeded(for buffer: CVPixelBuffer) -> Bool {
         let width = Int32(CVPixelBufferGetWidth(buffer))
         let height = Int32(CVPixelBufferGetHeight(buffer))
         let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
+        let metadataSignature = currentColorMetadataSignature(pixelFormat: pixelFormat)
         if let description = formatDescription {
             let dimensions = CMVideoFormatDescriptionGetDimensions(description)
             if dimensions.width == width,
                dimensions.height == height,
-               CMFormatDescriptionGetMediaSubType(description) == pixelFormat {
+               CMFormatDescriptionGetMediaSubType(description) == pixelFormat,
+               formatDescriptionMetadataSignature == metadataSignature {
                 return false
             }
         }
@@ -992,10 +1233,94 @@ public final class MPVMetalSampleBufferRenderer {
         )
         if status == noErr, let newDescription {
             formatDescription = newDescription
+            formatDescriptionMetadataSignature = metadataSignature
+            lastPixelFormatType = pixelFormat
+            lastPixelFormatDescription = pixelFormatDescription(pixelFormat)
             return true
         }
         reportError("format description creation failed status=\(status)")
         return false
+    }
+
+    private func applyColorAttachments(to buffer: CVPixelBuffer) {
+        let isHDR = streamLooksHDR
+        hdrMetadataApplied = isHDR
+        CVBufferSetAttachment(
+            buffer,
+            kCVImageBufferColorPrimariesKey,
+            colorPrimariesAttachmentValue() as CFTypeRef,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            buffer,
+            kCVImageBufferTransferFunctionKey,
+            transferFunctionAttachmentValue() as CFTypeRef,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            buffer,
+            kCVImageBufferYCbCrMatrixKey,
+            ycbcrMatrixAttachmentValue() as CFTypeRef,
+            .shouldPropagate
+        )
+        if let colorSpace = colorSpaceAttachmentValue() {
+            CVBufferSetAttachment(
+                buffer,
+                kCVImageBufferCGColorSpaceKey,
+                colorSpace as CFTypeRef,
+                .shouldPropagate
+            )
+        }
+    }
+
+    private func currentColorMetadataSignature(pixelFormat: OSType) -> String {
+        [
+            pixelFormatDescription(pixelFormat),
+            colorPrimariesAttachmentValue() as String,
+            transferFunctionAttachmentValue() as String,
+            ycbcrMatrixAttachmentValue() as String,
+            String(format: "%.3f", videoSignalPeak)
+        ].joined(separator: "|")
+    }
+
+    private func colorPrimariesAttachmentValue() -> CFString {
+        let primaries = videoColorPrimaries.lowercased()
+        if primaries.contains("2020") {
+            return kCVImageBufferColorPrimaries_ITU_R_2020
+        }
+        if primaries.contains("p3") {
+            return kCVImageBufferColorPrimaries_P3_D65
+        }
+        return kCVImageBufferColorPrimaries_ITU_R_709_2
+    }
+
+    private func transferFunctionAttachmentValue() -> CFString {
+        let transfer = videoTransferFunction.lowercased()
+        if transfer.contains("pq") || transfer.contains("2084") {
+            return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        }
+        if transfer.contains("hlg") {
+            return kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        }
+        if transfer.contains("srgb") {
+            return kCVImageBufferTransferFunction_sRGB
+        }
+        return kCVImageBufferTransferFunction_ITU_R_709_2
+    }
+
+    private func ycbcrMatrixAttachmentValue() -> CFString {
+        let matrix = videoYCbCrMatrix.lowercased()
+        if matrix.contains("2020") || videoColorPrimaries.lowercased().contains("2020") {
+            return kCVImageBufferYCbCrMatrix_ITU_R_2020
+        }
+        return kCVImageBufferYCbCrMatrix_ITU_R_709_2
+    }
+
+    private func colorSpaceAttachmentValue() -> CGColorSpace? {
+        if streamLooksHDR {
+            return CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+        }
+        return CGColorSpace(name: CGColorSpace.sRGB)
     }
 
     private func ensureTimebase(at presentationTime: CMTime) {
@@ -1095,6 +1420,15 @@ public final class MPVMetalSampleBufferRenderer {
         var data = Double()
         let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_DOUBLE, &data) }
         return status >= 0 ? data : nil
+    }
+
+    private func getStringProperty(_ name: String) -> String? {
+        guard let handle = mpv else { return nil }
+        var data: UnsafeMutablePointer<CChar>?
+        let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_STRING, &data) }
+        guard status >= 0, let data else { return nil }
+        defer { mpv_free(data) }
+        return String(cString: data)
     }
 
     private func getIntProperty(_ name: String) -> Int? {
@@ -1252,6 +1586,12 @@ public final class MPVMetalSampleBufferRenderer {
             presentationBackend: .softwareIOSurface,
             metalPresentationFrameCount: 0,
             metalPresentationFailureCount: 0,
+            pixelFormatDescription: "unsupported",
+            hdrMetadataApplied: false,
+            videoColorPrimaries: "",
+            videoTransferFunction: "",
+            videoSignalPeak: 0,
+            renderAPI: "unsupported",
             backendDescription: "unsupported"
         )
     }
