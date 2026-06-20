@@ -199,12 +199,19 @@ public final class MPVGPUPlayerRenderer {
 
     public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat = UIScreen.main.nativeScale) {
         performOnMain {
+            // Resize the inline Metal surface with implicit Core Animation actions disabled. The
+            // layer is a manually-managed sublayer (not a view's backing layer), so frame /
+            // drawableSize changes would otherwise animate on rotation and visibly overshoot the
+            // new bounds before settling. Snapping matches the AVSampleBufferDisplayLayer path.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             self.inlineLayer.frame = bounds
             self.inlineLayer.contentsScale = contentsScale
             self.inlineLayer.drawableSize = CGSize(
                 width: max(2, bounds.width * contentsScale),
                 height: max(2, bounds.height * contentsScale)
             )
+            CATransaction.commit()
         }
     }
 
@@ -460,7 +467,16 @@ public final class MPVGPUPlayerRenderer {
 
     public func endPictureInPicture(restoringInlinePlayback: Bool = true) {
         performOnMain {
-            let resumePosition = self.pictureInPictureRenderer.currentTime
+            // Resume the inline renderer at the PiP instance's position — but only trust that
+            // position if PiP actually advanced from (or near) the hand-off baseline. If PiP was
+            // torn down before its file loaded / its deferred seek applied, currentTime reads ~0,
+            // and seeking the inline there would yank it back to the start. Fall back to the
+            // baseline (where the inline was paused) in that case.
+            let pipPosition = self.pictureInPictureRenderer.currentTime
+            let handoffBaseline = self.cachedPosition
+            let resumePosition = (pipPosition.isFinite && pipPosition >= handoffBaseline - 2.0)
+                ? pipPosition
+                : handoffBaseline
             let shouldResume = !self.wasPausedBeforePictureInPicture
             self.pictureInPictureRenderer.pause()
             self.pictureInPictureRenderer.stop()

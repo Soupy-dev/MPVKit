@@ -177,6 +177,14 @@ public final class MPVMetalSampleBufferRenderer {
     private var videoSize: CGSize = .zero
     private var cachedPosition: Double = 0
     private var cachedDuration: Double = 0
+    /// True once MPV_EVENT_FILE_LOADED has fired for the current load. mpv silently drops an
+    /// absolute seek issued before the file is loaded, so seeks requested earlier are deferred
+    /// (see `pendingSeek`) and replayed here.
+    private var isFileLoaded = false
+    /// A seek target requested before the file finished loading. Applied on FILE_LOADED so a PiP
+    /// hand-off that loads this instance and immediately seeks to the live position actually starts
+    /// there instead of from the beginning.
+    private var pendingSeek: Double?
     private var isPaused = true
     private var isRunning = false
     private var isStopping = false
@@ -331,6 +339,8 @@ public final class MPVMetalSampleBufferRenderer {
         formatDescription = nil
         isRunning = false
         isStopping = false
+        isFileLoaded = false
+        pendingSeek = nil
         isRenderScheduled = false
         forcedFrameCount = 0
         hdrPresentationDisabled = false
@@ -347,6 +357,8 @@ public final class MPVMetalSampleBufferRenderer {
     public func load(_ url: URL, headers: [String: String]? = nil) {
         performOnMain {
             guard self.mpv != nil else { return }
+            self.isFileLoaded = false
+            self.pendingSeek = nil
             self.updateState(.loading)
             self.updateHTTPHeaders(headers)
             let target = url.isFileURL ? url.path : url.absoluteString
@@ -373,9 +385,19 @@ public final class MPVMetalSampleBufferRenderer {
 
     public func seek(to seconds: Double) {
         let clamped = max(0, seconds)
-        _ = command(["seek", "\(clamped)", "absolute+exact"])
-        cachedPosition = clamped
-        forceRenderBurst(count: 6)
+        performOnMain {
+            self.cachedPosition = clamped
+            guard self.isFileLoaded else {
+                // File not loaded yet (e.g. the PiP hand-off loads this instance then immediately
+                // seeks to the live position). mpv drops absolute seeks issued before FILE_LOADED,
+                // so defer and replay on load — otherwise playback (and the frames fed to PiP)
+                // would start from 0 while the timestamps say `clamped`, jumping back once decoded.
+                self.pendingSeek = clamped
+                return
+            }
+            _ = self.command(["seek", "\(clamped)", "absolute+exact"])
+            self.forceRenderBurst(count: 6)
+        }
     }
 
     public func seek(by seconds: Double) {
@@ -610,6 +632,11 @@ public final class MPVMetalSampleBufferRenderer {
                 performOnMain { self.updateState(.loading) }
             case MPV_EVENT_FILE_LOADED:
                 performOnMain {
+                    self.isFileLoaded = true
+                    if let pending = self.pendingSeek {
+                        self.pendingSeek = nil
+                        _ = self.command(["seek", "\(pending)", "absolute+exact"])
+                    }
                     self.updateState(self.isPaused ? .paused : .playing)
                     self.forceRenderBurst(count: 8)
                 }
