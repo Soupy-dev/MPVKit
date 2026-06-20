@@ -83,6 +83,7 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer {
         }
     }
 
+    @available(iOS 16.0, macOS 10.15, macCatalyst 16.0, tvOS 16.0, visionOS 1.0, *)
     public override var wantsExtendedDynamicRangeContent: Bool {
         get { super.wantsExtendedDynamicRangeContent }
         set {
@@ -557,7 +558,9 @@ public final class MPVGPUPlayerRenderer {
         inlineLayer.framebufferOnly = true
         inlineLayer.backgroundColor = UIColor.black.cgColor
         inlineLayer.contentsScale = UIScreen.main.nativeScale
-        inlineLayer.wantsExtendedDynamicRangeContent = options.enablesTargetColorspaceHint
+        if #available(iOS 16.0, macCatalyst 16.0, *) {
+            inlineLayer.wantsExtendedDynamicRangeContent = options.enablesTargetColorspaceHint
+        }
     }
 
     private func configurePictureInPictureCallbacks() {
