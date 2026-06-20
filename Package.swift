@@ -189,37 +189,37 @@ let package = Package(
         .binaryTarget(
             name: "Libavcodec-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavcodec-GPL.xcframework.zip",
-            checksum: "45c76099dd1fcbc774a8a6304d8bd792506e53d89e1c964dac2cec0ff5b44f50"
+            checksum: "6936e9661bb1c921cf01bbba45eeea8a691abf35429b1048095693a1a30f73de"
         ),
         .binaryTarget(
             name: "Libavdevice-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavdevice-GPL.xcframework.zip",
-            checksum: "c9c35e2d179f33fb2e89ef87e0e01356a7855717bbab4e3f5ee4cffe55fa569f"
+            checksum: "ae4633ba6d233c31d721eb830ac761039809564f1e03d3fc65f0407ca1945c50"
         ),
         .binaryTarget(
             name: "Libavformat-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavformat-GPL.xcframework.zip",
-            checksum: "d0f94e68fc8e7b71d00846d3459277b42b48dd5b294c6ab93b46730c3eea864e"
+            checksum: "0d58d7e603abeaeed34407afc2728626f2d6580a04b04fc48d7d398f82d82b4a"
         ),
         .binaryTarget(
             name: "Libavfilter-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavfilter-GPL.xcframework.zip",
-            checksum: "d8936d48f21fb2617ca255f5ff48ed66fc42d99fd7409ff653a376b9526d438d"
+            checksum: "135a9872106ef9a83cece846d87884688a2471dba450a716cee82415799881a5"
         ),
         .binaryTarget(
             name: "Libavutil-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libavutil-GPL.xcframework.zip",
-            checksum: "a3231e4e8bfd4fa6858e81587c6e5402a579e7f523330fa1aa7e93531c721898"
+            checksum: "4cabf4613d9fd2bd02ed04433418c4999077a47c81facc65fea082dfac165fb5"
         ),
         .binaryTarget(
             name: "Libswresample-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libswresample-GPL.xcframework.zip",
-            checksum: "fdace3a66ef617032ebd05eea80f1fe4aab273e206a731f1a9e138866cadc239"
+            checksum: "9f23459b1684df9535f7fa664a19ce404efc4140fa61f99da36df2b0a0f2d27b"
         ),
         .binaryTarget(
             name: "Libswscale-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libswscale-GPL.xcframework.zip",
-            checksum: "c18d4f7de9204b6538785e2b46967807231d4907e4f35b808d01a900f3debdf3"
+            checksum: "24dd1cff0de45af1179db2ae8d858fa777eade288bbd409ca1dfe38f9160ab00"
         ),
 
         .binaryTarget(
@@ -237,7 +237,7 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv-GPL",
             url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0/Libmpv-GPL.xcframework.zip",
-            checksum: "a01a99068b586e959d9f13a0e2792d8e185600d4f3a7ed7b7a17add6828560f0"
+            checksum: "18d1b4ebf847763557d7440ee8ae0b7ad9c22ef453ab79339b1dc8164dfd098e"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
