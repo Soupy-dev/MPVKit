@@ -744,6 +744,8 @@ private class BuildFFMPEG: BaseBuild {
         "--disable-filters",
         "--enable-filter=aformat", "--enable-filter=amix", "--enable-filter=anull", "--enable-filter=aresample",
         "--enable-filter=areverse", "--enable-filter=asetrate", "--enable-filter=atempo", "--enable-filter=atrim",
+        // Comfort/Dialogue/Night audio presets (Eclipse): dynamics + tone shaping via lavfi.
+        "--enable-filter=acompressor", "--enable-filter=alimiter", "--enable-filter=dynaudnorm", "--enable-filter=highpass",
         "--enable-filter=bwdif", "--enable-filter=delogo",
         "--enable-filter=equalizer", "--enable-filter=estdif",
         "--enable-filter=firequalizer", "--enable-filter=format", "--enable-filter=fps",
