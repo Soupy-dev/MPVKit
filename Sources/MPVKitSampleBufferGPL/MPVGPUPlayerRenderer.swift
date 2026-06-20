@@ -59,6 +59,20 @@ public struct MPVGPUPlayerRendererDiagnostics: Equatable {
     public let inlineGPUContext: String
     public let pictureInPictureDiagnostics: MPVMetalSampleBufferRendererDiagnostics?
     public let backendDescription: String
+    /// Decoded video frame width/height in pixels (`video-params/w`/`h`); 0 when no video.
+    public let videoWidth: Int
+    public let videoHeight: Int
+    /// Transfer characteristics / gamma (`video-params/gamma`, e.g. "pq", "hlg", "bt.1886").
+    public let videoTransferFunction: String
+    /// Color primaries (`video-params/primaries`, e.g. "bt.2020", "bt.709").
+    public let videoColorPrimaries: String
+    /// Reference signal peak (`video-params/sig-peak`); > 1.0 indicates HDR.
+    public let videoSignalPeak: Double
+    /// Decoded pixel format (`video-params/pixelformat`, e.g. "yuv420p10", "p010"). High-bit-depth
+    /// content contains "10"/"12"/"16".
+    public let videoPixelFormat: String
+    /// Active hardware decoder (`hwdec-current`, e.g. "videotoolbox" or "no").
+    public let hardwareDecoder: String
 }
 
 public final class MPVGPUPlayerMetalLayer: CAMetalLayer {
@@ -118,8 +132,14 @@ public final class MPVGPUPlayerRenderer {
     public var onStateChange: ((MPVGPUPlayerRendererState) -> Void)?
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
+    /// Fired on the main thread when the decoded video parameters may have changed (file loaded or
+    /// VIDEO_RECONFIG), so the host can re-evaluate HDR/colorspace configuration per content.
+    public var onVideoReconfigure: (() -> Void)?
 
     private var options: MPVGPUPlayerRendererOptions
+    /// The active mpv audio-filter chain (`af`), kept so it can be re-applied to the PiP renderer
+    /// when it loads (the PiP renderer is a separate mpv instance from the inline one).
+    private var audioFilterChain: String = ""
     private let pictureInPictureRenderer: MPVMetalSampleBufferRenderer
     private let eventQueue = DispatchQueue(label: "mpvkit.gpu-player.events", qos: .userInitiated)
     private let eventQueueGroup = DispatchGroup()
@@ -413,8 +433,14 @@ public final class MPVGPUPlayerRenderer {
         performOnMain {
             guard self.prepareForPictureInPictureStart() else { return }
             self.wasPausedBeforePictureInPicture = self.isPaused
+            // Sync the PiP renderer to the live inline position, but only when it is actually out of
+            // sync. prepare/prime already positioned it, so this avoids a redundant same-position
+            // seek (which re-decodes and can stutter the PiP start) while still correcting for any
+            // time that elapsed during priming.
             let handoffPosition = self.cachedPosition
-            self.pictureInPictureRenderer.seek(to: handoffPosition)
+            if abs(handoffPosition - self.pictureInPictureRenderer.currentTime) > 0.25 {
+                self.pictureInPictureRenderer.seek(to: handoffPosition)
+            }
             self.pictureInPictureRenderer.setSpeed(self.getSpeed())
             if self.options.pausesInlineRendererDuringPictureInPicture {
                 self.setFlagProperty("pause", true)
@@ -464,6 +490,29 @@ public final class MPVGPUPlayerRenderer {
     public func command(_ args: [String]) -> Int32 {
         guard let handle = mpv, !args.isEmpty else { return -1 }
         return command(handle: handle, args: args)
+    }
+
+    /// Primes additional frames into the PiP sample-buffer renderer without re-preparing it.
+    /// No-op until PiP has been prepared. Used to accumulate buffered frames before the
+    /// AVPictureInPictureController hand-off, matching the sample-buffer path's multi-prime warmup.
+    public func primePictureInPictureFrames(reason: String, count: Int = 6) {
+        performOnMain {
+            guard self.isPictureInPicturePrepared || self.isPictureInPictureActive else { return }
+            self.pictureInPictureRenderer.primeFrames(reason: reason, count: count)
+        }
+    }
+
+    /// Sets the mpv audio-filter chain (`af`) on the inline renderer and keeps it so the PiP
+    /// renderer (a separate mpv instance) gets the same processing when it loads or is already
+    /// active. Pass an empty string to clear all filters.
+    public func setAudioFilterChain(_ chain: String) {
+        performOnMain {
+            self.audioFilterChain = chain
+            self.setStringProperty("af", chain)
+            if self.isPictureInPicturePrepared || self.isPictureInPictureActive {
+                _ = self.pictureInPictureRenderer.command(["set", "af", chain])
+            }
+        }
     }
 
     public func audioTracks() -> [MPVMetalSampleBufferTrack] {
@@ -549,7 +598,14 @@ public final class MPVGPUPlayerRenderer {
                 : nil,
             backendDescription: isPictureInPictureActive
                 ? "AVSampleBufferDisplayLayer PiP bridge backed by MPVMetalSampleBufferRenderer"
-                : "mpv gpu-next renderer backed by MoltenVK CAMetalLayer"
+                : "mpv gpu-next renderer backed by MoltenVK CAMetalLayer",
+            videoWidth: Int(getInt64Property("video-params/w") ?? 0),
+            videoHeight: Int(getInt64Property("video-params/h") ?? 0),
+            videoTransferFunction: getStringProperty("video-params/gamma") ?? "",
+            videoColorPrimaries: getStringProperty("video-params/primaries") ?? "",
+            videoSignalPeak: getDoubleProperty("video-params/sig-peak") ?? 0,
+            videoPixelFormat: getStringProperty("video-params/pixelformat") ?? "",
+            hardwareDecoder: getStringProperty("hwdec-current") ?? ""
         )
     }
 
@@ -603,6 +659,9 @@ public final class MPVGPUPlayerRenderer {
         if let subtitleStyle {
             pictureInPictureRenderer.applySubtitleStyle(subtitleStyle)
         }
+        if !audioFilterChain.isEmpty {
+            _ = pictureInPictureRenderer.command(["set", "af", audioFilterChain])
+        }
         startsPaused ? pictureInPictureRenderer.pause() : pictureInPictureRenderer.play()
     }
 
@@ -618,7 +677,10 @@ public final class MPVGPUPlayerRenderer {
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("track-list", MPV_FORMAT_NONE),
             ("sid", MPV_FORMAT_NONE),
-            ("aid", MPV_FORMAT_NONE)
+            ("aid", MPV_FORMAT_NONE),
+            ("video-params/gamma", MPV_FORMAT_NONE),
+            ("video-params/primaries", MPV_FORMAT_NONE),
+            ("video-params/sig-peak", MPV_FORMAT_NONE)
         ]
         for (name, format) in properties {
             _ = name.withCString { mpv_observe_property(handle, 0, $0, format) }
@@ -654,6 +716,19 @@ public final class MPVGPUPlayerRenderer {
                 performOnMain {
                     self.updateState(self.isPaused ? .paused : .playing)
                     self.emitDiagnostics()
+                    self.onVideoReconfigure?()
+                }
+            case MPV_EVENT_VIDEO_RECONFIG:
+                performOnMain { self.onVideoReconfigure?() }
+            case MPV_EVENT_END_FILE:
+                // Surface decode/IO failures the host's onError can act on (the log-message scan
+                // alone misses some). Only report genuine error terminations, not normal EOF/stop.
+                if let data = event.data {
+                    let endFile = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
+                    if endFile.reason == MPV_END_FILE_REASON_ERROR {
+                        let message = String(cString: mpv_error_string(endFile.error))
+                        performOnMain { self.onError?("playback ended with error: \(message)") }
+                    }
                 }
             case MPV_EVENT_PROPERTY_CHANGE:
                 if let data = event.data {
@@ -697,6 +772,10 @@ public final class MPVGPUPlayerRenderer {
             }
         case "track-list", "sid", "aid":
             emitDiagnostics()
+        case "video-params/gamma", "video-params/primaries", "video-params/sig-peak":
+            // Colorspace/HDR characteristics resolved or changed — let the host re-evaluate HDR.
+            emitDiagnostics()
+            onVideoReconfigure?()
         default:
             break
         }
@@ -833,6 +912,23 @@ public final class MPVGPUPlayerRenderer {
         return status >= 0 ? data : nil
     }
 
+    private func getInt64Property(_ name: String) -> Int64? {
+        guard let handle = mpv else { return nil }
+        var data = Int64()
+        let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_INT64, &data) }
+        return status >= 0 ? data : nil
+    }
+
+    /// Reads a string-valued mpv property (e.g. `video-params/gamma`). The libmpv client API is
+    /// thread-safe, so this is safe to call from the main thread (diagnostics/overlay) while the
+    /// event loop runs on `eventQueue`. Returns nil when the property is unavailable.
+    private func getStringProperty(_ name: String) -> String? {
+        guard let handle = mpv else { return nil }
+        guard let raw = name.withCString({ mpv_get_property_string(handle, $0) }) else { return nil }
+        defer { mpv_free(raw) }
+        return String(cString: raw)
+    }
+
     private func mpvColorString(_ color: CGColor) -> String {
         let converted = color.converted(
             to: CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -955,7 +1051,14 @@ public final class MPVGPUPlayerRenderer {
             inlineGPUAPI: "unsupported",
             inlineGPUContext: "unsupported",
             pictureInPictureDiagnostics: nil,
-            backendDescription: "unsupported"
+            backendDescription: "unsupported",
+            videoWidth: 0,
+            videoHeight: 0,
+            videoTransferFunction: "",
+            videoColorPrimaries: "",
+            videoSignalPeak: 0,
+            videoPixelFormat: "",
+            hardwareDecoder: ""
         )
     }
 }
