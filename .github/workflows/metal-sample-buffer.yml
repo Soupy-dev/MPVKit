@@ -68,21 +68,24 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install autoconf automake libtool ninja rename
+          brew install autoconf automake libtool ninja
           python -m pip install meson==1.4.2
-
-      - name: Build LGPL iOS artifacts
-        run: |
-          make build platform=ios
-          mkdir -p artifacts/lgpl
-          cp dist/release/*.zip dist/release/Package.swift artifacts/lgpl/
-          shasum -a 256 artifacts/lgpl/*.zip artifacts/lgpl/Package.swift > artifacts/lgpl/checksums.sha256
 
       - name: Build GPL iOS artifacts
         run: |
-          make clean
           make build enable-gpl platform=ios
           mkdir -p artifacts/gpl
+          cd dist/release
+          for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter Libavutil Libswresample Libswscale; do
+            mv "${name}.xcframework.zip" "${name}-GPL.xcframework.zip"
+            mv "${name}.xcframework.checksum.txt" "${name}-GPL.xcframework.checksum.txt"
+          done
+          for name in libmpv FFmpeg; do
+            if [ -f "${name}-all.zip" ]; then
+              mv "${name}-all.zip" "${name}-GPL-all.zip"
+            fi
+          done
+          cd ../..
           cp dist/release/*.zip dist/release/Package.swift artifacts/gpl/
           shasum -a 256 artifacts/gpl/*.zip artifacts/gpl/Package.swift > artifacts/gpl/checksums.sha256
 

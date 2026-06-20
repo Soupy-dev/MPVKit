@@ -65,13 +65,18 @@ jobs:
           brew install libtool
           python -m pip install meson==1.4.2
           brew install ninja
-          brew install rename
 
       - name: Build GPL version
         run: |
           make build enable-gpl version=${{ env.RELEASE_VERSION }} platform=maccatalyst,xros,ios,macos
 
           cd ./dist/release
-          rename 's/-all\.zip/-GPL-all\.zip/' *-all.zip
-          rename 's/\.xcframework\.zip/-GPL\.xcframework\.zip/' *.xcframework.zip
-          rename 's/\.xcframework\.checksum\.txt/-GPL\.xcframework\.checksum\.txt/' *.xcframework.checksum.txt
+          for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter Libavutil Libswresample Libswscale; do
+            mv "${name}.xcframework.zip" "${name}-GPL.xcframework.zip"
+            mv "${name}.xcframework.checksum.txt" "${name}-GPL.xcframework.checksum.txt"
+          done
+          for name in libmpv FFmpeg; do
+            if [ -f "${name}-all.zip" ]; then
+              mv "${name}-all.zip" "${name}-GPL-all.zip"
+            fi
+          done

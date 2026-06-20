@@ -147,49 +147,59 @@ enum Library: String, CaseIterable {
     var targets : [PackageTarget] {
         switch self {
         case .libmpv:
+            let suffix = BaseBuild.options.enableGPL ? "-GPL" : ""
             return [
                 .target(
-                    name: "Libmpv",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libmpv.xcframework.zip",
-                    checksum: ""
+                    name: "Libmpv\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libmpv\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libmpv"
                 ),
             ]
         case .FFmpeg:
+            let suffix = BaseBuild.options.enableGPL ? "-GPL" : ""
             return  [
                 .target(
-                    name: "Libavcodec",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavcodec.xcframework.zip",
-                    checksum: ""
+                    name: "Libavcodec\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavcodec\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libavcodec"
                 ),
                 .target(
-                    name: "Libavdevice",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavdevice.xcframework.zip",
-                    checksum: ""
+                    name: "Libavdevice\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavdevice\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libavdevice"
                 ),
                 .target(
-                    name: "Libavformat",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavformat.xcframework.zip",
-                    checksum: ""
+                    name: "Libavformat\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavformat\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libavformat"
                 ),
                 .target(
-                    name: "Libavfilter",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavfilter.xcframework.zip",
-                    checksum: ""
+                    name: "Libavfilter\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavfilter\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libavfilter"
                 ),
                 .target(
-                    name: "Libavutil",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavutil.xcframework.zip",
-                    checksum: ""
+                    name: "Libavutil\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libavutil\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libavutil"
                 ),
                 .target(
-                    name: "Libswresample",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libswresample.xcframework.zip",
-                    checksum: ""
+                    name: "Libswresample\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libswresample\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libswresample"
                 ),
                 .target(
-                    name: "Libswscale",
-                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libswscale.xcframework.zip",
-                    checksum: ""
+                    name: "Libswscale\(suffix)",
+                    url: "https://github.com/Soupy-dev/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libswscale\(suffix).xcframework.zip",
+                    checksum: "",
+                    checksumFileName: "Libswscale"
                 ),
             ]
         case .openssl:

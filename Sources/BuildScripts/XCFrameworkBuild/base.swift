@@ -715,7 +715,8 @@ class BaseBuild {
 
     func generatePackageManagerFile() throws {
         let releaseDirPath = URL.currentDirectory + ["release"]
-        let template = URL.currentDirectory + ["../docs/Package.template.swift"]
+        let templateName = BaseBuild.options.enableGPL ? "Package.gpl.template.swift" : "Package.template.swift"
+        let template = URL.currentDirectory + ["../docs", templateName]
         let packageFile = releaseDirPath + "Package.swift"
 
         if !FileManager.default.fileExists(atPath: packageFile.path) {
@@ -744,7 +745,8 @@ class BaseBuild {
             }
         } else {
             for target in library.targets {
-                let checksumFile = releaseDirPath + [target.name + ".xcframework.checksum.txt"]
+                let checksumFileName = target.checksumFileName ?? target.name
+                let checksumFile = releaseDirPath + [checksumFileName + ".xcframework.checksum.txt"]
                 let checksum = try String(contentsOf: checksumFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
                 dependencyTargetContent += """
 
@@ -961,19 +963,22 @@ class PackageTarget {
     let name: String
     let url : String
     let checksum: String
+    let checksumFileName: String?
 
-    init(name: String, url : String, checksum: String) {
+    init(name: String, url : String, checksum: String, checksumFileName: String? = nil) {
         self.name = name
         self.url = url
         self.checksum = checksum
+        self.checksumFileName = checksumFileName
     }
 
     static func target(
         name: String,
         url : String,
-        checksum: String
+        checksum: String,
+        checksumFileName: String? = nil
     ) -> PackageTarget {
-        return PackageTarget(name: name, url: url, checksum: checksum)
+        return PackageTarget(name: name, url: url, checksum: checksum, checksumFileName: checksumFileName)
     }
 }
 
