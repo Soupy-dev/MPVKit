@@ -7,16 +7,8 @@ let package = Package(
     platforms: [.macOS(.v11), .iOS(.v14), .tvOS(.v14), .visionOS(.v1)],
     products: [
         .library(
-            name: "MPVKit",
-            targets: ["_MPVKit", "MPVKitSampleBuffer"]
-        ),
-        .library(
             name: "MPVKit-GPL",
             targets: ["_MPVKit-GPL", "MPVKitSampleBufferGPL"]
-        ),
-        .library(
-            name: "MPVKitSampleBuffer",
-            targets: ["MPVKitSampleBuffer"]
         ),
         .library(
             name: "MPVKitSampleBuffer-GPL",
@@ -24,19 +16,6 @@ let package = Package(
         ),
     ],
     targets: [
-        .target(
-            name: "MPVKitSampleBuffer",
-            dependencies: ["Libmpv", "_FFmpeg", "Libuchardet", "Libbluray"],
-            path: "Sources/MPVKitSampleBuffer",
-            linkerSettings: [
-                .linkedFramework("AVFoundation"),
-                .linkedFramework("CoreMedia"),
-                .linkedFramework("CoreVideo"),
-                .linkedFramework("Metal"),
-                .linkedFramework("QuartzCore"),
-                .linkedFramework("UIKit", .when(platforms: [.iOS])),
-            ]
-        ),
         .target(
             name: "MPVKitSampleBufferGPL",
             dependencies: ["Libmpv-GPL", "_FFmpeg-GPL", "Libuchardet", "Libbluray"],
@@ -48,43 +27,6 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("UIKit", .when(platforms: [.iOS])),
-            ]
-        ),
-        .target(
-            name: "_MPVKit",
-            dependencies: [
-                "Libmpv", "_FFmpeg", "Libuchardet", "Libbluray",
-                .target(name: "Libluajit", condition: .when(platforms: [.macOS])),
-            ],
-            path: "Sources/_MPVKit",
-            linkerSettings: [
-                .linkedFramework("AVFoundation"),
-                .linkedFramework("CoreAudio"),
-            ]
-        ),
-        .target(
-            name: "_FFmpeg",
-            dependencies: [
-                "Libavcodec", "Libavdevice", "Libavfilter", "Libavformat", "Libavutil", "Libswresample", "Libswscale",
-                "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
-                "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
-                "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d"
-            ],
-            path: "Sources/_FFmpeg",
-            linkerSettings: [
-                .linkedFramework("AudioToolbox"),
-                .linkedFramework("CoreVideo"),
-                .linkedFramework("CoreFoundation"),
-                .linkedFramework("CoreMedia"),
-                .linkedFramework("Metal"),
-                .linkedFramework("VideoToolbox"),
-                .linkedLibrary("bz2"),
-                .linkedLibrary("iconv"),
-                .linkedLibrary("expat"),
-                .linkedLibrary("resolv"),
-                .linkedLibrary("xml2"),
-                .linkedLibrary("z"),
-                .linkedLibrary("c++"),
             ]
         ),
         .target(
@@ -123,47 +65,6 @@ let package = Package(
                 .linkedLibrary("z"),
                 .linkedLibrary("c++"),
             ]
-        ),
-
-        .binaryTarget(
-            name: "Libmpv-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libmpv-GPL.xcframework.zip",
-            checksum: "8a443e65f5c76e6ff61bdc965a59717193615cceac089d7d3bfe248e7a95a418"
-        ),
-        .binaryTarget(
-            name: "Libavcodec-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavcodec-GPL.xcframework.zip",
-            checksum: "8701d4af2e629d11561574a9372ccbdc530f1d78c8f3622e88183db36d0ab0b1"
-        ),
-        .binaryTarget(
-            name: "Libavdevice-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavdevice-GPL.xcframework.zip",
-            checksum: "45c0dfb38d142933d2e369d41006ecfd6d63abe5ba67009a0efe3b66c96f9b40"
-        ),
-        .binaryTarget(
-            name: "Libavformat-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavformat-GPL.xcframework.zip",
-            checksum: "caaf16a4467d8633e2eb43bea2f217319ba9ad8faf8b39c0de3ae5b7b4a947b0"
-        ),
-        .binaryTarget(
-            name: "Libavfilter-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavfilter-GPL.xcframework.zip",
-            checksum: "23d9b2c41e8c90b5847a4fd9e2b7b672eefc74dca64578e8f2e1277a5e3b7867"
-        ),
-        .binaryTarget(
-            name: "Libavutil-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavutil-GPL.xcframework.zip",
-            checksum: "305b0bec614a415f8c5a92136d2ca061f7297c2c36d5e43d91e71c0362ac7463"
-        ),
-        .binaryTarget(
-            name: "Libswresample-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libswresample-GPL.xcframework.zip",
-            checksum: "212f2b1b5f64a6ed1aa0d414a349ff29967ff19e68f9464f897a5bce8bb18fe5"
-        ),
-        .binaryTarget(
-            name: "Libswscale-GPL",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libswscale-GPL.xcframework.zip",
-            checksum: "d69eb1234aa2e3c8f8defd16a2a797610ba682c97ebe29611b4963ad083e8df0"
         ),
         //AUTO_GENERATE_TARGETS_BEGIN//
 
@@ -286,39 +187,39 @@ let package = Package(
         ),
 
         .binaryTarget(
-            name: "Libavcodec",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavcodec.xcframework.zip",
-            checksum: "9126a81128c25b391123b9d68e27947d1dcedecadc59295bb41ad7d860729f60"
+            name: "Libavcodec-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libavcodec-GPL.xcframework.zip",
+            checksum: "bce8921fdc3ff17489e8ee253fb74b464ab18e350c597c4410dcff8e61a47674"
         ),
         .binaryTarget(
-            name: "Libavdevice",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavdevice.xcframework.zip",
-            checksum: "8818cedf8c32e25a80349c17c57a1ef9b60a88ab1d7b2ea472592b5aeebcce3d"
+            name: "Libavdevice-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libavdevice-GPL.xcframework.zip",
+            checksum: "4f3cde61694ddf341f20e9473eddc6e6add43b23edc4d6a987b1a62e1c3a08f4"
         ),
         .binaryTarget(
-            name: "Libavformat",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavformat.xcframework.zip",
-            checksum: "d38ce980eaad3108ae04522d96a0d011791238f32ddb7cea54979491100c013c"
+            name: "Libavformat-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libavformat-GPL.xcframework.zip",
+            checksum: "1971cb504fe5433621dd895e0d1bc0ebba13087c2b62c63a0d4879de0506f781"
         ),
         .binaryTarget(
-            name: "Libavfilter",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavfilter.xcframework.zip",
-            checksum: "0767bf18906d39d5eb92c15ede9a536f62e2acc086d0e683426a6731084193b1"
+            name: "Libavfilter-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libavfilter-GPL.xcframework.zip",
+            checksum: "0dca132e7cc1c8c3c9d3dc1df6dd7bae13c93533bc0420c4b2964171878464f5"
         ),
         .binaryTarget(
-            name: "Libavutil",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libavutil.xcframework.zip",
-            checksum: "f9a019a214e569566df9426b0e0633e43a411c0d1a49d1940d6f36376a11628e"
+            name: "Libavutil-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libavutil-GPL.xcframework.zip",
+            checksum: "ec41ae7902014ad6894846aa09298b8d7f6861cfc424d61f6f02dc9b7227b661"
         ),
         .binaryTarget(
-            name: "Libswresample",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libswresample.xcframework.zip",
-            checksum: "6e0db53aa7e48d89b7be07d9900fbfa52ec32dd051441e811231e07a0aab2b51"
+            name: "Libswresample-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libswresample-GPL.xcframework.zip",
+            checksum: "1d5bb494cd95d57fedf7d8a24e23ab7d68f7af6d2bb8cb183777e7b94459b953"
         ),
         .binaryTarget(
-            name: "Libswscale",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libswscale.xcframework.zip",
-            checksum: "67c5d72e5029a60008fb2db361fee3eaa3907fb1b9ee8cc7848250778cbb3997"
+            name: "Libswscale-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libswscale-GPL.xcframework.zip",
+            checksum: "7062a9768716dc0dcbbb6b6b0f986d3f1c6ac2fd921b35f019b3be1197d3e9ab"
         ),
 
         .binaryTarget(
@@ -334,9 +235,9 @@ let package = Package(
         ),
 
         .binaryTarget(
-            name: "Libmpv",
-            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.4/Libmpv.xcframework.zip",
-            checksum: "22615977963f870dbf4db7f7396b37e97cc2d5cfb6947a0266c39a0d6cff3c00"
+            name: "Libmpv-GPL",
+            url: "https://github.com/Soupy-dev/MPVKit/releases/download/0.41.0-eclipse-metal.5/Libmpv-GPL.xcframework.zip",
+            checksum: "26e06e288e226f22af8c24af1970c6c9a08d1bf1ffc7d384ef7598d6038914d3"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
