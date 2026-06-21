@@ -58,10 +58,10 @@ index e75cb228f8d99462ccecf7780098ea97ae7cfe02..afc17284773204563f4c90b4860758e6
  #endif
 diff --git forkSrcPrefix/video/out/vulkan/context_moltenvk.m forkDstPrefix/video/out/vulkan/context_moltenvk.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..445b907f795b24b8df80389394d4ae7b3f94c6e5
+index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe24b51708
 --- /dev/null
 +++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,129 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -90,6 +90,8 @@ index 0000000000000000000000000000000000000000..445b907f795b24b8df80389394d4ae7b
 +struct priv {
 +    struct mpvk_ctx vk;
 +    CAMetalLayer *layer;
++    int last_width;
++    int last_height;
 +};
 +
 +static void moltenvk_uninit(struct ra_ctx *ctx)
@@ -142,11 +144,42 @@ index 0000000000000000000000000000000000000000..445b907f795b24b8df80389394d4ae7b
 +    struct priv *p = ctx->priv;
 +    CGSize s = p->layer.drawableSize;
 +    ra_vk_ctx_resize(ctx, s.width, s.height);
++    // Seed the cached size so the first VOCTRL_CHECK_EVENTS after a real
++    // reconfig does not spuriously re-fire a resize for the same geometry.
++    p->last_width = s.width;
++    p->last_height = s.height;
 +    return true;
 +}
 +
 +static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 +{
++    struct priv *p = ctx->priv;
++
++    switch (request) {
++    case VOCTRL_CHECK_EVENTS: {
++        // The vulkan swapchain does not auto-track the CAMetalLayer's
++        // drawableSize; mpv only learns about a surface size change when we
++        // report it here. On rotation the host updates drawableSize, so poll
++        // it and, if it changed, update the tracked geometry and signal a
++        // resize. We deliberately do NOT call ra_vk_ctx_resize() here: the
++        // canonical mpv flow has the player's resize() handler call it in
++        // response to VO_EVENT_RESIZE, keeping vo state and the swapchain in
++        // sync exactly once and avoiding a double-resize.
++        CGSize s = p->layer.drawableSize;
++        int w = s.width;
++        int h = s.height;
++        if (w > 0 && h > 0 && (w != p->last_width || h != p->last_height)) {
++            ctx->vo->dwidth = w;
++            ctx->vo->dheight = h;
++            p->last_width = w;
++            p->last_height = h;
++            *events |= VO_EVENT_RESIZE;
++            MP_VERBOSE(ctx, "surface resized to %dx%d\n", w, h);
++        }
++        return VO_TRUE;
++    }
++    }
++
 +    return VO_NOTIMPL;
 +}
 +
