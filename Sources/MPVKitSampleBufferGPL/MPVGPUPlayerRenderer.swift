@@ -59,6 +59,10 @@ public struct MPVGPUPlayerRendererDiagnostics: Equatable {
     public let inlineGPUContext: String
     public let pictureInPictureDiagnostics: MPVMetalSampleBufferRendererDiagnostics?
     public let backendDescription: String
+    /// Best available decoded/container frame-rate estimate; 0 when mpv has not resolved one yet.
+    public let estimatedFramesPerSecond: Double
+    /// Active video codec name (`video-codec`); empty when no video is loaded.
+    public let videoCodec: String
     /// Decoded video frame width/height in pixels (`video-params/w`/`h`); 0 when no video.
     public let videoWidth: Int
     public let videoHeight: Int
@@ -618,6 +622,10 @@ public final class MPVGPUPlayerRenderer {
             backendDescription: isPictureInPictureActive
                 ? "AVSampleBufferDisplayLayer PiP bridge backed by MPVMetalSampleBufferRenderer"
                 : "mpv gpu-next renderer backed by MoltenVK CAMetalLayer",
+            estimatedFramesPerSecond: getDoubleProperty("estimated-vf-fps")
+                ?? getDoubleProperty("container-fps")
+                ?? 0,
+            videoCodec: getStringProperty("video-codec") ?? "",
             videoWidth: Int(getInt64Property("video-params/w") ?? 0),
             videoHeight: Int(getInt64Property("video-params/h") ?? 0),
             videoTransferFunction: getStringProperty("video-params/gamma") ?? "",
@@ -1014,6 +1022,7 @@ public final class MPVGPUPlayerRenderer {
     public var onStateChange: ((MPVGPUPlayerRendererState) -> Void)?
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
+    public var onVideoReconfigure: (() -> Void)?
 
     public convenience init(options: MPVGPUPlayerRendererOptions = MPVGPUPlayerRendererOptions()) {
         self.init(
@@ -1073,6 +1082,8 @@ public final class MPVGPUPlayerRenderer {
             inlineGPUContext: "unsupported",
             pictureInPictureDiagnostics: nil,
             backendDescription: "unsupported",
+            estimatedFramesPerSecond: 0,
+            videoCodec: "",
             videoWidth: 0,
             videoHeight: 0,
             videoTransferFunction: "",
