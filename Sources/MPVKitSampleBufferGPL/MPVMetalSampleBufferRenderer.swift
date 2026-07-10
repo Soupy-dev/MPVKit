@@ -372,24 +372,15 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     public func play() {
-        performOnMain {
-            // The PiP sample-buffer display layer uses this flag to choose its control-timebase
-            // rate.  Waiting for MPV_EVENT_PROPERTY_CHANGE leaves the first PiP frames at rate
-            // zero, which iPadOS can snapshot as a permanently black window.
-            self.isPaused = false
-            self.setFlagProperty("pause", false)
-            self.updateState(.playing)
-            self.forceRenderBurst(count: 3)
-        }
+        setFlagProperty("pause", false)
+        updateState(.playing)
+        forceRenderBurst(count: 3)
     }
 
     public func pause() {
-        performOnMain {
-            self.isPaused = true
-            self.setFlagProperty("pause", true)
-            self.updateState(.paused)
-            self.forceRenderBurst(count: 1)
-        }
+        setFlagProperty("pause", true)
+        updateState(.paused)
+        forceRenderBurst(count: 1)
     }
 
     public func seek(to seconds: Double) {
