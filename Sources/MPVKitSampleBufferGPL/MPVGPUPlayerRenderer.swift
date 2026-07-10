@@ -97,7 +97,8 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer {
         }
     }
 
-    @available(iOS 16.0, macOS 10.15, macCatalyst 16.0, tvOS 16.0, visionOS 1.0, *)
+    #if !os(tvOS)
+    @available(iOS 16.0, macOS 10.15, macCatalyst 16.0, visionOS 1.0, *)
     public override var wantsExtendedDynamicRangeContent: Bool {
         get { super.wantsExtendedDynamicRangeContent }
         set {
@@ -110,6 +111,7 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer {
             }
         }
     }
+    #endif
 }
 
 #if os(iOS)
