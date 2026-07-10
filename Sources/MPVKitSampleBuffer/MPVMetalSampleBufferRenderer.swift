@@ -196,6 +196,7 @@ public final class MPVMetalSampleBufferRenderer {
     private var metalDevice: MTLDevice?
     private var metalCommandQueue: MTLCommandQueue?
     private var metalTextureCache: CVMetalTextureCache?
+    private var opaqueBGRAConversionPipeline: MTLComputePipelineState?
     private var hdrConversionPipeline: MTLComputePipelineState?
     private var highBitDepthConversionPipeline: MTLComputePipelineState?
     private var metalCompatibilityProbeSucceeded = false
@@ -536,6 +537,10 @@ public final class MPVMetalSampleBufferRenderer {
     private func configureDisplayLayer() {
         displayLayer.videoGravity = .resizeAspect
         displayLayer.backgroundColor = UIColor.black.cgColor
+        // libmpv's software `bgr0` target does not define its fourth byte. The
+        // CoreVideo surface is intentionally presented as opaque BGRA, so make
+        // that contract explicit for AVKit's out-of-process PiP compositor.
+        displayLayer.isOpaque = true
         if #available(iOS 17.0, *) {
             displayLayer.wantsExtendedDynamicRangeContent = true
         }
@@ -822,9 +827,13 @@ public final class MPVMetalSampleBufferRenderer {
         lastSourcePixelFormatDescription = "bgr0/BGRA8"
         probeMetalCompatibility(buffer: buffer, width: width, height: height)
         let presentationBuffer = makeMetalPresentationBuffer(from: buffer, width: width, height: height) ?? buffer
+        if presentationBuffer === buffer {
+            makeBGRAOpaque(buffer)
+        }
         if !enqueue(buffer: presentationBuffer), presentationBuffer !== buffer {
             hdrPresentationDisabled = true
             presentationBackend = .metalIOSurface
+            makeBGRAOpaque(buffer)
             _ = enqueue(buffer: buffer)
         }
     }
@@ -1053,10 +1062,12 @@ public final class MPVMetalSampleBufferRenderer {
             return hdrBuffer
         }
 
-        guard let destinationBuffer = makePixelBuffer(width: width, height: height) else {
+        guard let destinationBuffer = makePixelBuffer(width: width, height: height),
+              let pipeline = opaqueBGRAConversionPipeline ?? makeOpaqueBGRAConversionPipeline() else {
             presentationBackend = .softwareIOSurface
             return nil
         }
+        opaqueBGRAConversionPipeline = pipeline
 
         var sourceTextureRef: CVMetalTexture?
         var destinationTextureRef: CVMetalTexture?
@@ -1089,25 +1100,24 @@ public final class MPVMetalSampleBufferRenderer {
               let sourceTexture = CVMetalTextureGetTexture(sourceTextureRef),
               let destinationTexture = CVMetalTextureGetTexture(destinationTextureRef),
               let commandBuffer = commandQueue.makeCommandBuffer(),
-              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
             metalPresentationFailureCount += 1
             presentationBackend = .softwareIOSurface
             CVMetalTextureCacheFlush(cache, 0)
             return nil
         }
 
-        blitEncoder.copy(
-            from: sourceTexture,
-            sourceSlice: 0,
-            sourceLevel: 0,
-            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(width: width, height: height, depth: 1),
-            to: destinationTexture,
-            destinationSlice: 0,
-            destinationLevel: 0,
-            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(sourceTexture, index: 0)
+        encoder.setTexture(destinationTexture, index: 1)
+        let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
+        let threadgroups = MTLSize(
+            width: (width + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+            height: (height + threadsPerThreadgroup.height - 1) / threadsPerThreadgroup.height,
+            depth: 1
         )
-        blitEncoder.endEncoding()
+        encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+        encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         CVMetalTextureCacheFlush(cache, 0)
@@ -1115,7 +1125,7 @@ public final class MPVMetalSampleBufferRenderer {
         guard commandBuffer.status == .completed else {
             metalPresentationFailureCount += 1
             presentationBackend = .softwareIOSurface
-            reportError("Metal presentation blit failed status=\(commandBuffer.status.rawValue)")
+            reportError("opaque BGRA Metal presentation failed status=\(commandBuffer.status.rawValue)")
             return nil
         }
 
@@ -1333,6 +1343,55 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
+    private func makeOpaqueBGRAConversionPipeline() -> MTLComputePipelineState? {
+        guard let metalDevice else { return nil }
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void mpvkit_copy_opaque_bgra8(
+            texture2d<float, access::read> sourceTexture [[texture(0)]],
+            texture2d<float, access::write> destinationTexture [[texture(1)]],
+            uint2 gid [[thread_position_in_grid]]
+        ) {
+            if (gid.x >= destinationTexture.get_width() || gid.y >= destinationTexture.get_height()) {
+                return;
+            }
+            float4 color = sourceTexture.read(gid);
+            color.a = 1.0;
+            destinationTexture.write(color, gid);
+        }
+        """
+        do {
+            let library = try metalDevice.makeLibrary(source: source, options: nil)
+            guard let function = library.makeFunction(name: "mpvkit_copy_opaque_bgra8") else {
+                return nil
+            }
+            return try metalDevice.makeComputePipelineState(function: function)
+        } catch {
+            reportError("opaque BGRA Metal presentation pipeline failed: \(error)")
+            return nil
+        }
+    }
+
+    private func makeBGRAOpaque(_ buffer: CVPixelBuffer) {
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        for rowIndex in 0..<height {
+            let row = baseAddress
+                .advanced(by: rowIndex * bytesPerRow)
+                .assumingMemoryBound(to: UInt32.self)
+            for columnIndex in 0..<width {
+                row[columnIndex] |= 0xFF00_0000
+            }
+        }
+    }
+
     private func makeHighBitDepthConversionPipeline() -> MTLComputePipelineState? {
         guard let metalDevice else { return nil }
         let source = """
@@ -1480,6 +1539,18 @@ public final class MPVMetalSampleBufferRenderer {
     private func applyColorAttachments(to buffer: CVPixelBuffer) {
         let isHDR = streamLooksHDR
         hdrMetadataApplied = isHDR
+        if CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA {
+            // MPV_RENDER_PARAM_SW_FORMAT `bgr0` leaves the fourth component
+            // uninitialized (commonly zero). Without this attachment AVKit can
+            // interpret that byte as transparent alpha and PiP becomes black
+            // even though the same layer renders correctly inline.
+            CVBufferSetAttachment(
+                buffer,
+                kCVImageBufferAlphaChannelIsOpaque,
+                kCFBooleanTrue,
+                .shouldPropagate
+            )
+        }
         CVBufferSetAttachment(
             buffer,
             kCVImageBufferColorPrimariesKey,
