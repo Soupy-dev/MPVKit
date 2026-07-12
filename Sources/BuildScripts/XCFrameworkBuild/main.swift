@@ -90,7 +90,7 @@ enum Library: String, CaseIterable {
         case .libluajit:
             return "2.1.0-xcode"
         case .libuavs3d:
-            return "1.2.1-xcode"
+            return "1.2.1"
         }
     }
 
