@@ -61,7 +61,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe24b51708
 --- /dev/null
 +++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,168 @@
 +/*
 + * This file is part of mpv.
 + *
