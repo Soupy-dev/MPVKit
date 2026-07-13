@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreGraphics
+import Darwin
 import Foundation
 import QuartzCore
 
@@ -124,8 +125,26 @@ import Metal
 import UIKit
 
 public final class MPVGPUPlayerRenderer {
+    /// Explains why the inline Vulkan/MoltenVK renderer should not be selected on this device.
+    /// The sample-buffer renderer remains available on older Apple GPUs and is a safer default
+    /// there than asking gpu-next/libplacebo to build a modern Vulkan swapchain.
+    public static var inlineGPUUnavailableReason: String? {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return "Metal is unavailable"
+        }
+#if targetEnvironment(simulator)
+        _ = device
+        return nil
+#else
+        guard device.supportsFamily(.apple4) else {
+            return "the GPU predates Apple family 4"
+        }
+        return nil
+#endif
+    }
+
     public static var isSupported: Bool {
-        MTLCreateSystemDefaultDevice() != nil
+        inlineGPUUnavailableReason == nil
     }
 
     public let inlineLayer: CAMetalLayer
@@ -255,8 +274,16 @@ public final class MPVGPUPlayerRenderer {
 
         guard !isRunning else { return }
         guard Self.isSupported else {
-            updateState(.failed("Metal is unavailable"))
+            let reason = Self.inlineGPUUnavailableReason ?? "Metal is unavailable"
+            updateState(.failed(reason))
             throw MPVMetalSampleBufferRendererError.metalUnavailable
+        }
+
+        // MoltenVK 1.4.1's descriptor implementation deliberately traps invalid resource
+        // lifetimes. Keep its live-resource validation enabled unless the host explicitly chose a
+        // different policy, converting a potential use-after-free crash into validation/fallback.
+        if getenv("MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES") == nil {
+            _ = setenv("MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES", "1", 0)
         }
 
         isStopping = false

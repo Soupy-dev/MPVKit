@@ -61,7 +61,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe24b51708
 --- /dev/null
 +++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,156 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -82,6 +82,7 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +#include <CoreGraphics/CoreGraphics.h>
 +#include <QuartzCore/CAMetalLayer.h>
 +#include <MoltenVK/mvk_vulkan.h>
++#include <math.h>
 +
 +#include "common.h"
 +#include "context.h"
@@ -90,9 +91,53 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +struct priv {
 +    struct mpvk_ctx vk;
 +    CAMetalLayer *layer;
-+    int last_width;
-+    int last_height;
++    CGSize last_drawable_size;
 +};
++
++static bool drawable_size_valid(CGSize size)
++{
++    return isfinite(size.width) && isfinite(size.height) &&
++           size.width > 1.0 && size.height > 1.0;
++}
++
++static bool drawable_size_changed(CGSize current, CGSize previous)
++{
++    return fabs(current.width - previous.width) >= 1.0 ||
++           fabs(current.height - previous.height) >= 1.0;
++}
++
++static bool moltenvk_resize_to_size(struct ra_ctx *ctx, CGSize size,
++                                    const char *reason)
++{
++    struct priv *p = ctx->priv;
++    if (!drawable_size_valid(size))
++        return false;
++
++    int width = MPMAX(1, (int)llround(size.width));
++    int height = MPMAX(1, (int)llround(size.height));
++    CGColorSpaceRef previous_color_space = p->layer.colorspace;
++    if (previous_color_space)
++        CFRetain(previous_color_space);
++
++    bool ok = ra_vk_ctx_resize(ctx, width, height);
++    if (previous_color_space) {
++        p->layer.colorspace = previous_color_space;
++        CFRelease(previous_color_space);
++    }
++    if (!ok) {
++        MP_WARN(ctx, "surface resize to %dx%d failed reason=%s; will retry\n",
++                width, height, reason ? reason : "unknown");
++        return false;
++    }
++
++    ctx->vo->dwidth = width;
++    ctx->vo->dheight = height;
++    p->last_drawable_size = size;
++
++    MP_VERBOSE(ctx, "surface resized to %dx%d reason=%s\n", width, height,
++               reason ? reason : "unknown");
++    return ok;
++}
 +
 +static void moltenvk_uninit(struct ra_ctx *ctx)
 +{
@@ -142,42 +187,36 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +static bool moltenvk_reconfig(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv;
-+    CGSize s = p->layer.drawableSize;
-+    ra_vk_ctx_resize(ctx, s.width, s.height);
-+    // Seed the cached size so the first VOCTRL_CHECK_EVENTS after a real
-+    // reconfig does not spuriously re-fire a resize for the same geometry.
-+    p->last_width = s.width;
-+    p->last_height = s.height;
-+    return true;
++    if (!p->layer)
++        return false;
++
++    CGSize size = p->layer.drawableSize;
++    if (!drawable_size_valid(size)) {
++        MP_VERBOSE(ctx, "deferring surface resize for invalid drawable %.2fx%.2f\n",
++                   size.width, size.height);
++        return true;
++    }
++    return moltenvk_resize_to_size(ctx, size, "reconfig");
 +}
 +
 +static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 +{
 +    struct priv *p = ctx->priv;
 +
-+    switch (request) {
-+    case VOCTRL_CHECK_EVENTS: {
++    if (request == VOCTRL_CHECK_EVENTS && p->layer) {
 +        // The vulkan swapchain does not auto-track the CAMetalLayer's
 +        // drawableSize; mpv only learns about a surface size change when we
-+        // report it here. On rotation the host updates drawableSize, so poll
-+        // it and, if it changed, update the tracked geometry and signal a
-+        // resize. We deliberately do NOT call ra_vk_ctx_resize() here: the
-+        // canonical mpv flow has the player's resize() handler call it in
-+        // response to VO_EVENT_RESIZE, keeping vo state and the swapchain in
-+        // sync exactly once and avoiding a double-resize.
++        // report it here. gpu-next's generic Vulkan resize hook is a no-op,
++        // so resize the Vulkan RA context directly before exposing the new
++        // geometry to the VO. This keeps the swapchain and CAMetalLayer in
++        // agreement through iPad rotation and Stage Manager resizing.
 +        CGSize s = p->layer.drawableSize;
-+        int w = s.width;
-+        int h = s.height;
-+        if (w > 0 && h > 0 && (w != p->last_width || h != p->last_height)) {
-+            ctx->vo->dwidth = w;
-+            ctx->vo->dheight = h;
-+            p->last_width = w;
-+            p->last_height = h;
-+            *events |= VO_EVENT_RESIZE;
-+            MP_VERBOSE(ctx, "surface resized to %dx%d\n", w, h);
++        if (drawable_size_valid(s) &&
++            drawable_size_changed(s, p->last_drawable_size)) {
++            if (moltenvk_resize_to_size(ctx, s, "size-changed"))
++                *events |= VO_EVENT_RESIZE | VO_EVENT_EXPOSE;
 +        }
 +        return VO_TRUE;
-+    }
 +    }
 +
 +    return VO_NOTIMPL;

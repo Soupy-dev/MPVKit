@@ -1,0 +1,65 @@
+diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
+index 8d4eb4d..95aa637 100644
+--- a/audio/out/ao_audiounit.m
++++ b/audio/out/ao_audiounit.m
+@@ -24,6 +24,8 @@
+ #include "ao_coreaudio_utils.h"
+ #include "ao_coreaudio_chmap.h"
+ 
++#include <stdint.h>
++
+ #import <AudioUnit/AudioUnit.h>
+ #import <CoreAudio/CoreAudioTypes.h>
+ #import <AudioToolbox/AudioToolbox.h>
+@@ -35,6 +37,33 @@
+     double device_latency;
+ };
+ 
++static void silence_buffers(struct ao *ao, AudioBufferList *buffer_list)
++{
++    if (!ao || !buffer_list)
++        return;
++    for (UInt32 n = 0; n < buffer_list->mNumberBuffers; n++) {
++        AudioBuffer *buffer = &buffer_list->mBuffers[n];
++        if (buffer->mData && buffer->mDataByteSize)
++            af_fill_silence(buffer->mData, buffer->mDataByteSize, ao->format);
++    }
++}
++
++static bool validate_render_buffers(struct ao *ao, AudioBufferList *buffer_list,
++                                    UInt32 frames)
++{
++    if (!ao || !buffer_list || ao->num_planes <= 0 ||
++        buffer_list->mNumberBuffers < (UInt32)ao->num_planes ||
++        ao->sstride <= 0 || frames > UINT32_MAX / (UInt32)ao->sstride)
++        return false;
++    UInt32 needed = frames * (UInt32)ao->sstride;
++    for (int n = 0; n < ao->num_planes; n++) {
++        AudioBuffer *buffer = &buffer_list->mBuffers[n];
++        if (!buffer->mData || buffer->mDataByteSize < needed)
++            return false;
++    }
++    return true;
++}
++
+ static OSStatus au_get_ary(AudioUnit unit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, void **data, UInt32 *outDataSize)
+ {
+     OSStatus err;
+@@ -88,9 +117,16 @@ static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
+                               UInt32 frames, AudioBufferList *buffer_list)
+ {
+     struct ao *ao = ctx;
+-    struct priv *p = ao->priv;
+     void *planes[MP_NUM_CHANNELS] = {0};
+ 
++    if (!ao || !ao->priv || !validate_render_buffers(ao, buffer_list, frames)) {
++        if (aflags)
++            *aflags |= kAudioUnitRenderAction_OutputIsSilence;
++        silence_buffers(ao, buffer_list);
++        return noErr;
++    }
++    struct priv *p = ao->priv;
++
+     for (int n = 0; n < ao->num_planes; n++)
+         planes[n] = buffer_list->mBuffers[n].mData;
+ 
