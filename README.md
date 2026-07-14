@@ -16,17 +16,151 @@ Forked from [kingslay/FFmpegKit](https://github.com/kingslay/FFmpegKit)
 
 Metal support only a patch version ([#7857](https://github.com/mpv-player/mpv/pull/7857)) and does not officially support it yet. Encountering any issues is not strange. 
 
-## Experimental iOS sample-buffer output
+## Apple GPU and sample-buffer renderers
 
-This fork exposes an iOS-only `MPVMetalSampleBufferRenderer` module through the `MPVKitSampleBuffer` and `MPVKitSampleBuffer-GPL` products, and also through the existing `MPVKit` / `MPVKit-GPL` products. The renderer owns an `AVSampleBufferDisplayLayer`, creates IOSurface-backed `CVPixelBuffer` frames with Metal compatibility, wraps them in `CMSampleBuffer`, and queues them for inline playback or AVKit Picture in Picture.
+The `MPVKitSampleBuffer` and `MPVKitSampleBuffer-GPL` products expose two
+`@MainActor` renderers. They are also included in the corresponding `MPVKit`
+products. Renderer callbacks are delivered on the main actor.
 
-The sample-buffer bridge is GPU-presented, but it is not the same as mpv's inline `gpu-next` renderer: libmpv renders into software targets, then the kit queues Metal-compatible sample buffers for display and AVKit PiP. HDR-looking streams first try a high-bit-depth path: libmpv renders into an `rgba64` software target, a Metal compute pass converts that 16-bit-per-channel source into an RGBA16F IOSurface-backed `CVPixelBuffer`, and CoreVideo color metadata is attached before the sample buffer is enqueued. If the device, layer, mpv format, or Metal pipeline rejects that path, the renderer disables it for the session and falls back to the BGRA Metal/IOSurface route. Diagnostics expose whether the active presentation backend is `metalHighBitDepthHDRIOSurface`, `metalHDRIOSurface`, `metalIOSurface`, or `softwareIOSurface`, along with render API, source pixel format, output pixel format, stream color tags, and Metal presentation frame/failure counts.
+| Renderer | Intended use |
+|---|---|
+| `MPVGPUPlayerRenderer` | Preferred inline renderer. It uses mpv `gpu-next`, Vulkan, libplacebo, MoltenVK, and a `CAMetalLayer`; its default PiP policy first attempts the same mpv session's native GPU output. |
+| `MPVMetalSampleBufferRenderer` | Standalone sample-buffer renderer and hardened compatibility bridge. It renders into bounded IOSurface-backed buffers and feeds an `AVSampleBufferDisplayLayer`. |
 
-For heat-sensitive inline playback, prefer the iOS-only `MPVGPUPlayerRenderer`. It presents the main video through mpv `vo=gpu-next`, `gpu-api=vulkan`, and `gpu-context=moltenvk` on a `CAMetalLayer`, while preserving AVKit PiP by lazily starting the existing sample-buffer renderer only for PiP handoff. The default inline options use `profile=fast`, `hwdec=videotoolbox`, `vd-lavc-dr=yes`, `video-sync=audio`, `framedrop=vo`, and `interpolation=no`; HDR display hinting is opt-in so SDR playback does not enter the EDR path by default.
+Inline playback is available on iOS/tvOS 14 or newer and Apple Silicon macOS
+11 or newer. Custom sample-buffer PiP is runtime-gated to iOS/tvOS 15 and
+macOS 12. The new macOS renderer is arm64-only; Intel uses the unsupported stub.
+MPVKit owns frame production, clocks, readiness, and safe teardown. The host
+continues to own `AVPictureInPictureController`, scene and window policy,
+remote-command policy, and application lifecycle decisions.
 
-Use `MPVGPUPlayerRenderer.inlineLayer` for the on-screen player layer and `MPVGPUPlayerRenderer.pictureInPictureDisplayLayer` as the `AVPictureInPictureController.ContentSource` display layer. Call `prepareForPictureInPictureStart()` before AVKit starts PiP, `beginPictureInPicture()` once PiP starts, and `endPictureInPicture(restoringInlinePlayback:)` when PiP stops so only one mpv renderer remains active after handoff.
+### Single-session GPU PiP
 
-Use the iOS demo app and select **Metal Sample Buffer** to smoke-test the API. Keep the existing OpenGL or MoltenVK layer renderer as fallback until device testing validates PiP start, PiP stop restore, subtitles, timing, heat, and long playback.
+`MPVGPUPlayerRendererOptions.pictureInPictureBackendPreference` accepts:
+
+| Preference | Behavior |
+|---|---|
+| `.automatic` | Default. Attempts the native one-session GPU sink once for each load, then latches the video-only compatibility bridge if the runtime probe or first-frame preparation fails. An active native failure receives at most one compatibility failover attempt. |
+| `.singleSessionGPU` | Strict one-session mode. Preparation fails instead of reopening the media when the native sink is unavailable. |
+| `.compatibilityDualSession` | Always uses the second, video-only mpv instance. The primary instance remains authoritative for audio, position, pause, speed, and commands. |
+
+The native sink receives the final `gpu-next`/libplacebo image after subtitles
+and OSD composition. It can render while a background `CAMetalLayer` has no
+drawable, and it returns the exact frame PTS only after GPU completion. This
+fork's native patch prefers direct Vulkan/libplacebo rendering into a
+three-buffer IOSurface pool. When direct import is unavailable, it renders to
+an exportable offscreen texture and completes an asynchronous Metal blit into
+the IOSurface before releasing the exact PTS and generation. If neither runtime
+probe succeeds, `.automatic` latches the compatibility bridge for that load.
+
+The compatibility instance is muted and video-only, but it must open the URL a
+second time. Use `.singleSessionGPU` when a signed, one-shot, or live source
+must never be reopened. The bridge disables primary video only after its first
+valid frame and waits for the restored primary output before destroying the
+second instance. Backend selection never oscillates within one media load.
+
+Use `inlineLayer` for the on-screen player and
+`pictureInPictureDisplayLayer` for AVKit's sample-buffer content source:
+
+```swift
+@MainActor
+func configurePlayback(url: URL) async throws {
+    let renderer = MPVGPUPlayerRenderer(
+        options: .init(pictureInPictureBackendPreference: .automatic)
+    )
+    try renderer.start()
+    renderer.load(url)
+
+    // Await this before asking AVKit to start PiP. It completes only after a
+    // valid frame from the current load generation has been enqueued.
+    try await renderer.preparePictureInPicture()
+
+    // The host now asks its AVPictureInPictureController to start. Forward
+    // AVKit's didStart callback only after AVKit has completed the handoff.
+    renderer.beginPictureInPicture()
+
+    // Forward AVKit's didTransitionToRenderSize value when it changes.
+    renderer.updatePictureInPictureRenderSize(CGSize(width: 1280, height: 720))
+
+    // Forward AVKit's didStop callback and its restoration decision.
+    renderer.endPictureInPicture(restoringInlinePlayback: true)
+
+    // stop() is nonblocking and idempotent. Await the drain before reuse.
+    renderer.stop()
+    await renderer.waitUntilStopped()
+}
+```
+
+`MPVPictureInPictureState` reports `.idle`, generation-scoped `.preparing`,
+`.ready`, `.active`, `.restoring`, and `.failed` states. Hosts should use
+`onPictureInPictureStateChange` instead of watchdog/priming bursts. After a
+PiP pause, speed change, duration change, or seek, invalidate the host-owned
+AVKit playback state; `waitForPictureInPictureTimelineUpdate()` can be used to
+wait until the renderer/timebase update is installed before completing a skip
+command. A new load supersedes old preparation, frame, flush, and GPU callbacks.
+
+`prepareForPictureInPictureStart(primeFrameCount:)`,
+`primePictureInPictureFrames(reason:count:)`, and the standalone renderer's
+`primeFrames(reason:count:)` remain for source compatibility but are deprecated.
+Their counts are bounded to a coalesced immediate attempt plus one retry. New
+code should await `preparePictureInPicture()`.
+
+`MPVGPUPlayerRendererOptions` also controls the three-buffer capacity, the
+one-second default preparation timeout, PiP frame size/FPS, inline drawable
+pixel cap, and resize debounce interval. `updateInlineLayerLayout` updates the
+visible layer immediately while coalescing expensive drawable resizes. Invalid
+or non-finite sizes are ignored, and a zero-sized detachment keeps the last
+valid drawable.
+
+Diagnostics expose the requested and selected PiP backend, fallback reason,
+active mpv instance count, preparation generation/latency, resize requests and
+coalescing, scheduler coalescing, display backpressure, pool exhaustion, stale
+generation drops, in-flight GPU buffers, GPU latency, timeline epoch/rate, and
+AudioUnit recovery count. Stream codec, size, FPS, HDR tags, pixel format, and
+hardware-decoder details are included as well. The actual backend is reported
+as `.singleSessionGPUDirectIOSurface`,
+`.singleSessionGPUAsynchronousMetalBlit`, or `.compatibilityDualSession`.
+
+### HDR behavior and the compatibility renderer
+
+Inline `gpu-next` playback retains its native color pipeline. EDR layer hinting
+is opt-in through `enablesTargetColorspaceHint` and is enabled only when the
+loaded stream is actually tagged as HDR. Single-session GPU PiP intentionally
+targets predictable SDR BT.709/sRGB BGRA8, so libplacebo tone-maps HDR before
+the frame reaches AVKit.
+
+When used directly, `MPVMetalSampleBufferRenderer` keeps its standalone HDR
+path: libmpv renders a high-bit-depth source, Metal converts it asynchronously
+into an RGBA16F IOSurface-backed pixel buffer, and CoreVideo color metadata is
+attached. Conversion failures preserve the last good frame and fall back to
+tagged SDR. Its diagnostics report the active presentation backend
+(`metalHighBitDepthHDRIOSurface`, `metalHDRIOSurface`, `metalIOSurface`, or
+`softwareIOSurface`), formats, color tags, frame counts, failures, timeline,
+backpressure, and pool usage.
+
+Both renderers use demand-driven scheduling, bounded allocation, asynchronous
+GPU completion, and asynchronous teardown. `start()` rejects reuse while the
+renderer is `.stopping`; call `waitUntilStopped()` before restarting it.
+
+The iOS, tvOS, and macOS demos exercise the renderer API. Simulator builds are
+useful for compile and state-flow validation, but PiP black-frame, timing, HDR,
+thermal, and long-run acceptance require physical devices.
+
+After building Apple-platform artifacts, an Apple Silicon Mac can exercise the
+native sink itself against the local Libmpv rather than only checking exported
+symbols. The harness creates one real mpv handle, plays a deterministic local
+H.264 fixture through gpu-next/MoltenVK, validates all four output modes and
+generation-scoped IOSurface callbacks, then verifies `disable_and_drain` has no
+late callback:
+
+```bash
+MPVKIT_LOCAL_ARTIFACTS_DIR=dist/release \
+  MPVKIT_NATIVE_RUNTIME_REQUIRED=1 \
+  bash Scripts/check-apple-pip-runtime.sh
+```
+
+Unsupported hosts print `SKIP(platform)` unless the required flag is set;
+missing or incomplete artifacts and runtime failures always fail distinctly.
 
 ## Installation
 
@@ -60,47 +194,30 @@ make help
 
 ## Make demo app using the local build version
 
-If you want the demo app to use the local build version, you need to modify `Package.swift` to reference the local build xcframework file.
+Set `MPVKIT_LOCAL_ARTIFACTS_DIR` to a relative or absolute directory that
+resolves inside this checkout. The manifest looks both in that directory and
+its `xcframework/` child for locally built `.xcframework` directories or
+`.xcframework.zip` archives. This means the standard `make build` layout can
+be selected by pointing at `dist/release`, while artifacts are discovered in
+`dist/release/xcframework`. Unpacked XCFrameworks are preferred to ZIP archives
+when both are present.
 
-<details>
-<summary>Click here for more information.</summary>
-  
-```
-.binaryTarget(
-    name: "Libmpv-GPL",
-    path: "dist/release/Libmpv.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libavcodec-GPL",
-    path: "dist/release/Libavcodec.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libavdevice-GPL",
-    path: "dist/release/Libavdevice.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libavformat-GPL",
-    path: "dist/release/Libavformat.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libavfilter-GPL",
-    path: "dist/release/Libavfilter.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libavutil-GPL",
-    path: "dist/release/Libavutil.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libswresample-GPL",
-    path: "dist/release/Libswresample.xcframework.zip"
-),
-.binaryTarget(
-    name: "Libswscale-GPL",
-    path: "dist/release/Libswscale.xcframework.zip"
-),
+Files must use their Swift package target names, such as
+`Libmpv-GPL.xcframework.zip`. Matching local artifacts are used automatically;
+targets that are not present continue using their versioned remote artifacts.
+GPL targets also recognize the unsuffixed filenames emitted directly by
+`make build enable-gpl`, such as `Libmpv.xcframework.zip`.
+
+```bash
+export MPVKIT_LOCAL_ARTIFACTS_DIR=dist/release
+xcodebuild -resolvePackageDependencies # or build a demo/Eclipse normally
 ```
 
-</details>
+The directory must resolve inside this MPVKit checkout because SwiftPM local
+binary target paths are package-relative. The variable affects manifest
+evaluation, so it must be present in the environment that launches
+`xcodebuild` or resolves the package. Unset it to verify the release
+URL/checksum path.
 
 ## Run default mpv player
 

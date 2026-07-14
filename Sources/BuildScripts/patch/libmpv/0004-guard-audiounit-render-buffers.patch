@@ -1,40 +1,65 @@
 diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
-index 8d4eb4d..95aa637 100644
+index 8d4eb4d..c3a3ce5 100644
 --- a/audio/out/ao_audiounit.m
 +++ b/audio/out/ao_audiounit.m
-@@ -24,6 +24,8 @@
+@@ -24,6 +24,10 @@
  #include "ao_coreaudio_utils.h"
  #include "ao_coreaudio_chmap.h"
--
-+
+
 +#include <stdint.h>
++#include <stdatomic.h>
++#include <string.h>
 +
  #import <AudioUnit/AudioUnit.h>
  #import <CoreAudio/CoreAudioTypes.h>
  #import <AudioToolbox/AudioToolbox.h>
-@@ -35,6 +37,33 @@
+@@ -33,8 +37,58 @@
+ struct priv {
+     AudioUnit audio_unit;
      double device_latency;
++    atomic_bool reload_requested;
  };
--
+
++static atomic_uint_fast64_t audiounit_recovery_count;
++
++// Optional diagnostics ABI used by MPVKit. Keep this in the AudioUnit driver's object file so
++// static Apple builds that include the driver also retain the counter without touching mpv's
++// public client ABI.
++__attribute__((visibility("default"), used, retain))
++uint64_t mpv_apple_audiounit_recovery_count(void)
++{
++    return atomic_load_explicit(&audiounit_recovery_count, memory_order_relaxed);
++}
 +
 +static void silence_buffers(struct ao *ao, AudioBufferList *buffer_list)
 +{
-+    if (!ao || !buffer_list)
++    if (!buffer_list)
 +        return;
-+    for (UInt32 n = 0; n < buffer_list->mNumberBuffers; n++) {
++
++    UInt32 buffer_count = buffer_list->mNumberBuffers;
++    if (buffer_count > (UInt32)MP_NUM_CHANNELS)
++        buffer_count = (UInt32)MP_NUM_CHANNELS;
++
++    for (UInt32 n = 0; n < buffer_count; n++) {
 +        AudioBuffer *buffer = &buffer_list->mBuffers[n];
-+        if (buffer->mData && buffer->mDataByteSize)
++        if (!buffer->mData || !buffer->mDataByteSize)
++            continue;
++        if (ao)
 +            af_fill_silence(buffer->mData, buffer->mDataByteSize, ao->format);
++        else
++            memset(buffer->mData, 0, buffer->mDataByteSize);
 +    }
 +}
 +
-+static bool validate_render_buffers(struct ao *ao, AudioBufferList *buffer_list,
-+                                    UInt32 frames)
++static bool validate_render_buffers(struct ao *ao, const AudioTimeStamp *ts,
++                                    AudioBufferList *buffer_list, UInt32 frames)
 +{
-+    if (!ao || !buffer_list || ao->num_planes <= 0 ||
++    if (!ao || !ao->priv || !ts || !buffer_list || ao->num_planes <= 0 ||
++        ao->num_planes > MP_NUM_CHANNELS ||
 +        buffer_list->mNumberBuffers < (UInt32)ao->num_planes ||
 +        ao->sstride <= 0 || frames > UINT32_MAX / (UInt32)ao->sstride)
 +        return false;
++
 +    UInt32 needed = frames * (UInt32)ao->sstride;
 +    for (int n = 0; n < ao->num_planes; n++) {
 +        AudioBuffer *buffer = &buffer_list->mBuffers[n];
@@ -47,23 +72,47 @@ index 8d4eb4d..95aa637 100644
  static OSStatus au_get_ary(AudioUnit unit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, void **data, UInt32 *outDataSize)
  {
      OSStatus err;
-@@ -88,9 +117,16 @@ static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
+@@ -88,9 +138,33 @@ static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
                                UInt32 frames, AudioBufferList *buffer_list)
  {
      struct ao *ao = ctx;
 -    struct priv *p = ao->priv;
      void *planes[MP_NUM_CHANNELS] = {0};
--
+
++    // A zero-frame render is a benign no-op and must not trigger a reload.
++    if (frames == 0)
++        return noErr;
 +
-+    if (!ao || !ao->priv || !validate_render_buffers(ao, buffer_list, frames)) {
++    if (!validate_render_buffers(ao, ts, buffer_list, frames)) {
 +        if (aflags)
 +            *aflags |= kAudioUnitRenderAction_OutputIsSilence;
 +        silence_buffers(ao, buffer_list);
++
++        if (ao && ao->priv) {
++            struct priv *p = ao->priv;
++            bool expected = false;
++            if (atomic_compare_exchange_strong_explicit(&p->reload_requested,
++                                                        &expected, true,
++                                                        memory_order_relaxed,
++                                                        memory_order_relaxed)) {
++                atomic_fetch_add_explicit(&audiounit_recovery_count, 1, memory_order_relaxed);
++                ao_request_reload(ao);
++            }
++        }
 +        return noErr;
 +    }
++
 +    struct priv *p = ao->priv;
 +
      for (int n = 0; n < ao->num_planes; n++)
          planes[n] = buffer_list->mBuffers[n].mData;
--
+
+@@ -243,5 +317,8 @@ static void uninit(struct ao *ao)
+
+ static int init(struct ao *ao)
+ {
++    struct priv *p = ao->priv;
++    atomic_init(&p->reload_requested, false);
 +
+     if (!init_audiounit(ao))
+         goto coreaudio_error;

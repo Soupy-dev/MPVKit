@@ -1,0 +1,1258 @@
+diff --git a/include/mpv/apple_pip.h b/include/mpv/apple_pip.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e3a0f6d85f058284dab1a0662f4eba00c5325cc
+--- /dev/null
++++ b/include/mpv/apple_pip.h
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (C) 2026 MPVKit contributors
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef MPV_CLIENT_API_APPLE_PIP_H_
++#define MPV_CLIENT_API_APPLE_PIP_H_
++
++#include <stdint.h>
++
++#include "client.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define MPV_APPLE_PIP_API_VERSION 1u
++#define MPV_APPLE_PIP_PIXEL_FORMAT_BGRA 0x42475241u
++
++/*
++ * MPVKit ships libmpv as a static XCFramework. Keep these optional entry
++ * points in the final Mach-O image so clients may resolve the stable names
++ * with dlsym even when Release builds enable dead stripping.
++ */
++#if defined(__has_attribute)
++# if __has_attribute(retain)
++#  define MPV_APPLE_PIP_RETAIN __attribute__((used, retain))
++# elif __has_attribute(used)
++#  define MPV_APPLE_PIP_RETAIN __attribute__((used))
++# else
++#  define MPV_APPLE_PIP_RETAIN
++# endif
++#else
++# define MPV_APPLE_PIP_RETAIN
++#endif
++#define MPV_APPLE_PIP_EXPORT MPV_EXPORT MPV_APPLE_PIP_RETAIN
++
++enum mpv_apple_pip_result {
++    MPV_APPLE_PIP_OK = 0,
++    MPV_APPLE_PIP_UNAVAILABLE = -1,
++    MPV_APPLE_PIP_INVALID_ARGUMENT = -2,
++    MPV_APPLE_PIP_WRONG_VIDEO_OUTPUT = -3,
++    MPV_APPLE_PIP_UNSUPPORTED = -4,
++    MPV_APPLE_PIP_BUSY = -5,
++    MPV_APPLE_PIP_STALE_GENERATION = -6,
++    MPV_APPLE_PIP_IMPORT_FAILED = -7,
++    MPV_APPLE_PIP_INTERNAL_ERROR = -8,
++};
++
++enum mpv_apple_pip_mode {
++    MPV_APPLE_PIP_MODE_INLINE_ONLY = 0,
++    MPV_APPLE_PIP_MODE_DUAL_OUTPUT_WARMUP = 1,
++    MPV_APPLE_PIP_MODE_OFFSCREEN_ONLY = 2,
++    MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE = 3,
++};
++
++enum mpv_apple_pip_capability {
++    MPV_APPLE_PIP_CAP_DIRECT_IOSURFACE = 1ull << 0,
++    MPV_APPLE_PIP_CAP_SDR_BGRA8 = 1ull << 1,
++    MPV_APPLE_PIP_CAP_OFFSCREEN_WITHOUT_DRAWABLE = 1ull << 2,
++    MPV_APPLE_PIP_CAP_ASYNC_COMPLETION = 1ull << 3,
++};
++
++enum mpv_apple_pip_frame_status {
++    MPV_APPLE_PIP_FRAME_READY = 0,
++    MPV_APPLE_PIP_FRAME_STALE = 1,
++    MPV_APPLE_PIP_FRAME_CANCELED = 2,
++    MPV_APPLE_PIP_FRAME_RENDER_FAILED = 3,
++};
++
++struct mpv_apple_pip_capabilities {
++    uint32_t struct_size;
++    uint32_t api_version;
++    uint64_t flags;
++    uint32_t pixel_format;
++    uint32_t max_queued_targets;
++    char diagnostic[160];
++};
++
++/*
++ * io_surface is an IOSurfaceRef passed as an untyped pointer. The caller must
++ * keep the IOSurface and its CVPixelBuffer alive until the completion callback.
++ * Submitting the same IOSurface while it is queued or GPU-in-flight returns
++ * MPV_APPLE_PIP_BUSY.
++ */
++struct mpv_apple_pip_target {
++    uint32_t struct_size;
++    uint32_t width;
++    uint32_t height;
++    uint32_t pixel_format;
++    void *io_surface;
++    uint64_t token;
++    uint64_t generation;
++};
++
++struct mpv_apple_pip_frame {
++    uint32_t struct_size;
++    uint32_t status;
++    uint32_t width;
++    uint32_t height;
++    uint32_t pixel_format;
++    uint32_t reserved;
++    uint64_t token;
++    uint64_t generation;
++    double pts;
++    double duration;
++};
++
++/*
++ * The frame pointer is valid only for the duration of the callback. Callbacks
++ * run on a completion worker, must return promptly, and must not call blocking
++ * libmpv APIs. Dispatch application and AVSampleBufferDisplayLayer work to an
++ * application-owned queue. generation is always copied from the submitted
++ * target; discard any callback whose generation no longer matches the
++ * application's current load, regardless of status.
++ */
++typedef void (*mpv_apple_pip_frame_callback)(
++    void *callback_ctx, const struct mpv_apple_pip_frame *frame);
++
++MPV_APPLE_PIP_EXPORT uint32_t mpv_apple_pip_api_version(void);
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_get_capabilities(
++    mpv_handle *ctx, struct mpv_apple_pip_capabilities *capabilities);
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_set_callback(
++    mpv_handle *ctx, mpv_apple_pip_frame_callback callback,
++    void *callback_ctx);
++
++/*
++ * generation must be nonzero. Increment it before every new media load or PiP
++ * preparation cycle so queued and GPU-in-flight work can be rejected safely.
++ */
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_set_mode(
++    mpv_handle *ctx, uint32_t mode, uint64_t generation);
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_submit_target(
++    mpv_handle *ctx, const struct mpv_apple_pip_target *target);
++
++/*
++ * Switches to inline-only, prevents future callbacks, cancels queued targets,
++ * waits for GPU-in-flight targets and callbacks to drain, and releases all
++ * retained IOSurfaces. A callback already claimed by the completion worker may
++ * finish during this call, but no callback can occur after it returns. Register
++ * the callback again before a later PiP cycle.
++ */
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_disable_and_drain(mpv_handle *ctx);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/meson.build b/meson.build
+index 42ece8ef04c79bc9612d10c8da84eb91cc5c6df9..b6a796fac93dcd2788be5240526bf91070447431 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1339,6 +1339,27 @@ if host_machine.system() == 'darwin'
+     if features['vulkan'] and features['moltenvk']
+         sources += files('video/out/vulkan/context_moltenvk.m')
+     endif
++
++    apple_gpu_pip_frameworks = dependency(
++        'appleframeworks',
++        modules: ['CoreFoundation', 'IOSurface'],
++        required: get_option('apple-gpu-pip'),
++    )
++    apple_gpu_pip = get_option('apple-gpu-pip').require(
++        features['vulkan'] and features['moltenvk'] and libplacebo.found() and
++        apple_gpu_pip_frameworks.found(),
++        error_message: 'Vulkan, MoltenVK, libplacebo, CoreFoundation, or IOSurface was not found!',
++    )
++    features += {'apple-gpu-pip': apple_gpu_pip.allowed()}
++    if features['apple-gpu-pip']
++        dependencies += apple_gpu_pip_frameworks
++    endif
++else
++    apple_gpu_pip = get_option('apple-gpu-pip').require(
++        false,
++        error_message: 'Apple gpu-next IOSurface PiP requires an Apple target!',
++    )
++    features += {'apple-gpu-pip': apple_gpu_pip.allowed()}
+ endif
+ 
+ features += {'vk-khr-display': vulkan.type_name() == 'internal' or
+@@ -1807,7 +1828,8 @@ if get_option('libmpv')
+                  description: 'mpv media player client library')
+ 
+     headers = ['include/mpv/client.h', 'include/mpv/render.h',
+-               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
++               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h',
++               'include/mpv/apple_pip.h']
+     install_headers(headers, subdir: 'mpv')
+ 
+     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
+diff --git a/meson.options b/meson.options
+index 5e7a5dfa9683109b6ad02553925984f2f8e1c5b8..d580afbb81a242c5d38977c514043a6d04adb0a3 100644
+--- a/meson.options
++++ b/meson.options
+@@ -105,6 +105,7 @@ option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoo
+ option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
+ option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
+ option('ios-sample-buffer', type: 'feature', value: 'auto', description: 'iOS app-owned sample-buffer render bridge')
++option('apple-gpu-pip', type: 'feature', value: 'auto', description: 'Apple gpu-next direct IOSurface PiP output')
+ 
+ # macOS features
+ option('macos-10-15-4-features', type: 'feature', value: 'auto', description: 'macOS 10.15.4 SDK Features')
+diff --git a/player/client.c b/player/client.c
+index e23b98b00f8ee657facc011f3713ec462693a6c7..279984137bdfb020add85c7fae65e1ae21cc1b1e 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -46,6 +46,8 @@
+ #include "command.h"
+ #include "core.h"
+ #include "client.h"
++#include "mpv/apple_pip.h"
++#include "video/out/apple_pip.h"
+ 
+ /*
+  * Locking hierarchy:
+@@ -2138,6 +2140,80 @@ int64_t mpv_get_time_us(mpv_handle *ctx)
+     return mp_time_ns() / 1000;
+ }
+ 
++MPV_APPLE_PIP_EXPORT uint32_t mpv_apple_pip_api_version(void)
++{
++    return MPV_APPLE_PIP_API_VERSION;
++}
++
++static int apple_pip_control(mpv_handle *ctx, int request, void *data)
++{
++    if (!ctx)
++        return MPV_APPLE_PIP_INVALID_ARGUMENT;
++
++    lock_core(ctx);
++    struct vo *vo = ctx->mpctx->video_out;
++    int result;
++    if (!vo) {
++        result = MPV_APPLE_PIP_UNAVAILABLE;
++    } else if (strcmp(vo->driver->name, "gpu-next") != 0) {
++        result = MPV_APPLE_PIP_WRONG_VIDEO_OUTPUT;
++    } else {
++        result = vo_control(vo, request, data);
++    }
++    unlock_core(ctx);
++    return result;
++}
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_get_capabilities(
++    mpv_handle *ctx, struct mpv_apple_pip_capabilities *capabilities)
++{
++    if (!capabilities ||
++        capabilities->struct_size < sizeof(*capabilities))
++        return MPV_APPLE_PIP_INVALID_ARGUMENT;
++
++    return apple_pip_control(ctx, VOCTRL_APPLE_PIP_GET_CAPABILITIES,
++                             capabilities);
++}
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_set_callback(
++    mpv_handle *ctx, mpv_apple_pip_frame_callback callback,
++    void *callback_ctx)
++{
++    struct voctrl_apple_pip_callback config = {
++        .callback = callback,
++        .callback_ctx = callback_ctx,
++    };
++    return apple_pip_control(ctx, VOCTRL_APPLE_PIP_SET_CALLBACK, &config);
++}
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_set_mode(
++    mpv_handle *ctx, uint32_t mode, uint64_t generation)
++{
++    if (mode > MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE || !generation)
++        return MPV_APPLE_PIP_INVALID_ARGUMENT;
++
++    struct voctrl_apple_pip_mode config = {
++        .mode = mode,
++        .generation = generation,
++    };
++    return apple_pip_control(ctx, VOCTRL_APPLE_PIP_SET_MODE, &config);
++}
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_submit_target(
++    mpv_handle *ctx, const struct mpv_apple_pip_target *target)
++{
++    if (!target || target->struct_size < sizeof(*target))
++        return MPV_APPLE_PIP_INVALID_ARGUMENT;
++
++    return apple_pip_control(ctx, VOCTRL_APPLE_PIP_SUBMIT_TARGET,
++                             (void *)target);
++}
++
++MPV_APPLE_PIP_EXPORT int mpv_apple_pip_disable_and_drain(mpv_handle *ctx)
++{
++    return apple_pip_control(ctx, VOCTRL_APPLE_PIP_DISABLE_AND_DRAIN, NULL);
++}
++
+ #include "video/out/libmpv.h"
+ 
+ static void do_kill(void *ptr)
+diff --git a/video/out/apple_pip.h b/video/out/apple_pip.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6891337076d1f4ea94337fc5b4de3c06c4dc1df
+--- /dev/null
++++ b/video/out/apple_pip.h
+@@ -0,0 +1,16 @@
++#ifndef MPV_VIDEO_OUT_APPLE_PIP_H_
++#define MPV_VIDEO_OUT_APPLE_PIP_H_
++
++#include "mpv/apple_pip.h"
++
++struct voctrl_apple_pip_callback {
++    mpv_apple_pip_frame_callback callback;
++    void *callback_ctx;
++};
++
++struct voctrl_apple_pip_mode {
++    uint32_t mode;
++    uint64_t generation;
++};
++
++#endif
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 160d86042b452de4e68ae7e2e57f1278ef8fd46f..19d955382e00f3587c8442a20d2dd5b9a9ec01f9 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -133,6 +133,13 @@ enum mp_voctrl {
+     // Clipboard
+     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
+     VOCTRL_SET_CLIPBOARD,
++
++    /* private MPVKit gpu-next IOSurface output controls */
++    VOCTRL_APPLE_PIP_GET_CAPABILITIES,
++    VOCTRL_APPLE_PIP_SET_CALLBACK,
++    VOCTRL_APPLE_PIP_SET_MODE,
++    VOCTRL_APPLE_PIP_SUBMIT_TARGET,
++    VOCTRL_APPLE_PIP_DISABLE_AND_DRAIN,
+ };
+ 
+ // Helper to expose what kind of content is currently playing to the VO.
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 2d95eb85b883447503eb20f7bd3073edc7730efd..3e94f9a0910ae826761ac47eea5a1daff440f90a 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -48,6 +48,13 @@
+ #include "gpu/video_shaders.h"
+ #include "sub/osd.h"
+ #include "gpu_next/context.h"
++#include "video/out/apple_pip.h"
++
++#if HAVE_APPLE_GPU_PIP
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include <libplacebo/vulkan.h>
++#endif
+ 
+ #if HAVE_GL && defined(PL_HAVE_OPENGL)
+ #include <libplacebo/opengl.h>
+@@ -102,6 +109,48 @@ struct cache {
+     pl_cache cache;
+ };
+ 
++#if HAVE_APPLE_GPU_PIP
++#define APPLE_PIP_MAX_TARGETS 8
++
++enum apple_pip_slot_state {
++    APPLE_PIP_SLOT_FREE = 0,
++    APPLE_PIP_SLOT_QUEUED,
++    APPLE_PIP_SLOT_RENDERING,
++    APPLE_PIP_SLOT_IN_FLIGHT,
++    APPLE_PIP_SLOT_CALLBACK,
++    APPLE_PIP_SLOT_CANCELED,
++};
++
++struct apple_pip_slot {
++    enum apple_pip_slot_state state;
++    pl_tex tex;
++    IOSurfaceRef surface;
++    uint32_t width;
++    uint32_t height;
++    uint64_t token;
++    uint64_t generation;
++    double pts;
++    double duration;
++    uint32_t completion_status;
++};
++
++struct apple_pip_state {
++    mp_mutex lock;
++    mp_cond wakeup;
++    mp_thread worker;
++    bool initialized;
++    bool worker_started;
++    bool shutting_down;
++    bool force_redraw_armed;
++    uint32_t mode;
++    uint64_t generation;
++    mpv_apple_pip_frame_callback callback;
++    void *callback_ctx;
++    struct apple_pip_slot slots[APPLE_PIP_MAX_TARGETS];
++    char diagnostic[160];
++};
++#endif
++
+ struct priv {
+     struct mp_log *log;
+     struct mpv_global *global;
+@@ -158,10 +207,553 @@ struct priv {
+     struct frame_info perf_redraw;
+ 
+     struct mp_image_params target_params;
++
++#if HAVE_APPLE_GPU_PIP
++    struct apple_pip_state apple_pip;
++#endif
+ };
+ 
+ static void update_render_options(struct vo *vo);
+ static void update_lut(struct priv *p, struct user_lut *lut);
++static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
++                       int width, int height);
++
++#if HAVE_APPLE_GPU_PIP
++static bool apple_pip_direct_supported(struct vo *vo, char *reason,
++                                       size_t reason_size)
++{
++    struct priv *p = vo->priv;
++    const char *failure = NULL;
++
++    if (!vo->context_name || strcmp(vo->context_name, "moltenvk") != 0) {
++        failure = "gpu-next is not using the moltenvk context";
++    } else if (!pl_vulkan_get(p->gpu)) {
++        failure = "libplacebo is not using a Vulkan GPU";
++    } else if (!p->gpu->limits.thread_safe) {
++        failure = "libplacebo Vulkan polling is not thread-safe";
++    } else if (!(p->gpu->import_caps.tex & PL_HANDLE_IOSURFACE)) {
++        failure = "direct IOSurface import is not advertised";
++    } else {
++        pl_fmt fmt = pl_find_named_fmt(p->gpu, "bgra8");
++        enum pl_fmt_caps required = PL_FMT_CAP_RENDERABLE |
++                                    PL_FMT_CAP_BLITTABLE;
++        if (!fmt || (fmt->caps & required) != required)
++            failure = "renderable/blittable BGRA8 is unavailable";
++    }
++
++    if (failure) {
++        snprintf(reason, reason_size,
++                 "%s; no safe GPU blit fallback is enabled", failure);
++    } else {
++        snprintf(reason, reason_size,
++                 "direct IOSurface gpu-next output ready");
++    }
++    return !failure;
++}
++
++static bool apple_pip_has_slots_locked(struct apple_pip_state *state)
++{
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        if (state->slots[i].state != APPLE_PIP_SLOT_FREE)
++            return true;
++    }
++    return false;
++}
++
++static bool apple_pip_claim_forced_redraw_locked(
++    struct apple_pip_state *state)
++{
++    if (!state->force_redraw_armed)
++        return false;
++
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        struct apple_pip_slot *slot = &state->slots[i];
++        if (slot->state == APPLE_PIP_SLOT_QUEUED &&
++            slot->generation == state->generation) {
++            state->force_redraw_armed = false;
++            return true;
++        }
++    }
++    return false;
++}
++
++static void apple_pip_cancel_locked(struct apple_pip_state *state,
++                                    uint32_t status)
++{
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        struct apple_pip_slot *slot = &state->slots[i];
++        switch (slot->state) {
++        case APPLE_PIP_SLOT_QUEUED:
++            slot->completion_status = status;
++            slot->state = APPLE_PIP_SLOT_CANCELED;
++            break;
++        case APPLE_PIP_SLOT_RENDERING:
++            // draw_frame owns this slot until apple_pip_complete_render().
++            // Preserve its state so the worker cannot destroy the texture
++            // while it is being encoded into a GPU command buffer.
++            if (slot->completion_status == MPV_APPLE_PIP_FRAME_READY)
++                slot->completion_status = status;
++            break;
++        case APPLE_PIP_SLOT_IN_FLIGHT:
++            if (slot->completion_status == MPV_APPLE_PIP_FRAME_READY)
++                slot->completion_status = status;
++            break;
++        default:
++            break;
++        }
++    }
++    mp_cond_broadcast(&state->wakeup);
++}
++
++static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
++{
++    struct vo *vo = opaque;
++    struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
++    mp_thread_set_name("mpv/apple-pip");
++
++    while (true) {
++        struct apple_pip_slot *slot = NULL;
++        pl_tex tex = NULL;
++        bool needs_poll = false;
++
++        mp_mutex_lock(&state->lock);
++        for (;;) {
++            for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++                enum apple_pip_slot_state s = state->slots[i].state;
++                if (s == APPLE_PIP_SLOT_CANCELED ||
++                    s == APPLE_PIP_SLOT_IN_FLIGHT) {
++                    slot = &state->slots[i];
++                    tex = slot->tex;
++                    // Import/initial-layout work can be pending even when a
++                    // queued target is canceled before its first render.
++                    needs_poll = tex != NULL;
++                    break;
++                }
++            }
++
++            if (slot || (state->shutting_down &&
++                         !apple_pip_has_slots_locked(state)))
++                break;
++            mp_cond_wait(&state->wakeup, &state->lock);
++        }
++
++        if (!slot) {
++            mp_mutex_unlock(&state->lock);
++            break;
++        }
++        mp_mutex_unlock(&state->lock);
++
++        if (needs_poll && pl_tex_poll(p->gpu, tex, MP_TIME_MS_TO_NS(20)))
++            continue;
++
++        struct mpv_apple_pip_frame frame = {0};
++        mpv_apple_pip_frame_callback callback = NULL;
++        void *callback_ctx = NULL;
++        IOSurfaceRef surface = NULL;
++
++        mp_mutex_lock(&state->lock);
++        if (slot->state != APPLE_PIP_SLOT_CANCELED &&
++            slot->state != APPLE_PIP_SLOT_IN_FLIGHT) {
++            mp_mutex_unlock(&state->lock);
++            continue;
++        }
++
++        if (slot->completion_status == MPV_APPLE_PIP_FRAME_READY &&
++            slot->generation != state->generation)
++            slot->completion_status = MPV_APPLE_PIP_FRAME_STALE;
++
++        frame = (struct mpv_apple_pip_frame) {
++            .struct_size = sizeof(frame),
++            .status = slot->completion_status,
++            .width = slot->width,
++            .height = slot->height,
++            .pixel_format = MPV_APPLE_PIP_PIXEL_FORMAT_BGRA,
++            .token = slot->token,
++            .generation = slot->generation,
++            .pts = slot->pts,
++            .duration = slot->duration,
++        };
++        callback = state->callback;
++        callback_ctx = state->callback_ctx;
++        surface = slot->surface;
++        slot->state = APPLE_PIP_SLOT_CALLBACK;
++        mp_mutex_unlock(&state->lock);
++
++        if (tex)
++            pl_tex_destroy(p->gpu, &tex);
++        if (surface)
++            CFRelease(surface);
++        if (callback)
++            callback(callback_ctx, &frame);
++
++        mp_mutex_lock(&state->lock);
++        memset(slot, 0, sizeof(*slot));
++        mp_cond_broadcast(&state->wakeup);
++        mp_mutex_unlock(&state->lock);
++    }
++
++    MP_THREAD_RETURN();
++}
++
++static void apple_pip_init(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
++    if (mp_mutex_init(&state->lock)) {
++        snprintf(state->diagnostic, sizeof(state->diagnostic),
++                 "failed initializing completion mutex");
++        return;
++    }
++    if (mp_cond_init(&state->wakeup)) {
++        mp_mutex_destroy(&state->lock);
++        snprintf(state->diagnostic, sizeof(state->diagnostic),
++                 "failed initializing completion condition");
++        return;
++    }
++
++    state->initialized = true;
++    state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
++    if (!apple_pip_direct_supported(vo, state->diagnostic,
++                                    sizeof(state->diagnostic)))
++        return;
++
++    if (mp_thread_create(&state->worker, apple_pip_completion_worker, vo)) {
++        snprintf(state->diagnostic, sizeof(state->diagnostic),
++                 "failed starting completion worker");
++        return;
++    }
++    state->worker_started = true;
++}
++
++static void apple_pip_uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
++    if (!state->initialized)
++        return;
++
++    mp_mutex_lock(&state->lock);
++    state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
++    state->force_redraw_armed = false;
++    state->callback = NULL;
++    state->callback_ctx = NULL;
++    state->shutting_down = true;
++    apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
++    mp_mutex_unlock(&state->lock);
++
++    if (state->worker_started)
++        mp_thread_join(state->worker);
++
++    mp_cond_destroy(&state->wakeup);
++    mp_mutex_destroy(&state->lock);
++    state->initialized = false;
++}
++
++static bool apple_pip_inline_enabled(struct priv *p)
++{
++    return !p->apple_pip.initialized ||
++           p->apple_pip.mode != MPV_APPLE_PIP_MODE_OFFSCREEN_ONLY;
++}
++
++static bool apple_pip_output_enabled(struct priv *p)
++{
++    return p->apple_pip.initialized &&
++           p->apple_pip.mode != MPV_APPLE_PIP_MODE_INLINE_ONLY;
++}
++
++static struct apple_pip_slot *apple_pip_take_target(struct priv *p)
++{
++    struct apple_pip_state *state = &p->apple_pip;
++    if (!state->worker_started || !apple_pip_output_enabled(p))
++        return NULL;
++
++    struct apple_pip_slot *result = NULL;
++    mp_mutex_lock(&state->lock);
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        struct apple_pip_slot *slot = &state->slots[i];
++        if (slot->state != APPLE_PIP_SLOT_QUEUED)
++            continue;
++        if (slot->generation != state->generation) {
++            slot->completion_status = MPV_APPLE_PIP_FRAME_STALE;
++            slot->state = APPLE_PIP_SLOT_CANCELED;
++            continue;
++        }
++        slot->state = APPLE_PIP_SLOT_RENDERING;
++        result = slot;
++        break;
++    }
++    mp_cond_broadcast(&state->wakeup);
++    mp_mutex_unlock(&state->lock);
++    return result;
++}
++
++static void apple_pip_complete_render(struct priv *p,
++                                      struct apple_pip_slot *slot,
++                                      bool gpu_used, bool ready, double pts,
++                                      double duration)
++{
++    if (!slot)
++        return;
++
++    struct apple_pip_state *state = &p->apple_pip;
++    mp_mutex_lock(&state->lock);
++    slot->pts = pts;
++    slot->duration = duration;
++    if (slot->completion_status == MPV_APPLE_PIP_FRAME_READY) {
++        slot->completion_status = ready ? MPV_APPLE_PIP_FRAME_READY
++                                        : MPV_APPLE_PIP_FRAME_RENDER_FAILED;
++    }
++    slot->state = gpu_used ? APPLE_PIP_SLOT_IN_FLIGHT
++                           : APPLE_PIP_SLOT_CANCELED;
++    mp_cond_broadcast(&state->wakeup);
++    mp_mutex_unlock(&state->lock);
++}
++
++static void apple_pip_make_target(struct priv *p,
++                                  struct apple_pip_slot *slot,
++                                  struct pl_frame *target,
++                                  struct mp_rect *dst,
++                                  struct mp_osd_res *osd)
++{
++    *target = (struct pl_frame) {
++        .repr = pl_color_repr_rgb,
++        .color = pl_color_space_srgb,
++        .num_planes = 1,
++        .planes[0] = {
++            .texture = slot->tex,
++            .components = 4,
++            .component_mapping = {0, 1, 2, 3},
++        },
++    };
++    target->color.primaries = PL_COLOR_PRIM_BT_709;
++    target->color.transfer = PL_COLOR_TRC_SRGB;
++    target->repr.levels = PL_COLOR_LEVELS_FULL;
++
++    double aspect = 0.0;
++    int current_w = abs(mp_rect_w(p->dst));
++    int current_h = abs(mp_rect_h(p->dst));
++    if (current_w > 0 && current_h > 0)
++        aspect = (double)current_w / current_h;
++    if (!(aspect > 0.0) || !isfinite(aspect))
++        aspect = (double)slot->width / slot->height;
++
++    int width = slot->width;
++    int height = lround(width / aspect);
++    if (height > (int)slot->height) {
++        height = slot->height;
++        width = lround(height * aspect);
++    }
++    width = MPMAX(1, MPMIN(width, (int)slot->width));
++    height = MPMAX(1, MPMIN(height, (int)slot->height));
++    int left = ((int)slot->width - width) / 2;
++    int top = ((int)slot->height - height) / 2;
++    *dst = (struct mp_rect) {left, top, left + width, top + height};
++    *osd = (struct mp_osd_res) {
++        .w = slot->width,
++        .h = slot->height,
++        .ml = left,
++        .mr = slot->width - dst->x1,
++        .mt = top,
++        .mb = slot->height - dst->y1,
++        .display_par = 1.0,
++    };
++    apply_crop(target, *dst, slot->width, slot->height);
++}
++
++static int apple_pip_get_capabilities(struct vo *vo,
++                                      struct mpv_apple_pip_capabilities *caps)
++{
++    struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
++    uint32_t size = caps->struct_size;
++    memset(caps, 0, sizeof(*caps));
++    caps->struct_size = size;
++    caps->api_version = MPV_APPLE_PIP_API_VERSION;
++    caps->pixel_format = MPV_APPLE_PIP_PIXEL_FORMAT_BGRA;
++    caps->max_queued_targets = APPLE_PIP_MAX_TARGETS;
++    snprintf(caps->diagnostic, sizeof(caps->diagnostic), "%s",
++             state->diagnostic[0] ? state->diagnostic : "not initialized");
++
++    if (!state->worker_started)
++        return MPV_APPLE_PIP_UNSUPPORTED;
++
++    caps->flags = MPV_APPLE_PIP_CAP_DIRECT_IOSURFACE |
++                  MPV_APPLE_PIP_CAP_SDR_BGRA8 |
++                  MPV_APPLE_PIP_CAP_OFFSCREEN_WITHOUT_DRAWABLE |
++                  MPV_APPLE_PIP_CAP_ASYNC_COMPLETION;
++    return MPV_APPLE_PIP_OK;
++}
++
++static int apple_pip_set_callback(struct priv *p,
++                                  struct voctrl_apple_pip_callback *config)
++{
++    struct apple_pip_state *state = &p->apple_pip;
++    if (!state->worker_started)
++        return MPV_APPLE_PIP_UNSUPPORTED;
++
++    mp_mutex_lock(&state->lock);
++    state->callback = config->callback;
++    state->callback_ctx = config->callback_ctx;
++    mp_mutex_unlock(&state->lock);
++    return MPV_APPLE_PIP_OK;
++}
++
++static int apple_pip_set_mode(struct vo *vo,
++                              struct voctrl_apple_pip_mode *config)
++{
++    struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
++    if (!state->worker_started)
++        return MPV_APPLE_PIP_UNSUPPORTED;
++
++    bool force_redraw = false;
++    mp_mutex_lock(&state->lock);
++    if (state->shutting_down) {
++        mp_mutex_unlock(&state->lock);
++        return MPV_APPLE_PIP_UNAVAILABLE;
++    }
++    bool new_generation = config->generation != state->generation;
++    bool new_warmup = config->mode == MPV_APPLE_PIP_MODE_DUAL_OUTPUT_WARMUP &&
++                      state->mode != MPV_APPLE_PIP_MODE_DUAL_OUTPUT_WARMUP;
++    bool new_restore = config->mode == MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE &&
++                       state->mode != MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE;
++    if (new_generation)
++        apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_STALE);
++    state->generation = config->generation;
++    state->mode = config->mode;
++    if (config->mode == MPV_APPLE_PIP_MODE_INLINE_ONLY) {
++        state->force_redraw_armed = false;
++        apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
++    } else if (new_generation || new_warmup || new_restore) {
++        // A single forced draw prepares or restores PiP while paused.
++        // Thereafter surfaces are merely available targets and are consumed
++        // only by natural VO draws, preventing callback/refill from becoming
++        // an unbounded loop.
++        state->force_redraw_armed = true;
++        force_redraw = apple_pip_claim_forced_redraw_locked(state);
++    }
++    mp_mutex_unlock(&state->lock);
++
++    if (force_redraw)
++        vo->want_redraw = true;
++    return MPV_APPLE_PIP_OK;
++}
++
++static int apple_pip_submit_target(struct vo *vo,
++                                   const struct mpv_apple_pip_target *target)
++{
++    struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
++    if (!state->worker_started)
++        return MPV_APPLE_PIP_UNSUPPORTED;
++    if (!target->io_surface || !target->width || !target->height ||
++        target->pixel_format != MPV_APPLE_PIP_PIXEL_FORMAT_BGRA)
++        return MPV_APPLE_PIP_INVALID_ARGUMENT;
++
++    IOSurfaceRef surface = target->io_surface;
++    if (IOSurfaceGetWidth(surface) != target->width ||
++        IOSurfaceGetHeight(surface) != target->height ||
++        IOSurfaceGetBytesPerElement(surface) != 4 ||
++        IOSurfaceGetPixelFormat(surface) != MPV_APPLE_PIP_PIXEL_FORMAT_BGRA)
++        return MPV_APPLE_PIP_INVALID_ARGUMENT;
++
++    bool force_redraw = false;
++    mp_mutex_lock(&state->lock);
++    if (state->shutting_down ||
++        state->mode == MPV_APPLE_PIP_MODE_INLINE_ONLY) {
++        mp_mutex_unlock(&state->lock);
++        return MPV_APPLE_PIP_UNAVAILABLE;
++    }
++    if (target->generation != state->generation) {
++        mp_mutex_unlock(&state->lock);
++        return MPV_APPLE_PIP_STALE_GENERATION;
++    }
++
++    struct apple_pip_slot *slot = NULL;
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        struct apple_pip_slot *candidate = &state->slots[i];
++        if (candidate->state != APPLE_PIP_SLOT_FREE &&
++            candidate->surface == surface) {
++            mp_mutex_unlock(&state->lock);
++            return MPV_APPLE_PIP_BUSY;
++        }
++        if (!slot && candidate->state == APPLE_PIP_SLOT_FREE)
++            slot = candidate;
++    }
++    mp_mutex_unlock(&state->lock);
++    if (!slot)
++        return MPV_APPLE_PIP_BUSY;
++
++    pl_fmt fmt = pl_find_named_fmt(p->gpu, "bgra8");
++    CFRetain(surface);
++    pl_tex tex = pl_tex_create(p->gpu, pl_tex_params(
++        .w = target->width,
++        .h = target->height,
++        .format = fmt,
++        .renderable = true,
++        .blit_dst = true,
++        .import_handle = PL_HANDLE_IOSURFACE,
++        .shared_mem = {
++            .handle.handle = surface,
++            .size = IOSurfaceGetAllocSize(surface),
++        },
++        .debug_tag = "MPVKit PiP IOSurface",
++    ));
++    if (!tex) {
++        CFRelease(surface);
++        snprintf(state->diagnostic, sizeof(state->diagnostic),
++                 "direct IOSurface import failed for %ux%u BGRA; "
++                 "no safe GPU blit fallback is enabled",
++                 target->width, target->height);
++        MP_ERR(vo, "%s\n", state->diagnostic);
++        return MPV_APPLE_PIP_IMPORT_FAILED;
++    }
++
++    mp_mutex_lock(&state->lock);
++    if (state->shutting_down || target->generation != state->generation ||
++        slot->state != APPLE_PIP_SLOT_FREE) {
++        mp_mutex_unlock(&state->lock);
++        pl_tex_destroy(p->gpu, &tex);
++        CFRelease(surface);
++        return MPV_APPLE_PIP_STALE_GENERATION;
++    }
++    *slot = (struct apple_pip_slot) {
++        .state = APPLE_PIP_SLOT_QUEUED,
++        .tex = tex,
++        .surface = surface,
++        .width = target->width,
++        .height = target->height,
++        .token = target->token,
++        .generation = target->generation,
++        .completion_status = MPV_APPLE_PIP_FRAME_READY,
++    };
++    force_redraw = apple_pip_claim_forced_redraw_locked(state);
++    mp_mutex_unlock(&state->lock);
++
++    if (force_redraw)
++        vo->want_redraw = true;
++    return MPV_APPLE_PIP_OK;
++}
++
++static int apple_pip_disable_and_drain(struct priv *p)
++{
++    struct apple_pip_state *state = &p->apple_pip;
++    if (!state->initialized)
++        return MPV_APPLE_PIP_UNAVAILABLE;
++
++    mp_mutex_lock(&state->lock);
++    state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
++    state->force_redraw_armed = false;
++    state->callback = NULL;
++    state->callback_ctx = NULL;
++    apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
++    while (apple_pip_has_slots_locked(state))
++        mp_cond_wait(&state->wakeup, &state->lock);
++    mp_mutex_unlock(&state->lock);
++    return MPV_APPLE_PIP_OK;
++}
++#endif
+ 
+ struct gl_next_opts {
+     bool delayed_peak;
+@@ -1085,12 +1677,28 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     }
+ 
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
++#if HAVE_APPLE_GPU_PIP
++    struct apple_pip_slot *pip_slot = apple_pip_take_target(p);
++    bool request_inline = apple_pip_inline_enabled(p);
++    if (pip_slot && !frame->current) {
++        // A preparation callback must never advertise an idle/background frame
++        // as the first valid sample for the current load generation.
++        apple_pip_complete_render(p, pip_slot, false, false, 0.0, 0.0);
++        pip_slot = NULL;
++    }
++#else
++    bool request_inline = true;
++#endif
+ 
+     bool pass_colorspace = false;
+     struct pl_color_space target_csp = {0};
+     // TODO: Implement this for all backends
+-    if (sw->fns->target_csp)
++    if (request_inline && sw->fns->target_csp)
+         target_csp = sw->fns->target_csp(sw);
++#if HAVE_APPLE_GPU_PIP
++    if (!request_inline)
++        target_csp = pl_color_space_srgb;
++#endif
+     if (target_csp.primaries == PL_COLOR_PRIM_UNKNOWN)
+         target_csp.primaries = get_best_prim_container(&target_csp.hdr.prim);
+     if (!pl_color_transfer_is_hdr(target_csp.transfer)) {
+@@ -1230,17 +1838,28 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         // Update again after possible max_luma change
+         if (p->icc_profile)
+             hint = p->icc_profile->csp;
+-        if (!pass_colorspace)
++        if (request_inline && !pass_colorspace)
+             pl_swapchain_colorspace_hint(p->sw, &hint);
+     } else if (!target_hint) {
+         if (!hint.hdr.min_luma)
+             hint.hdr.min_luma = target_csp.hdr.min_luma;
+-        pl_swapchain_colorspace_hint(p->sw, NULL);
++        if (request_inline)
++            pl_swapchain_colorspace_hint(p->sw, NULL);
+     }
+ 
+-    struct pl_swapchain_frame swframe;
+-    bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
+-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
++    struct pl_swapchain_frame swframe = {0};
++    bool have_inline = false;
++    if (request_inline) {
++        bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
++        have_inline = should_draw && pl_swapchain_start_frame(p->sw, &swframe);
++    }
++
++#if HAVE_APPLE_GPU_PIP
++    bool have_pip = pip_slot != NULL;
++#else
++    bool have_pip = false;
++#endif
++    if (!have_inline && !have_pip) {
+         if (frame->current) {
+             // Advance the queue state to the current PTS to discard unused frames
+             struct pl_queue_params qparams = *pl_queue_params(
+@@ -1257,14 +1876,29 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     }
+ 
+     bool valid = false;
++    bool pip_rendered = false;
++    bool pip_gpu_used = false;
+     p->is_interpolated = false;
+ 
+-    // Calculate target
++    // Calculate the primary target. In offscreen-only mode this path never
++    // asks the CAMetalLayer swapchain for a drawable.
+     struct pl_frame target;
+-    pl_frame_from_swapchain(&target, &swframe);
+-    bool strict_sw_params = target_hint && !pass_colorspace && p->next_opts->target_hint_strict;
+-    apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params);
+-    if (target.color.transfer == PL_COLOR_TRC_SRGB && frame->current &&
++    struct mp_rect primary_dst = p->dst;
++    struct mp_osd_res primary_osd = p->osd_res;
++    bool primary_is_pip = !have_inline;
++    if (have_inline) {
++        pl_frame_from_swapchain(&target, &swframe);
++        bool strict_sw_params = target_hint && !pass_colorspace &&
++                                p->next_opts->target_hint_strict;
++        apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params);
++    }
++#if HAVE_APPLE_GPU_PIP
++    else {
++        apple_pip_make_target(p, pip_slot, &target, &primary_dst, &primary_osd);
++    }
++#endif
++    if (!primary_is_pip && target.color.transfer == PL_COLOR_TRC_SRGB &&
++        frame->current &&
+         ((opts->sdr_adjust_gamma == 0 && opts->target_trc == PL_COLOR_TRC_UNKNOWN) ||
+          opts->sdr_adjust_gamma == -1))
+     {
+@@ -1275,7 +1909,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             target.color.transfer = frame->current->params.color.transfer;
+         }
+     }
+-    if (target.color.transfer == PL_COLOR_TRC_SRGB) {
++    if (!primary_is_pip && target.color.transfer == PL_COLOR_TRC_SRGB) {
+         // sRGB reference display is pure 2.2 power function, see IEC 61966-2-1-1999.
+         if (opts->treat_srgb_as_power22 & 2)
+             target.color.transfer = PL_COLOR_TRC_GAMMA22;
+@@ -1303,10 +1937,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             target.color.transfer = PL_COLOR_TRC_SRGB;
+ #endif
+     }
+-    update_overlays(vo, p->osd_res,
++    update_overlays(vo, primary_osd,
+                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
+                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current);
+-    apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
++    if (!primary_is_pip)
++        apply_crop(&target, primary_dst, swframe.fbo->params.w,
++                   swframe.fbo->params.h);
+     update_tm_viz(&pars->color_map_params, &target);
+ 
+     struct pl_frame_mix mix = {0};
+@@ -1403,22 +2039,61 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
+     }
+ 
+-    // Render frame
+-    if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
++    // Render the primary frame. In offscreen-only mode the imported IOSurface
++    // is the primary target; in dual modes the CAMetalLayer remains primary.
++#if HAVE_APPLE_GPU_PIP
++    if (primary_is_pip) {
++        pl_tex_clear(gpu, pip_slot->tex, (float[4]){0.0, 0.0, 0.0, 1.0});
++        pip_gpu_used = true;
++    }
++#endif
++    bool primary_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
++    if (!primary_ok) {
+         MP_ERR(vo, "Failed rendering frame!\n");
++#if HAVE_APPLE_GPU_PIP
++        if (primary_is_pip)
++            pip_gpu_used = true;
++#endif
+         goto done;
+     }
+ 
++    valid = true;
++#if HAVE_APPLE_GPU_PIP
++    if (primary_is_pip) {
++        pip_gpu_used = true;
++        pip_rendered = mix.num_frames > 0;
++    } else if (have_pip) {
++        struct pl_frame pip_target;
++        struct mp_rect pip_dst;
++        struct mp_osd_res pip_osd;
++        apple_pip_make_target(p, pip_slot, &pip_target, &pip_dst, &pip_osd);
++        update_overlays(vo, pip_osd,
++                        (frame->current && opts->blend_subs)
++                            ? OSD_DRAW_OSD_ONLY : 0,
++                        PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state,
++                        &pip_target, frame->current);
++        update_tm_viz(&pars->color_map_params, &pip_target);
++        pl_tex_clear(gpu, pip_slot->tex,
++                     (float[4]){0.0, 0.0, 0.0, 1.0});
++        pip_gpu_used = true;
++        pip_rendered = pl_render_image_mix(p->rr, &mix, &pip_target, &params) &&
++                       mix.num_frames > 0;
++        if (!pip_rendered)
++            MP_ERR(vo, "Failed rendering direct IOSurface PiP frame!\n");
++    }
++#endif
++
+     struct pl_frame ref_frame;
+     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
+ 
+     mp_mutex_lock(&vo->params_mutex);
++    pl_tex target_tex = target.planes[0].texture;
+     p->target_params = (struct mp_image_params){
+-        .imgfmt_name = swframe.fbo->params.format
+-                        ? swframe.fbo->params.format->name : NULL,
+-        .w = mp_rect_w(p->dst),
+-        .h = mp_rect_h(p->dst),
+-        .color = pass_colorspace ? hint : target.color,
++        .imgfmt_name = target_tex && target_tex->params.format
++                        ? target_tex->params.format->name : NULL,
++        .w = mp_rect_w(primary_dst),
++        .h = mp_rect_h(primary_dst),
++        .color = !primary_is_pip && pass_colorspace ? hint : target.color,
+         .repr = target.repr,
+         .rotate = target.rotation,
+     };
+@@ -1431,15 +2106,23 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     mp_mutex_unlock(&vo->params_mutex);
+ 
+     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
+-    valid = true;
+     // fall through
+ 
+ done:
+-    if (!valid) // clear with purple to indicate error
++    if (!valid && have_inline) // clear with purple to indicate error
+         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+ 
+     pl_gpu_flush(gpu);
+-    p->frame_pending = true;
++#if HAVE_APPLE_GPU_PIP
++    if (pip_slot) {
++        double pip_pts = frame->current ? p->last_pts : 0.0;
++        double pip_duration = frame->current && frame->approx_duration > 0
++                                ? frame->approx_duration : 0.0;
++        apple_pip_complete_render(p, pip_slot, pip_gpu_used, pip_rendered,
++                                  pip_pts, pip_duration);
++    }
++#endif
++    p->frame_pending = have_inline;
+     return VO_TRUE;
+ }
+ 
+@@ -1448,6 +2131,14 @@ static void flip_page(struct vo *vo)
+     struct priv *p = vo->priv;
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+ 
++#if HAVE_APPLE_GPU_PIP
++    // Active offscreen-only PiP must not acquire or present a CAMetalDrawable.
++    if (!apple_pip_inline_enabled(p)) {
++        p->frame_pending = false;
++        return;
++    }
++#endif
++
+     if (p->frame_pending) {
+         if (!pl_swapchain_submit_frame(p->sw))
+             MP_ERR(vo, "Failed presenting frame!\n");
+@@ -1799,6 +2490,29 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     struct priv *p = vo->priv;
+ 
+     switch (request) {
++#if HAVE_APPLE_GPU_PIP
++    case VOCTRL_APPLE_PIP_GET_CAPABILITIES:
++        return data ? apple_pip_get_capabilities(vo, data)
++                    : MPV_APPLE_PIP_INVALID_ARGUMENT;
++    case VOCTRL_APPLE_PIP_SET_CALLBACK:
++        return data ? apple_pip_set_callback(p, data)
++                    : MPV_APPLE_PIP_INVALID_ARGUMENT;
++    case VOCTRL_APPLE_PIP_SET_MODE:
++        return data ? apple_pip_set_mode(vo, data)
++                    : MPV_APPLE_PIP_INVALID_ARGUMENT;
++    case VOCTRL_APPLE_PIP_SUBMIT_TARGET:
++        return data ? apple_pip_submit_target(vo, data)
++                    : MPV_APPLE_PIP_INVALID_ARGUMENT;
++    case VOCTRL_APPLE_PIP_DISABLE_AND_DRAIN:
++        return apple_pip_disable_and_drain(p);
++#else
++    case VOCTRL_APPLE_PIP_GET_CAPABILITIES:
++    case VOCTRL_APPLE_PIP_SET_CALLBACK:
++    case VOCTRL_APPLE_PIP_SET_MODE:
++    case VOCTRL_APPLE_PIP_SUBMIT_TARGET:
++    case VOCTRL_APPLE_PIP_DISABLE_AND_DRAIN:
++        return MPV_APPLE_PIP_UNSUPPORTED;
++#endif
+     case VOCTRL_SET_PANSCAN:
+         resize(vo);
+         return VO_TRUE;
+@@ -2080,6 +2794,10 @@ done:
+ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_APPLE_GPU_PIP
++    // Drain imported surfaces while the libplacebo GPU is still alive.
++    apple_pip_uninit(vo);
++#endif
+     pl_queue_destroy(&p->queue); // destroy this first
+     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
+         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
+@@ -2174,6 +2892,9 @@ static int preinit(struct vo *vo)
+ 
+     p->pars = pl_options_alloc(p->pllog);
+     update_render_options(vo);
++#if HAVE_APPLE_GPU_PIP
++    apple_pip_init(vo);
++#endif
+     return 0;
+ 
+ err_out:

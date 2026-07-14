@@ -2,19 +2,6 @@ import Foundation
 
 enum Build {
     static func performCommand(_ options: ArgumentOptions) throws {
-        if Utility.shell("which brew") == nil {
-            print("""
-            You need to run the script first
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            """)
-            return
-        }
-        if Utility.shell("which pkg-config") == nil {
-            Utility.shell("brew install pkg-config")
-        }
-        if Utility.shell("which wget") == nil {
-            Utility.shell("brew install wget")
-        }
         let path = URL.currentDirectory + "dist"
         if !FileManager.default.fileExists(atPath: path.path) {
             try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: false, attributes: nil)
@@ -91,7 +78,31 @@ class ArgumentOptions {
 }
 
 class BaseBuild {
-    static let defaultPath = "/Library/Frameworks/Python.framework/Versions/Current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    static let defaultPath: String = {
+        // Prefer the repository-pinned helper toolchain (nasm/pkg-config/etc.) when present so
+        // artifact builds do not depend on a particular Homebrew installation.
+        var paths: [String] = [
+            (URL.currentDirectory + ".build/tooling/bin").standardizedFileURL.path,
+            (URL.currentDirectory + "../.build/tooling/bin").standardizedFileURL.path
+        ]
+        if let inherited = ProcessInfo.processInfo.environment["PATH"] {
+            paths.append(contentsOf: inherited.split(separator: ":").map(String.init))
+        }
+        if let home = ProcessInfo.processInfo.environment["HOME"] {
+            paths.append("\(home)/.local/bin")
+        }
+        paths.append(contentsOf: [
+            "/Library/Frameworks/Python.framework/Versions/Current/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ])
+        var seen = Set<String>()
+        return paths.filter { seen.insert($0).inserted }.joined(separator: ":")
+    }()
     static var platforms = PlatformType.allCases
     static var options = ArgumentOptions()
     static let splitPlatformGroups = [
@@ -111,8 +122,35 @@ class BaseBuild {
     }
 
     func beforeBuild() throws {
+        let patchDirectory = URL.currentDirectory + "../Sources/BuildScripts/patch/\(library.rawValue)"
+        let patchFileNames: [String]
+        if FileManager.default.fileExists(atPath: patchDirectory.path) {
+            patchFileNames = try FileManager.default
+                .contentsOfDirectory(atPath: patchDirectory.path)
+                .filter { $0.hasSuffix(".patch") }
+                .sorted()
+        } else {
+            patchFileNames = []
+        }
+
+        // A cached source checkout is reusable only while its exact ordered patch set is unchanged.
+        // Keeping the full patch contents in the stamp avoids depending on an external hashing tool
+        // and, importantly, forces a clean clone when a patch is added or edited between builds.
+        let patchStamp = try patchFileNames.map { fileName -> String in
+            let data = try Data(contentsOf: patchDirectory + fileName)
+            return "\(fileName):\(data.base64EncodedString())"
+        }.joined(separator: "\n")
+        let patchStampURL = directoryURL + ".mpvkit-patch-set"
+
         if FileManager.default.fileExists(atPath: directoryURL.path) {
-            return 
+            if patchFileNames.isEmpty {
+                return
+            }
+            let cachedStamp = try? String(contentsOf: patchStampURL, encoding: .utf8)
+            if cachedStamp == patchStamp {
+                return
+            }
+            try FileManager.default.removeItem(at: directoryURL)
         }
 
         // pull code from git
@@ -123,16 +161,15 @@ class BaseBuild {
         }
 
         // apply patch
-        let patch = URL.currentDirectory + "../Sources/BuildScripts/patch/\(library.rawValue)"
-        if FileManager.default.fileExists(atPath: patch.path) {
-            _ = try? Utility.launch(path: "/usr/bin/git", arguments: ["checkout", "."], currentDirectoryURL: directoryURL)
-            let fileNames = try! FileManager.default.contentsOfDirectory(atPath: patch.path).sorted()
-            for fileName in fileNames {
-                if !fileName.hasSuffix(".patch") {
-                    continue
-                }
-                try! Utility.launch(path: "/usr/bin/git", arguments: ["apply", "\((patch + fileName).path)"], currentDirectoryURL: directoryURL)
+        if !patchFileNames.isEmpty {
+            for fileName in patchFileNames {
+                try Utility.launch(
+                    path: "/usr/bin/git",
+                    arguments: ["apply", "\((patchDirectory + fileName).path)"],
+                    currentDirectoryURL: directoryURL
+                )
             }
+            try patchStamp.write(to: patchStampURL, atomically: true, encoding: .utf8)
         }
     }
 
@@ -270,9 +307,48 @@ class BaseBuild {
             "CXXFLAGS": cFlags,
             "ASMFLAGS": cFlags,
             "LDFLAGS": ldFlags,
-            "PKG_CONFIG_LIBDIR": pkgConfigPath + pkgConfigPathDefault,
+            "PKG_CONFIG_LIBDIR": pkgConfigPath + appleSDKPkgConfigPath(platform: platform) + pkgConfigPathDefault,
             "PATH": BaseBuild.defaultPath,
         ]
+    }
+
+    /// Downloaded freetype metadata retains a zlib dependency, while FFmpeg also requires
+    /// libxml2. Both libraries are supplied by every selected Apple SDK, but Xcode intentionally
+    /// ships no pkg-config files for them. Generate platform-specific metadata so cross builds use
+    /// the SDK selected by `-isysroot` rather than accidentally linking Homebrew's host libraries.
+    private func appleSDKPkgConfigPath(platform: PlatformType) -> String {
+        let directory = URL.currentDirectory + ["pkgconfig", "apple-sdk", platform.rawValue]
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+        let sdk = platform.isysroot
+        let files = [
+            "zlib.pc": """
+            Name: zlib
+            Description: zlib supplied by the selected Apple SDK
+            Version: 1.3.1
+            Libs: -lz
+            Cflags:
+
+            """,
+            "libxml-2.0.pc": """
+            Name: libXML
+            Description: libxml2 supplied by the selected Apple SDK
+            Version: 2.9.14
+            Libs: -L\(sdk)/usr/lib -lxml2
+            Cflags: -I\(sdk)/usr/include/libxml2
+
+            """,
+        ]
+        for (name, contents) in files {
+            let file = directory + name
+            if !FileManager.default.fileExists(atPath: file.path) {
+                try? contents.write(to: file, atomically: true, encoding: .utf8)
+            }
+        }
+        return directory.path + ":"
     }
 
     func cFlags(platform: PlatformType, arch: ArchType) -> [String] {
@@ -731,11 +807,11 @@ class BaseBuild {
                 if FileManager.default.fileExists(atPath: tmpChecksum.path) {
                     try? FileManager.default.removeItem(at: tmpChecksum)
                 }
-                try! Utility.launch(path: "wget", arguments: ["-q", "-O", tmpChecksum.path, target.checksum], currentDirectoryURL: FileManager.default.temporaryDirectory)
+                try Utility.download(url: target.checksum, to: tmpChecksum)
                 let checksum = try String(contentsOf: tmpChecksum, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
                 dependencyTargetContent += """
                 
-                        .binaryTarget(
+                        mpvkitBinaryTarget(
                             name: "\(target.name)",
                             url: "\(target.url)",
                             checksum: "\(checksum)"
@@ -750,7 +826,7 @@ class BaseBuild {
                 let checksum = try String(contentsOf: checksumFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
                 dependencyTargetContent += """
 
-                        .binaryTarget(
+                        mpvkitBinaryTarget(
                             name: "\(target.name)",
                             url: "\(target.url)",
                             checksum: "\(checksum)"
@@ -910,7 +986,7 @@ class ZipBaseBuild : BaseBuild {
         try! FileManager.default.createDirectory(atPath: directoryURL.path, withIntermediateDirectories: true, attributes: nil)
 
         if !FileManager.default.fileExists(atPath: outputFile.path) {
-            try! Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
+            try Utility.download(url: library.url, to: outputFile)
             try! Utility.launch(path: "/usr/bin/unzip", arguments: ["-o",outputFileName], currentDirectoryURL: directoryURL)
         }
     }
@@ -1246,6 +1322,14 @@ enum ArchType: String, CaseIterable {
 
 
 enum Utility {
+    static func download(url: String, to outputURL: URL) throws {
+        try launch(
+            path: "/usr/bin/curl",
+            arguments: ["-fL", "--retry", "3", "--retry-delay", "1", "-o", outputURL.path, url],
+            currentDirectoryURL: outputURL.deletingLastPathComponent()
+        )
+    }
+
     @discardableResult
     static func shell(_ command: String, isOutput : Bool = false, currentDirectoryURL: URL? = nil, environment: [String: String] = [:]) -> String? {
         do {
@@ -1450,4 +1534,3 @@ extension URL {
         return url
     }
 }
-

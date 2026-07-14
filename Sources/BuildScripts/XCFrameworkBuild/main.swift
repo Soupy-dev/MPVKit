@@ -401,6 +401,7 @@ private class BuildMPV: BaseBuild {
             "-Dvulkan=enabled",
             "-Dmoltenvk=enabled",  // from patch option
             "-Dios-sample-buffer=enabled",
+            "-Dapple-gpu-pip=enabled",
 
             "-Djavascript=disabled",
             "-Dzimg=disabled",
@@ -464,10 +465,11 @@ private class BuildFFMPEG: BaseBuild {
         try super.beforeBuild()
 
         if Utility.shell("which nasm") == nil {
-            Utility.shell("brew install nasm")
-        }
-        if Utility.shell("which sdl2-config") == nil {
-            Utility.shell("brew install sdl2")
+            throw NSError(
+                domain: "MPVKit.Build",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "nasm is required to build FFmpeg simulator and Intel slices"]
+            )
         }
 
         let lldbFile = URL.currentDirectory + "LLDBInitFile"
@@ -607,16 +609,9 @@ private class BuildFFMPEG: BaseBuild {
             arguments.append("--enable-neon")
             arguments.append("--enable-asm")
         }
-        if platform == .macos, arch.executable {
-            arguments.append("--enable-ffplay")
-            arguments.append("--enable-sdl2")
-            arguments.append("--enable-decoder=rawvideo")
-            arguments.append("--enable-filter=color")
-            arguments.append("--enable-filter=lut")
-            arguments.append("--enable-filter=testsrc")
-        } else {
-            arguments.append("--disable-programs")
-        }
+        // MPVKit distributes FFmpeg libraries only. Building ffplay for the host architecture
+        // pulled an otherwise unused Homebrew SDL2 dependency into cross-platform artifact jobs.
+        arguments.append("--disable-programs")
         //        if platform == .isimulator || platform == .tvsimulator {
         //            arguments.append("--assert-level=1")
         //        }
@@ -857,6 +852,27 @@ private class BuildSmbclient: ZipBaseBuild {
         super.init(library: .libsmbclient)
     }
 
+    override func buildALL() throws {
+        try super.buildALL()
+
+        // Some prebuilt Apple slices advertise glib as a private pkg-config dependency even
+        // though the shipped static archive has no unresolved glib symbols. Requiring a host
+        // Homebrew glib then makes otherwise hermetic macOS/simulator FFmpeg builds fail at
+        // configure time. Normalize only that stale transitive metadata; the archive and its
+        // actual gnutls/system link dependencies remain unchanged.
+        let root = URL.currentDirectory + Library.libsmbclient.rawValue
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: nil
+        ) else { return }
+        for case let file as URL in enumerator where file.lastPathComponent == "smbclient.pc" {
+            guard let data = FileManager.default.contents(atPath: file.path),
+                  var contents = String(data: data, encoding: .utf8) else { continue }
+            contents = contents.replacingOccurrences(of: " -lglib-2.0", with: "")
+            contents = contents.replacingOccurrences(of: " glib-2.0", with: "")
+            try contents.write(to: file, atomically: true, encoding: .utf8)
+        }
+    }
 }
 
 private class BuildDav1d: ZipBaseBuild {

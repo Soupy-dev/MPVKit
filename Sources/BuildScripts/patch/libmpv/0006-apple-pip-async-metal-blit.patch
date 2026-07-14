@@ -1,0 +1,807 @@
+diff --git a/include/mpv/apple_pip.h b/include/mpv/apple_pip.h
+index 8e3a0f6d85f058284dab1a0662f4eba00c5325cc..12293960709a013cd3c6103f2c08437748e36c53 100644
+--- a/include/mpv/apple_pip.h
++++ b/include/mpv/apple_pip.h
+@@ -65,6 +65,13 @@ enum mpv_apple_pip_capability {
+     MPV_APPLE_PIP_CAP_SDR_BGRA8 = 1ull << 1,
+     MPV_APPLE_PIP_CAP_OFFSCREEN_WITHOUT_DRAWABLE = 1ull << 2,
+     MPV_APPLE_PIP_CAP_ASYNC_COMPLETION = 1ull << 3,
++    MPV_APPLE_PIP_CAP_ASYNC_METAL_BLIT = 1ull << 4,
++    MPV_APPLE_PIP_CAP_INLINE_RESTORE_NOTIFICATION = 1ull << 5,
++};
++
++enum mpv_apple_pip_backend {
++    MPV_APPLE_PIP_BACKEND_DIRECT_IOSURFACE = 1,
++    MPV_APPLE_PIP_BACKEND_ASYNC_METAL_BLIT = 2,
+ };
+ 
+ enum mpv_apple_pip_frame_status {
+@@ -105,7 +112,7 @@ struct mpv_apple_pip_frame {
+     uint32_t width;
+     uint32_t height;
+     uint32_t pixel_format;
+-    uint32_t reserved;
++    uint32_t backend;
+     uint64_t token;
+     uint64_t generation;
+     double pts;
+@@ -119,6 +126,11 @@ struct mpv_apple_pip_frame {
+  * application-owned queue. generation is always copied from the submitted
+  * target; discard any callback whose generation no longer matches the
+  * application's current load, regardless of status.
++ *
++ * When a callback is installed and INLINE_ONLY is selected, gpu-next emits
++ * one targetless READY notification (token 0, width/height 0) after a valid
++ * current frame has been submitted back to the inline swapchain. This lets a
++ * compatibility renderer remain visible until inline restoration is real.
+  */
+ typedef void (*mpv_apple_pip_frame_callback)(
+     void *callback_ctx, const struct mpv_apple_pip_frame *frame);
+diff --git a/meson.build b/meson.build
+index b6a796fac93dcd2788be5240526bf91070447431..a6c5244f7bf263c6453bd77b1846d6a0da9f2fc1 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1342,7 +1342,7 @@ if host_machine.system() == 'darwin'
+ 
+     apple_gpu_pip_frameworks = dependency(
+         'appleframeworks',
+-        modules: ['CoreFoundation', 'IOSurface'],
++        modules: ['CoreFoundation', 'IOSurface', 'Metal'],
+         required: get_option('apple-gpu-pip'),
+     )
+     apple_gpu_pip = get_option('apple-gpu-pip').require(
+@@ -1353,6 +1353,7 @@ if host_machine.system() == 'darwin'
+     features += {'apple-gpu-pip': apple_gpu_pip.allowed()}
+     if features['apple-gpu-pip']
+         dependencies += apple_gpu_pip_frameworks
++        sources += files('video/out/apple_pip_metal.m')
+     endif
+ else
+     apple_gpu_pip = get_option('apple-gpu-pip').require(
+diff --git a/video/out/apple_pip_metal.h b/video/out/apple_pip_metal.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..53e8194573da9c625fb44a79a2daadfd49b604c5
+--- /dev/null
++++ b/video/out/apple_pip_metal.h
+@@ -0,0 +1,31 @@
++#ifndef MPV_VIDEO_OUT_APPLE_PIP_METAL_H_
++#define MPV_VIDEO_OUT_APPLE_PIP_METAL_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <IOSurface/IOSurfaceRef.h>
++
++struct apple_pip_metal_context;
++struct apple_pip_metal_target;
++
++typedef void (*apple_pip_metal_completion)(void *opaque, bool success);
++
++struct apple_pip_metal_context *apple_pip_metal_create(
++    char *diagnostic, size_t diagnostic_size);
++void apple_pip_metal_destroy(struct apple_pip_metal_context **context);
++
++struct apple_pip_metal_target *apple_pip_metal_target_create(
++    struct apple_pip_metal_context *context, IOSurfaceRef destination,
++    uint32_t width, uint32_t height, char *diagnostic,
++    size_t diagnostic_size);
++void *apple_pip_metal_target_source_texture(
++    struct apple_pip_metal_target *target);
++bool apple_pip_metal_target_blit(
++    struct apple_pip_metal_context *context,
++    struct apple_pip_metal_target *target,
++    apple_pip_metal_completion completion, void *opaque);
++void apple_pip_metal_target_destroy(struct apple_pip_metal_target **target);
++
++#endif
+diff --git a/video/out/apple_pip_metal.m b/video/out/apple_pip_metal.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..df9535524ccdd379f082b5b70d793db28ca3b7bc
+--- /dev/null
++++ b/video/out/apple_pip_metal.m
+@@ -0,0 +1,220 @@
++/*
++ * Copyright (C) 2026 MPVKit contributors
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#import <Metal/Metal.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "apple_pip_metal.h"
++
++struct apple_pip_metal_context {
++    void *device;
++    void *queue;
++};
++
++struct apple_pip_metal_target {
++    void *source;
++    void *destination;
++};
++
++static void *retain_object(id object)
++{
++    if (!object)
++        return NULL;
++#if __has_feature(objc_arc)
++    return (__bridge_retained void *)object;
++#else
++    return [object retain];
++#endif
++}
++
++static id object_from_pointer(void *pointer)
++{
++    return (__bridge id)pointer;
++}
++
++static void release_object(void *pointer)
++{
++    if (!pointer)
++        return;
++#if __has_feature(objc_arc)
++    id value = (__bridge_transfer id)pointer;
++    (void)value;
++#else
++    [(id)pointer release];
++#endif
++}
++
++struct apple_pip_metal_context *apple_pip_metal_create(
++    char *diagnostic, size_t diagnostic_size)
++{
++    @autoreleasepool {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        if (!device || !queue) {
++#if !__has_feature(objc_arc)
++            [queue release];
++            [device release];
++#endif
++            snprintf(diagnostic, diagnostic_size,
++                     "Metal device or command queue is unavailable");
++            return NULL;
++        }
++
++        struct apple_pip_metal_context *context = calloc(1, sizeof(*context));
++        if (!context) {
++#if !__has_feature(objc_arc)
++            [queue release];
++            [device release];
++#endif
++            snprintf(diagnostic, diagnostic_size,
++                     "allocating Metal PiP context failed");
++            return NULL;
++        }
++        context->device = retain_object(device);
++        context->queue = retain_object(queue);
++#if !__has_feature(objc_arc)
++        [queue release];
++        [device release];
++#endif
++        snprintf(diagnostic, diagnostic_size,
++                 "asynchronous Metal blit output ready");
++        return context;
++    }
++}
++
++void apple_pip_metal_destroy(struct apple_pip_metal_context **context_ptr)
++{
++    if (!context_ptr || !*context_ptr)
++        return;
++    struct apple_pip_metal_context *context = *context_ptr;
++    release_object(context->queue);
++    release_object(context->device);
++    free(context);
++    *context_ptr = NULL;
++}
++
++struct apple_pip_metal_target *apple_pip_metal_target_create(
++    struct apple_pip_metal_context *context, IOSurfaceRef destination_surface,
++    uint32_t width, uint32_t height, char *diagnostic,
++    size_t diagnostic_size)
++{
++    if (!context || !destination_surface || !width || !height)
++        return NULL;
++
++    @autoreleasepool {
++        id<MTLDevice> device = object_from_pointer(context->device);
++        MTLTextureDescriptor *source_descriptor =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                                               width:width
++                                                              height:height
++                                                           mipmapped:NO];
++        source_descriptor.storageMode = MTLStorageModePrivate;
++        source_descriptor.usage = MTLTextureUsageRenderTarget |
++                                  MTLTextureUsageShaderRead;
++        id<MTLTexture> source = [device newTextureWithDescriptor:source_descriptor];
++
++        MTLTextureDescriptor *destination_descriptor =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                                               width:width
++                                                              height:height
++                                                           mipmapped:NO];
++        destination_descriptor.storageMode = MTLStorageModeShared;
++        destination_descriptor.usage = MTLTextureUsageShaderRead;
++        id<MTLTexture> destination =
++            [device newTextureWithDescriptor:destination_descriptor
++                                   iosurface:destination_surface
++                                       plane:0];
++        if (!source || !destination) {
++#if !__has_feature(objc_arc)
++            [destination release];
++            [source release];
++#endif
++            snprintf(diagnostic, diagnostic_size,
++                     "creating Metal source or IOSurface destination texture failed");
++            return NULL;
++        }
++
++        source.label = @"MPVKit PiP Vulkan render target";
++        destination.label = @"MPVKit PiP IOSurface blit destination";
++        struct apple_pip_metal_target *target = calloc(1, sizeof(*target));
++        if (!target) {
++#if !__has_feature(objc_arc)
++            [destination release];
++            [source release];
++#endif
++            snprintf(diagnostic, diagnostic_size,
++                     "allocating Metal PiP target failed");
++            return NULL;
++        }
++        target->source = retain_object(source);
++        target->destination = retain_object(destination);
++#if !__has_feature(objc_arc)
++        [destination release];
++        [source release];
++#endif
++        return target;
++    }
++}
++
++void *apple_pip_metal_target_source_texture(
++    struct apple_pip_metal_target *target)
++{
++    return target ? target->source : NULL;
++}
++
++bool apple_pip_metal_target_blit(
++    struct apple_pip_metal_context *context,
++    struct apple_pip_metal_target *target,
++    apple_pip_metal_completion completion, void *opaque)
++{
++    if (!context || !target || !completion)
++        return false;
++
++    @autoreleasepool {
++        id<MTLCommandQueue> queue = object_from_pointer(context->queue);
++        id<MTLTexture> source = object_from_pointer(target->source);
++        id<MTLTexture> destination = object_from_pointer(target->destination);
++        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
++        id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
++        if (!command_buffer || !encoder)
++            return false;
++
++        MTLSize size = MTLSizeMake(source.width, source.height, 1);
++        [encoder copyFromTexture:source
++                    sourceSlice:0
++                    sourceLevel:0
++                   sourceOrigin:MTLOriginMake(0, 0, 0)
++                     sourceSize:size
++                      toTexture:destination
++               destinationSlice:0
++               destinationLevel:0
++              destinationOrigin:MTLOriginMake(0, 0, 0)];
++        [encoder endEncoding];
++        [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
++            completion(opaque, buffer.status == MTLCommandBufferStatusCompleted);
++        }];
++        [command_buffer commit];
++        return true;
++    }
++}
++
++void apple_pip_metal_target_destroy(struct apple_pip_metal_target **target_ptr)
++{
++    if (!target_ptr || !*target_ptr)
++        return;
++    struct apple_pip_metal_target *target = *target_ptr;
++    release_object(target->destination);
++    release_object(target->source);
++    free(target);
++    *target_ptr = NULL;
++}
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 3e94f9a0910ae826761ac47eea5a1daff440f90a..91bad1434ad1f123e82f3bb2b768382bebc682aa 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -54,6 +54,7 @@
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <IOSurface/IOSurfaceRef.h>
+ #include <libplacebo/vulkan.h>
++#include "video/out/apple_pip_metal.h"
+ #endif
+ 
+ #if HAVE_GL && defined(PL_HAVE_OPENGL)
+@@ -121,6 +122,8 @@ enum apple_pip_slot_state {
+     APPLE_PIP_SLOT_CANCELED,
+ };
+ 
++struct apple_pip_state;
++
+ struct apple_pip_slot {
+     enum apple_pip_slot_state state;
+     pl_tex tex;
+@@ -132,6 +135,12 @@ struct apple_pip_slot {
+     double pts;
+     double duration;
+     uint32_t completion_status;
++    uint32_t backend;
++    struct apple_pip_metal_target *metal_target;
++    bool metal_blit_started;
++    bool metal_blit_complete;
++    bool metal_blit_succeeded;
++    struct apple_pip_state *owner;
+ };
+ 
+ struct apple_pip_state {
+@@ -142,10 +151,13 @@ struct apple_pip_state {
+     bool worker_started;
+     bool shutting_down;
+     bool force_redraw_armed;
++    bool inline_probe_armed;
+     uint32_t mode;
+     uint64_t generation;
+     mpv_apple_pip_frame_callback callback;
+     void *callback_ctx;
++    uint32_t backend;
++    struct apple_pip_metal_context *metal;
+     struct apple_pip_slot slots[APPLE_PIP_MAX_TARGETS];
+     char diagnostic[160];
+ };
+@@ -183,6 +195,9 @@ struct priv {
+     bool is_interpolated;
+     bool want_reset;
+     bool frame_pending;
++#if HAVE_APPLE_GPU_PIP
++    bool apple_pip_inline_frame_valid;
++#endif
+ 
+     pl_options pars;
+     struct m_config_cache *opts_cache;
+@@ -219,10 +234,10 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+                        int width, int height);
+ 
+ #if HAVE_APPLE_GPU_PIP
+-static bool apple_pip_direct_supported(struct vo *vo, char *reason,
+-                                       size_t reason_size)
++static bool apple_pip_select_backend(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++    struct apple_pip_state *state = &p->apple_pip;
+     const char *failure = NULL;
+ 
+     if (!vo->context_name || strcmp(vo->context_name, "moltenvk") != 0) {
+@@ -231,8 +246,6 @@ static bool apple_pip_direct_supported(struct vo *vo, char *reason,
+         failure = "libplacebo is not using a Vulkan GPU";
+     } else if (!p->gpu->limits.thread_safe) {
+         failure = "libplacebo Vulkan polling is not thread-safe";
+-    } else if (!(p->gpu->import_caps.tex & PL_HANDLE_IOSURFACE)) {
+-        failure = "direct IOSurface import is not advertised";
+     } else {
+         pl_fmt fmt = pl_find_named_fmt(p->gpu, "bgra8");
+         enum pl_fmt_caps required = PL_FMT_CAP_RENDERABLE |
+@@ -242,13 +255,33 @@ static bool apple_pip_direct_supported(struct vo *vo, char *reason,
+     }
+ 
+     if (failure) {
+-        snprintf(reason, reason_size,
+-                 "%s; no safe GPU blit fallback is enabled", failure);
+-    } else {
+-        snprintf(reason, reason_size,
++        snprintf(state->diagnostic, sizeof(state->diagnostic), "%s", failure);
++        return false;
++    }
++
++    bool direct = p->gpu->import_caps.tex & PL_HANDLE_IOSURFACE;
++    bool metal_import = p->gpu->import_caps.tex & PL_HANDLE_MTL_TEX;
++    if (metal_import) {
++        state->metal = apple_pip_metal_create(state->diagnostic,
++                                               sizeof(state->diagnostic));
++    }
++
++    if (direct) {
++        state->backend = MPV_APPLE_PIP_BACKEND_DIRECT_IOSURFACE;
++        snprintf(state->diagnostic, sizeof(state->diagnostic),
+                  "direct IOSurface gpu-next output ready");
++        return true;
+     }
+-    return !failure;
++    if (state->metal) {
++        state->backend = MPV_APPLE_PIP_BACKEND_ASYNC_METAL_BLIT;
++        snprintf(state->diagnostic, sizeof(state->diagnostic),
++                 "direct IOSurface import unavailable; asynchronous Metal blit ready");
++        return true;
++    }
++
++    snprintf(state->diagnostic, sizeof(state->diagnostic),
++             "neither IOSurface nor Metal texture import is available");
++    return false;
+ }
+ 
+ static bool apple_pip_has_slots_locked(struct apple_pip_state *state)
+@@ -305,6 +338,54 @@ static void apple_pip_cancel_locked(struct apple_pip_state *state,
+     mp_cond_broadcast(&state->wakeup);
+ }
+ 
++static void apple_pip_metal_blit_complete(void *opaque, bool success)
++{
++    struct apple_pip_slot *slot = opaque;
++    struct apple_pip_state *state = slot->owner;
++    if (!state)
++        return;
++
++    mp_mutex_lock(&state->lock);
++    if (slot->state == APPLE_PIP_SLOT_IN_FLIGHT &&
++        slot->metal_blit_started) {
++        slot->metal_blit_succeeded = success;
++        slot->metal_blit_complete = true;
++        mp_cond_broadcast(&state->wakeup);
++    }
++    mp_mutex_unlock(&state->lock);
++}
++
++static void apple_pip_signal_inline_presented(struct priv *p)
++{
++    struct apple_pip_state *state = &p->apple_pip;
++    mp_mutex_lock(&state->lock);
++    if (!state->inline_probe_armed || !state->callback) {
++        mp_mutex_unlock(&state->lock);
++        return;
++    }
++
++    struct apple_pip_slot *slot = NULL;
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        if (state->slots[i].state == APPLE_PIP_SLOT_FREE) {
++            slot = &state->slots[i];
++            break;
++        }
++    }
++    if (slot) {
++        *slot = (struct apple_pip_slot) {
++            .state = APPLE_PIP_SLOT_IN_FLIGHT,
++            .token = 0,
++            .generation = state->generation,
++            .pts = p->last_pts,
++            .completion_status = MPV_APPLE_PIP_FRAME_READY,
++            .owner = state,
++        };
++        state->inline_probe_armed = false;
++        mp_cond_broadcast(&state->wakeup);
++    }
++    mp_mutex_unlock(&state->lock);
++}
++
+ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+ {
+     struct vo *vo = opaque;
+@@ -320,10 +401,14 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+         mp_mutex_lock(&state->lock);
+         for (;;) {
+             for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
+-                enum apple_pip_slot_state s = state->slots[i].state;
+-                if (s == APPLE_PIP_SLOT_CANCELED ||
+-                    s == APPLE_PIP_SLOT_IN_FLIGHT) {
+-                    slot = &state->slots[i];
++                struct apple_pip_slot *candidate = &state->slots[i];
++                enum apple_pip_slot_state s = candidate->state;
++                bool metal_ready = !candidate->metal_target ||
++                                   !candidate->metal_blit_started ||
++                                   candidate->metal_blit_complete;
++                if ((s == APPLE_PIP_SLOT_CANCELED ||
++                     s == APPLE_PIP_SLOT_IN_FLIGHT) && metal_ready) {
++                    slot = candidate;
+                     tex = slot->tex;
+                     // Import/initial-layout work can be pending even when a
+                     // queued target is canceled before its first render.
+@@ -347,6 +432,28 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+         if (needs_poll && pl_tex_poll(p->gpu, tex, MP_TIME_MS_TO_NS(20)))
+             continue;
+ 
++        if (slot->metal_target && !slot->metal_blit_started) {
++            bool should_blit = false;
++            mp_mutex_lock(&state->lock);
++            if (slot->state == APPLE_PIP_SLOT_IN_FLIGHT &&
++                slot->completion_status == MPV_APPLE_PIP_FRAME_READY &&
++                slot->generation == state->generation) {
++                slot->metal_blit_started = true;
++                should_blit = true;
++            }
++            mp_mutex_unlock(&state->lock);
++
++            if (should_blit) {
++                if (!apple_pip_metal_target_blit(state->metal,
++                                                 slot->metal_target,
++                                                 apple_pip_metal_blit_complete,
++                                                 slot)) {
++                    apple_pip_metal_blit_complete(slot, false);
++                }
++                continue;
++            }
++        }
++
+         struct mpv_apple_pip_frame frame = {0};
+         mpv_apple_pip_frame_callback callback = NULL;
+         void *callback_ctx = NULL;
+@@ -362,6 +469,9 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+         if (slot->completion_status == MPV_APPLE_PIP_FRAME_READY &&
+             slot->generation != state->generation)
+             slot->completion_status = MPV_APPLE_PIP_FRAME_STALE;
++        if (slot->completion_status == MPV_APPLE_PIP_FRAME_READY &&
++            slot->metal_target && !slot->metal_blit_succeeded)
++            slot->completion_status = MPV_APPLE_PIP_FRAME_RENDER_FAILED;
+ 
+         frame = (struct mpv_apple_pip_frame) {
+             .struct_size = sizeof(frame),
+@@ -369,6 +479,7 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+             .width = slot->width,
+             .height = slot->height,
+             .pixel_format = MPV_APPLE_PIP_PIXEL_FORMAT_BGRA,
++            .backend = slot->backend,
+             .token = slot->token,
+             .generation = slot->generation,
+             .pts = slot->pts,
+@@ -382,6 +493,8 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+ 
+         if (tex)
+             pl_tex_destroy(p->gpu, &tex);
++        if (slot->metal_target)
++            apple_pip_metal_target_destroy(&slot->metal_target);
+         if (surface)
+             CFRelease(surface);
+         if (callback)
+@@ -414,9 +527,7 @@ static void apple_pip_init(struct vo *vo)
+ 
+     state->initialized = true;
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+-    if (!apple_pip_direct_supported(vo, state->diagnostic,
+-                                    sizeof(state->diagnostic)))
+-        return;
++    apple_pip_select_backend(vo);
+ 
+     if (mp_thread_create(&state->worker, apple_pip_completion_worker, vo)) {
+         snprintf(state->diagnostic, sizeof(state->diagnostic),
+@@ -436,6 +547,7 @@ static void apple_pip_uninit(struct vo *vo)
+     mp_mutex_lock(&state->lock);
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+     state->force_redraw_armed = false;
++    state->inline_probe_armed = false;
+     state->callback = NULL;
+     state->callback_ctx = NULL;
+     state->shutting_down = true;
+@@ -445,6 +557,8 @@ static void apple_pip_uninit(struct vo *vo)
+     if (state->worker_started)
+         mp_thread_join(state->worker);
+ 
++    apple_pip_metal_destroy(&state->metal);
++
+     mp_cond_destroy(&state->wakeup);
+     mp_mutex_destroy(&state->lock);
+     state->initialized = false;
+@@ -578,10 +692,16 @@ static int apple_pip_get_capabilities(struct vo *vo,
+     if (!state->worker_started)
+         return MPV_APPLE_PIP_UNSUPPORTED;
+ 
+-    caps->flags = MPV_APPLE_PIP_CAP_DIRECT_IOSURFACE |
+-                  MPV_APPLE_PIP_CAP_SDR_BGRA8 |
+-                  MPV_APPLE_PIP_CAP_OFFSCREEN_WITHOUT_DRAWABLE |
+-                  MPV_APPLE_PIP_CAP_ASYNC_COMPLETION;
++    caps->flags = MPV_APPLE_PIP_CAP_INLINE_RESTORE_NOTIFICATION;
++    if (state->backend) {
++        caps->flags |= MPV_APPLE_PIP_CAP_SDR_BGRA8 |
++                       MPV_APPLE_PIP_CAP_OFFSCREEN_WITHOUT_DRAWABLE |
++                       MPV_APPLE_PIP_CAP_ASYNC_COMPLETION;
++    }
++    if (state->backend == MPV_APPLE_PIP_BACKEND_DIRECT_IOSURFACE)
++        caps->flags |= MPV_APPLE_PIP_CAP_DIRECT_IOSURFACE;
++    if (state->metal)
++        caps->flags |= MPV_APPLE_PIP_CAP_ASYNC_METAL_BLIT;
+     return MPV_APPLE_PIP_OK;
+ }
+ 
+@@ -595,6 +715,8 @@ static int apple_pip_set_callback(struct priv *p,
+     mp_mutex_lock(&state->lock);
+     state->callback = config->callback;
+     state->callback_ctx = config->callback_ctx;
++    if (!config->callback)
++        state->inline_probe_armed = false;
+     mp_mutex_unlock(&state->lock);
+     return MPV_APPLE_PIP_OK;
+ }
+@@ -606,6 +728,8 @@ static int apple_pip_set_mode(struct vo *vo,
+     struct apple_pip_state *state = &p->apple_pip;
+     if (!state->worker_started)
+         return MPV_APPLE_PIP_UNSUPPORTED;
++    if (!state->backend && config->mode != MPV_APPLE_PIP_MODE_INLINE_ONLY)
++        return MPV_APPLE_PIP_UNSUPPORTED;
+ 
+     bool force_redraw = false;
+     mp_mutex_lock(&state->lock);
+@@ -625,7 +749,10 @@ static int apple_pip_set_mode(struct vo *vo,
+     if (config->mode == MPV_APPLE_PIP_MODE_INLINE_ONLY) {
+         state->force_redraw_armed = false;
+         apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
++        state->inline_probe_armed = state->callback != NULL;
++        force_redraw = state->inline_probe_armed;
+     } else if (new_generation || new_warmup || new_restore) {
++        state->inline_probe_armed = false;
+         // A single forced draw prepares or restores PiP while paused.
+         // Thereafter surfaces are merely available targets and are consumed
+         // only by natural VO draws, preventing callback/refill from becoming
+@@ -645,7 +772,7 @@ static int apple_pip_submit_target(struct vo *vo,
+ {
+     struct priv *p = vo->priv;
+     struct apple_pip_state *state = &p->apple_pip;
+-    if (!state->worker_started)
++    if (!state->worker_started || !state->backend)
+         return MPV_APPLE_PIP_UNSUPPORTED;
+     if (!target->io_surface || !target->width || !target->height ||
+         target->pixel_format != MPV_APPLE_PIP_PIXEL_FORMAT_BGRA)
+@@ -686,25 +813,64 @@ static int apple_pip_submit_target(struct vo *vo,
+         return MPV_APPLE_PIP_BUSY;
+ 
+     pl_fmt fmt = pl_find_named_fmt(p->gpu, "bgra8");
++    uint32_t backend = state->backend;
++    struct apple_pip_metal_target *metal_target = NULL;
+     CFRetain(surface);
+-    pl_tex tex = pl_tex_create(p->gpu, pl_tex_params(
+-        .w = target->width,
+-        .h = target->height,
+-        .format = fmt,
+-        .renderable = true,
+-        .blit_dst = true,
+-        .import_handle = PL_HANDLE_IOSURFACE,
+-        .shared_mem = {
+-            .handle.handle = surface,
+-            .size = IOSurfaceGetAllocSize(surface),
+-        },
+-        .debug_tag = "MPVKit PiP IOSurface",
+-    ));
++    pl_tex tex = NULL;
++    if (backend == MPV_APPLE_PIP_BACKEND_DIRECT_IOSURFACE) {
++        tex = pl_tex_create(p->gpu, pl_tex_params(
++            .w = target->width,
++            .h = target->height,
++            .format = fmt,
++            .renderable = true,
++            .blit_dst = true,
++            .import_handle = PL_HANDLE_IOSURFACE,
++            .shared_mem = {
++                .handle.handle = surface,
++                .size = IOSurfaceGetAllocSize(surface),
++            },
++            .debug_tag = "MPVKit PiP IOSurface",
++        ));
++    }
++
++    if (!tex && state->metal) {
++        metal_target = apple_pip_metal_target_create(
++            state->metal, surface, target->width, target->height,
++            state->diagnostic, sizeof(state->diagnostic));
++        void *metal_source =
++            apple_pip_metal_target_source_texture(metal_target);
++        if (metal_source) {
++            tex = pl_tex_create(p->gpu, pl_tex_params(
++                .w = target->width,
++                .h = target->height,
++                .format = fmt,
++                .renderable = true,
++                .blit_src = true,
++                .blit_dst = true,
++                .import_handle = PL_HANDLE_MTL_TEX,
++                .shared_mem = {
++                    .handle.handle = metal_source,
++                    .size = (size_t)target->width * target->height * 4,
++                },
++                .debug_tag = "MPVKit PiP Metal blit source",
++            ));
++        }
++        if (tex) {
++            backend = MPV_APPLE_PIP_BACKEND_ASYNC_METAL_BLIT;
++            mp_mutex_lock(&state->lock);
++            state->backend = backend;
++            snprintf(state->diagnostic, sizeof(state->diagnostic),
++                     "asynchronous Metal blit output active");
++            mp_mutex_unlock(&state->lock);
++        }
++    }
++
+     if (!tex) {
++        apple_pip_metal_target_destroy(&metal_target);
+         CFRelease(surface);
+         snprintf(state->diagnostic, sizeof(state->diagnostic),
+-                 "direct IOSurface import failed for %ux%u BGRA; "
+-                 "no safe GPU blit fallback is enabled",
++                 "IOSurface import and asynchronous Metal blit setup failed "
++                 "for %ux%u BGRA",
+                  target->width, target->height);
+         MP_ERR(vo, "%s\n", state->diagnostic);
+         return MPV_APPLE_PIP_IMPORT_FAILED;
+@@ -715,6 +881,7 @@ static int apple_pip_submit_target(struct vo *vo,
+         slot->state != APPLE_PIP_SLOT_FREE) {
+         mp_mutex_unlock(&state->lock);
+         pl_tex_destroy(p->gpu, &tex);
++        apple_pip_metal_target_destroy(&metal_target);
+         CFRelease(surface);
+         return MPV_APPLE_PIP_STALE_GENERATION;
+     }
+@@ -727,6 +894,9 @@ static int apple_pip_submit_target(struct vo *vo,
+         .token = target->token,
+         .generation = target->generation,
+         .completion_status = MPV_APPLE_PIP_FRAME_READY,
++        .backend = backend,
++        .metal_target = metal_target,
++        .owner = state,
+     };
+     force_redraw = apple_pip_claim_forced_redraw_locked(state);
+     mp_mutex_unlock(&state->lock);
+@@ -745,6 +915,7 @@ static int apple_pip_disable_and_drain(struct priv *p)
+     mp_mutex_lock(&state->lock);
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+     state->force_redraw_armed = false;
++    state->inline_probe_armed = false;
+     state->callback = NULL;
+     state->callback_ctx = NULL;
+     apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
+@@ -2123,6 +2294,9 @@ done:
+     }
+ #endif
+     p->frame_pending = have_inline;
++#if HAVE_APPLE_GPU_PIP
++    p->apple_pip_inline_frame_valid = have_inline && valid && frame->current;
++#endif
+     return VO_TRUE;
+ }
+ 
+@@ -2135,17 +2309,30 @@ static void flip_page(struct vo *vo)
+     // Active offscreen-only PiP must not acquire or present a CAMetalDrawable.
+     if (!apple_pip_inline_enabled(p)) {
+         p->frame_pending = false;
++        p->apple_pip_inline_frame_valid = false;
+         return;
+     }
+ #endif
+ 
++#if HAVE_APPLE_GPU_PIP
++    bool inline_presented = false;
++#endif
+     if (p->frame_pending) {
+-        if (!pl_swapchain_submit_frame(p->sw))
++        bool submitted = pl_swapchain_submit_frame(p->sw);
++        if (!submitted)
+             MP_ERR(vo, "Failed presenting frame!\n");
++#if HAVE_APPLE_GPU_PIP
++        inline_presented = submitted && p->apple_pip_inline_frame_valid;
++        p->apple_pip_inline_frame_valid = false;
++#endif
+         p->frame_pending = false;
+     }
+ 
+     sw->fns->swap_buffers(sw);
++#if HAVE_APPLE_GPU_PIP
++    if (inline_presented)
++        apple_pip_signal_inline_presented(p);
++#endif
+ }
+ 
+ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)

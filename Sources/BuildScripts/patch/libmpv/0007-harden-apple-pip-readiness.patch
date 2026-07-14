@@ -1,0 +1,143 @@
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 91bad14..873c194 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -358,32 +358,30 @@ static void apple_pip_metal_blit_complete(void *opaque, bool success)
+ static void apple_pip_signal_inline_presented(struct priv *p)
+ {
+     struct apple_pip_state *state = &p->apple_pip;
++    mpv_apple_pip_frame_callback callback = NULL;
++    void *callback_ctx = NULL;
++    struct mpv_apple_pip_frame frame = {0};
++
+     mp_mutex_lock(&state->lock);
+     if (!state->inline_probe_armed || !state->callback) {
+         mp_mutex_unlock(&state->lock);
+         return;
+     }
+-
+-    struct apple_pip_slot *slot = NULL;
+-    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
+-        if (state->slots[i].state == APPLE_PIP_SLOT_FREE) {
+-            slot = &state->slots[i];
+-            break;
+-        }
+-    }
+-    if (slot) {
+-        *slot = (struct apple_pip_slot) {
+-            .state = APPLE_PIP_SLOT_IN_FLIGHT,
+-            .token = 0,
+-            .generation = state->generation,
+-            .pts = p->last_pts,
+-            .completion_status = MPV_APPLE_PIP_FRAME_READY,
+-            .owner = state,
+-        };
+-        state->inline_probe_armed = false;
+-        mp_cond_broadcast(&state->wakeup);
+-    }
++    callback = state->callback;
++    callback_ctx = state->callback_ctx;
++    frame = (struct mpv_apple_pip_frame) {
++        .struct_size = sizeof(frame),
++        .status = MPV_APPLE_PIP_FRAME_READY,
++        .token = 0,
++        .generation = state->generation,
++        .pts = p->last_pts,
++    };
++    state->inline_probe_armed = false;
+     mp_mutex_unlock(&state->lock);
++
++    // Token zero is a presentation notification, not an IOSurface fence. Invoke
++    // it after dropping the native lock so callback code may safely change mode.
++    callback(callback_ctx, &frame);
+ }
+ 
+ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+@@ -602,6 +600,27 @@ static struct apple_pip_slot *apple_pip_take_target(struct priv *p)
+     return result;
+ }
+ 
++static void apple_pip_requeue_target(struct priv *p,
++                                     struct apple_pip_slot *slot)
++{
++    if (!slot)
++        return;
++
++    struct apple_pip_state *state = &p->apple_pip;
++    mp_mutex_lock(&state->lock);
++    if (slot->state == APPLE_PIP_SLOT_RENDERING &&
++        slot->generation == state->generation &&
++        slot->completion_status == MPV_APPLE_PIP_FRAME_READY) {
++        // No decoded frame is available yet. Keep the target for the next
++        // natural VO draw; deliberately do not re-arm a forced redraw loop.
++        slot->state = APPLE_PIP_SLOT_QUEUED;
++    } else if (slot->state == APPLE_PIP_SLOT_RENDERING) {
++        slot->state = APPLE_PIP_SLOT_CANCELED;
++    }
++    mp_cond_broadcast(&state->wakeup);
++    mp_mutex_unlock(&state->lock);
++}
++
+ static void apple_pip_complete_render(struct priv *p,
+                                       struct apple_pip_slot *slot,
+                                       bool gpu_used, bool ready, double pts,
+@@ -752,13 +771,19 @@ static int apple_pip_set_mode(struct vo *vo,
+         state->inline_probe_armed = state->callback != NULL;
+         force_redraw = state->inline_probe_armed;
+     } else if (new_generation || new_warmup || new_restore) {
+-        state->inline_probe_armed = false;
+-        // A single forced draw prepares or restores PiP while paused.
+-        // Thereafter surfaces are merely available targets and are consumed
+-        // only by natural VO draws, preventing callback/refill from becoming
+-        // an unbounded loop.
+-        state->force_redraw_armed = true;
+-        force_redraw = apple_pip_claim_forced_redraw_locked(state);
++        bool restoring = config->mode == MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE;
++        state->inline_probe_armed = restoring && state->callback != NULL;
++        if (restoring) {
++            // Restoration waits for an actual CAMetalLayer presentation and
++            // must not depend on a queued PiP target being available.
++            state->force_redraw_armed = false;
++            force_redraw = state->inline_probe_armed;
++        } else {
++            // A single forced draw prepares PiP while paused. Thereafter
++            // surfaces are consumed only by natural VO draws.
++            state->force_redraw_armed = true;
++            force_redraw = apple_pip_claim_forced_redraw_locked(state);
++        }
+     }
+     mp_mutex_unlock(&state->lock);
+ 
+@@ -1854,7 +1879,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     if (pip_slot && !frame->current) {
+         // A preparation callback must never advertise an idle/background frame
+         // as the first valid sample for the current load generation.
+-        apple_pip_complete_render(p, pip_slot, false, false, 0.0, 0.0);
++        apple_pip_requeue_target(p, pip_slot);
+         pip_slot = NULL;
+     }
+ #else
+@@ -2286,11 +2311,18 @@ done:
+     pl_gpu_flush(gpu);
+ #if HAVE_APPLE_GPU_PIP
+     if (pip_slot) {
+-        double pip_pts = frame->current ? p->last_pts : 0.0;
+-        double pip_duration = frame->current && frame->approx_duration > 0
+-                                ? frame->approx_duration : 0.0;
+-        apple_pip_complete_render(p, pip_slot, pip_gpu_used, pip_rendered,
+-                                  pip_pts, pip_duration);
++        if (!pip_rendered && mix.num_frames == 0) {
++            // libplacebo can legitimately request more source frames. Preserve
++            // this target for the next natural draw instead of reporting a
++            // fatal GPU failure and latching the compatibility backend early.
++            apple_pip_requeue_target(p, pip_slot);
++        } else {
++            double pip_pts = frame->current ? p->last_pts : 0.0;
++            double pip_duration = frame->current && frame->approx_duration > 0
++                                    ? frame->approx_duration : 0.0;
++            apple_pip_complete_render(p, pip_slot, pip_gpu_used, pip_rendered,
++                                      pip_pts, pip_duration);
++        }
+     }
+ #endif
+     p->frame_pending = have_inline;

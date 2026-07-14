@@ -1,29 +1,32 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Accelerate
 import CoreGraphics
 import CoreMedia
-import CoreVideo
+@preconcurrency import CoreVideo
+@preconcurrency import Dispatch
 import Foundation
+import MPVKitSampleBufferCore
 
-public enum MPVMetalSampleBufferRendererState: Equatable {
+public enum MPVMetalSampleBufferRendererState: Equatable, Sendable {
     case idle
     case starting
     case loading
     case ready
     case playing
     case paused
+    case stopping
     case stopped
     case failed(String)
 }
 
-public enum MPVMetalSampleBufferPresentationBackend: String, Equatable {
+public enum MPVMetalSampleBufferPresentationBackend: String, Equatable, Sendable {
     case metalHighBitDepthHDRIOSurface
     case metalHDRIOSurface
     case metalIOSurface
     case softwareIOSurface
 }
 
-public struct MPVMetalSampleBufferRendererOptions: Equatable {
+public struct MPVMetalSampleBufferRendererOptions: Equatable, Sendable {
     public var maximumFrameSize: CGSize
     public var preferredFramesPerSecond: Int
     public var preferredPiPFramesPerSecond: Int
@@ -31,6 +34,9 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
     public var prefersMetalPresentation: Bool
     public var prefersHDRPresentation: Bool
     public var prefersHighBitDepthRendering: Bool
+    /// Maximum number of IOSurface-backed buffers that the display path may have outstanding.
+    /// Keeping this small is especially important on iPad while PiP and Stage Manager are active.
+    public var maximumInFlightFrameCount: Int
 
     public init(
         maximumFrameSize: CGSize = CGSize(width: 1280, height: 720),
@@ -39,7 +45,8 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
         createsMetalCompatibilityProbe: Bool = true,
         prefersMetalPresentation: Bool = true,
         prefersHDRPresentation: Bool = true,
-        prefersHighBitDepthRendering: Bool = true
+        prefersHighBitDepthRendering: Bool = true,
+        maximumInFlightFrameCount: Int = 3
     ) {
         self.maximumFrameSize = maximumFrameSize
         self.preferredFramesPerSecond = preferredFramesPerSecond
@@ -48,10 +55,11 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable {
         self.prefersMetalPresentation = prefersMetalPresentation
         self.prefersHDRPresentation = prefersHDRPresentation
         self.prefersHighBitDepthRendering = prefersHighBitDepthRendering
+        self.maximumInFlightFrameCount = min(3, max(1, maximumInFlightFrameCount))
     }
 }
 
-public struct MPVMetalSampleBufferFrame {
+public struct MPVMetalSampleBufferFrame: @unchecked Sendable {
     public let sampleBuffer: CMSampleBuffer
     public let pixelBuffer: CVPixelBuffer
     public let presentationTime: CMTime
@@ -59,7 +67,7 @@ public struct MPVMetalSampleBufferFrame {
     public let frameIndex: Int
 }
 
-public struct MPVMetalSampleBufferRendererDiagnostics: Equatable {
+public struct MPVMetalSampleBufferRendererDiagnostics: Equatable, Sendable {
     public let state: MPVMetalSampleBufferRendererState
     public let frameCount: Int
     public let renderAttemptCount: Int
@@ -85,9 +93,17 @@ public struct MPVMetalSampleBufferRendererDiagnostics: Equatable {
     public let videoSignalPeak: Double
     public let renderAPI: String
     public let backendDescription: String
+    public let coalescedRenderRequestCount: Int
+    public let backpressureDropCount: Int
+    public let poolExhaustionDropCount: Int
+    public let staleGenerationDropCount: Int
+    public let inFlightGPUFrameCount: Int
+    public let lastGPULatencyMilliseconds: Double
+    public let timelineEpoch: UInt64
+    public let timelineRate: Double
 }
 
-public struct MPVMetalSampleBufferTrack: Equatable {
+public struct MPVMetalSampleBufferTrack: Equatable, Sendable {
     public let id: Int
     public let type: String
     public let title: String
@@ -96,7 +112,7 @@ public struct MPVMetalSampleBufferTrack: Equatable {
     public let selected: Bool
 }
 
-public struct MPVMetalSampleBufferSubtitleStyle {
+public struct MPVMetalSampleBufferSubtitleStyle: @unchecked Sendable {
     public var foregroundColor: CGColor
     public var strokeColor: CGColor
     public var strokeWidth: CGFloat
@@ -125,11 +141,12 @@ public enum MPVMetalSampleBufferRendererError: Error, LocalizedError, Equatable 
     case mpvInitializationFailed(Int32)
     case renderContextCreationFailed(Int32)
     case commandFailed(String, Int32)
+    case teardownInProgress
 
     public var errorDescription: String? {
         switch self {
         case .unsupportedPlatform:
-            return "MPVMetalSampleBufferRenderer is only available on iOS."
+            return "MPVMetalSampleBufferRenderer is only available on iOS, tvOS, and Apple Silicon macOS."
         case .metalUnavailable:
             return "Metal is unavailable on this device."
         case .mpvCreationFailed:
@@ -140,17 +157,490 @@ public enum MPVMetalSampleBufferRendererError: Error, LocalizedError, Equatable 
             return "mpv render context creation failed with status \(status)."
         case .commandFailed(let command, let status):
             return "mpv command \(command) failed with status \(status)."
+        case .teardownInProgress:
+            return "MPVMetalSampleBufferRenderer teardown is still in progress."
         }
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(tvOS) || (os(macOS) && arch(arm64))
 import Darwin
 import Libmpv
-import Metal
+@preconcurrency import Metal
 import QuartzCore
+#if os(macOS)
+import AppKit
+#else
 import UIKit
+#endif
 
+private final class MPVMetalSampleBufferCallbackToken: @unchecked Sendable {
+    enum Kind {
+        case render
+        case events
+    }
+
+    private weak var renderer: MPVMetalSampleBufferRenderer?
+    private let engineGeneration: UInt64
+    private let kind: Kind
+    private let lock = NSLock()
+    private var isActive = true
+    private var isSignalPending = false
+
+    init(renderer: MPVMetalSampleBufferRenderer, engineGeneration: UInt64, kind: Kind) {
+        self.renderer = renderer
+        self.engineGeneration = engineGeneration
+        self.kind = kind
+    }
+
+    func signal() {
+        lock.lock()
+        guard isActive, !isSignalPending else {
+            lock.unlock()
+            return
+        }
+        isSignalPending = true
+        lock.unlock()
+
+        // libmpv may invoke this callback from arbitrary threads and in bursts. Coalesce the
+        // callback before crossing onto the renderer's actor; the render queue will coalesce the
+        // actual frame demand separately.
+        DispatchQueue.main.async { @MainActor [weak self] in
+            self?.deliverSignal()
+        }
+    }
+
+    @MainActor
+    private func deliverSignal() {
+        lock.lock()
+        isSignalPending = false
+        guard isActive else {
+            lock.unlock()
+            return
+        }
+        let renderer = self.renderer
+        let generation = engineGeneration
+        let kind = self.kind
+        lock.unlock()
+
+        switch kind {
+        case .render:
+            renderer?.scheduleRender(force: false, engineGeneration: generation)
+        case .events:
+            break
+        }
+    }
+
+    var active: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isActive
+    }
+
+    func deactivate() {
+        lock.lock()
+        isActive = false
+        renderer = nil
+        lock.unlock()
+    }
+}
+
+private enum MPVMetalSampleBufferEvent: Sendable {
+    case startFile(playlistEntryID: Int64)
+    case fileLoaded(playlistEntryID: Int64?)
+    case videoReconfigure(playlistEntryID: Int64?)
+    case endFile(playlistEntryID: Int64)
+    case propertyChange(String, playlistEntryID: Int64?)
+    case logError(String, playlistEntryID: Int64?)
+    case shutdown
+}
+
+private func copyMPVMetalSampleBufferEvent(
+    _ event: mpv_event,
+    activePlaylistEntryID: inout Int64?
+) -> MPVMetalSampleBufferEvent? {
+    switch event.event_id {
+    case MPV_EVENT_START_FILE:
+        guard let data = event.data else { return nil }
+        let startFile = data.assumingMemoryBound(to: mpv_event_start_file.self).pointee
+        activePlaylistEntryID = startFile.playlist_entry_id
+        return .startFile(playlistEntryID: startFile.playlist_entry_id)
+    case MPV_EVENT_FILE_LOADED:
+        return .fileLoaded(playlistEntryID: activePlaylistEntryID)
+    case MPV_EVENT_VIDEO_RECONFIG:
+        return .videoReconfigure(playlistEntryID: activePlaylistEntryID)
+    case MPV_EVENT_END_FILE:
+        guard let data = event.data else { return nil }
+        let endFile = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
+        let playlistEntryID = endFile.playlist_entry_id
+        if activePlaylistEntryID == playlistEntryID {
+            activePlaylistEntryID = nil
+        }
+        return .endFile(playlistEntryID: playlistEntryID)
+    case MPV_EVENT_PROPERTY_CHANGE:
+        guard let data = event.data else { return nil }
+        let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
+        guard let name = property.name else { return nil }
+        return .propertyChange(String(cString: name), playlistEntryID: activePlaylistEntryID)
+    case MPV_EVENT_LOG_MESSAGE:
+        guard let log = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) else {
+            return nil
+        }
+        let text = log.pointee.text.map { String(cString: $0) } ?? ""
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.localizedCaseInsensitiveContains("error")
+            ? .logError(trimmed, playlistEntryID: activePlaylistEntryID)
+            : nil
+    case MPV_EVENT_SHUTDOWN:
+        return .shutdown
+    default:
+        return nil
+    }
+}
+
+private enum MPVMetalSampleBufferDeferredLoadAction {
+    case videoTrack(String)
+    case audioTrack(Int)
+    case subtitleTrack(Int)
+    case externalSubtitles(urls: [String], names: [String]?, selectFirst: Bool)
+    case subtitleStyle(MPVMetalSampleBufferSubtitleStyle)
+}
+
+private struct MPVMetalSampleBufferPendingDisplaySample: @unchecked Sendable {
+    let sampleBuffer: CMSampleBuffer
+    let pixelBuffer: CVPixelBuffer
+    let description: CMVideoFormatDescription
+    let presentationTime: CMTime
+    let mediaSeconds: Double
+    let timelineEpoch: UInt64
+    let forceSDR: Bool
+}
+
+private struct MPVMetalSampleBufferPendingRecoveryFrame: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let forceSDR: Bool
+    let loadGeneration: UInt64
+    let timelineEpoch: UInt64
+}
+
+private struct MPVMetalSampleBufferDisplayFlushRequest: @unchecked Sendable {
+    let loadGeneration: UInt64
+    let removingDisplayedImage: Bool
+    let pendingSample: MPVMetalSampleBufferPendingDisplaySample?
+    let recoversDisplayRenderer: Bool
+    let recoveryTimelineEpoch: UInt64?
+}
+
+/// Immutable handoff from the serial render queue to the main-actor diagnostics surface.
+/// None of these values are read cross-queue in mutable form.
+private struct MPVMetalSampleBufferRenderDiagnosticsSnapshot: @unchecked Sendable {
+    var frameCount = 0
+    var renderAttemptCount = 0
+    var renderFailureCount = 0
+    var allocationFailureCount = 0
+    var enqueueFailureCount = 0
+    var lastRenderStatus: Int32 = 0
+    var lastFrameSize = CGSize.zero
+    var lastPresentationTime: Double = 0
+    var metalCompatibilityProbeSucceeded = false
+    var presentationBackend: MPVMetalSampleBufferPresentationBackend = .softwareIOSurface
+    var metalPresentationFrameCount = 0
+    var metalPresentationFailureCount = 0
+    var pixelFormatDescription = "BGRA8"
+    var sourcePixelFormatDescription = "bgr0/BGRA8"
+    var highBitDepthRenderingActive = false
+    var highBitDepthRenderingFailureCount = 0
+    var hdrMetadataApplied = false
+    var videoColorPrimaries = ""
+    var videoTransferFunction = ""
+    var videoSignalPeak: Double = 0
+    var backendDescription = "libmpv sample-buffer renderer with software IOSurface presentation"
+    var coalescedRenderRequestCount = 0
+    var backpressureDropCount = 0
+    var poolExhaustionDropCount = 0
+    var staleGenerationDropCount = 0
+    var inFlightGPUFrameCount = 0
+    var lastGPULatencyMilliseconds: Double = 0
+    var timelineEpoch: UInt64 = 0
+    var timelineRate: Double = 0
+}
+
+private final class MPVHighBitDepthStagingPool: @unchecked Sendable {
+    final class Lease: @unchecked Sendable {
+        let pointer: UnsafeMutableRawPointer
+        let length: Int
+        private let lock = NSLock()
+        private var releaseHandler: (() -> Void)?
+
+        fileprivate init(pointer: UnsafeMutableRawPointer, length: Int, releaseHandler: @escaping () -> Void) {
+            self.pointer = pointer
+            self.length = length
+            self.releaseHandler = releaseHandler
+        }
+
+        func release() {
+            lock.lock()
+            let handler = releaseHandler
+            releaseHandler = nil
+            lock.unlock()
+            handler?()
+        }
+
+        deinit { release() }
+    }
+
+    private struct Entry {
+        let pointer: UnsafeMutableRawPointer
+        var isInUse: Bool
+    }
+
+    let generation: UInt64
+    let width: Int
+    let height: Int
+    let stride: Int
+    let byteCount: Int
+    let allocationLength: Int
+    private let capacity: Int
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+
+    init(generation: UInt64, width: Int, height: Int, stride: Int, capacity: Int) {
+        self.generation = generation
+        self.width = width
+        self.height = height
+        self.stride = stride
+        self.byteCount = stride * height
+        let pageSize = Int(getpagesize())
+        self.allocationLength = ((self.byteCount + pageSize - 1) / pageSize) * pageSize
+        self.capacity = min(3, max(1, capacity))
+    }
+
+    func matches(generation: UInt64, width: Int, height: Int, stride: Int) -> Bool {
+        self.generation == generation && self.width == width && self.height == height && self.stride == stride
+    }
+
+    func acquire() -> Lease? {
+        lock.lock()
+        let index: Int
+        if let available = entries.firstIndex(where: { !$0.isInUse }) {
+            index = available
+            entries[index].isInUse = true
+        } else if entries.count < capacity {
+            var rawPointer: UnsafeMutableRawPointer?
+            let pageSize = Int(getpagesize())
+            guard posix_memalign(&rawPointer, pageSize, allocationLength) == 0, let pointer = rawPointer else {
+                lock.unlock()
+                return nil
+            }
+            index = entries.count
+            entries.append(Entry(pointer: pointer, isInUse: true))
+        } else {
+            lock.unlock()
+            return nil
+        }
+        let pointer = entries[index].pointer
+        lock.unlock()
+
+        return Lease(pointer: pointer, length: allocationLength) { [self] in
+            release(index: index)
+        }
+    }
+
+    private func release(index: Int) {
+        lock.lock()
+        if entries.indices.contains(index) { entries[index].isInUse = false }
+        lock.unlock()
+    }
+
+    deinit { entries.forEach { free($0.pointer) } }
+}
+
+private final class MPVMetalUncheckedSendableReference<Value>: @unchecked Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
+}
+
+private final class MPVMetalSampleBufferReadinessHandler: @unchecked Sendable {
+    private let body: () -> Void
+    init(_ body: @escaping () -> Void) { self.body = body }
+    func callAsFunction() { body() }
+}
+
+private final class MPVMetalSampleBufferValueHandler<Value>: @unchecked Sendable {
+    private let body: (Value) -> Void
+    init(_ body: @escaping (Value) -> Void) { self.body = body }
+    func callAsFunction(_ value: Value) { body(value) }
+}
+
+private struct MPVMetalSampleBufferTimelineWaiter: @unchecked Sendable {
+    let engineGeneration: UInt64
+    let loadGeneration: UInt64
+    let timelineEpoch: UInt64
+    let continuation: CheckedContinuation<Bool, Never>
+}
+
+/// Retains CoreVideo/Metal objects across the command-buffer callback and the serial render queue.
+/// Their use remains ordered by the GPU fence; unchecked sendability only bridges SDK types that
+/// do not yet declare Sendable conformance.
+private final class MPVMetalGPUCompletionResources: @unchecked Sendable {
+    let destinationBuffer: CVPixelBuffer
+    let fallbackBuffer: CVPixelBuffer?
+    let retainedObjects: [AnyObject]
+
+    init(
+        destinationBuffer: CVPixelBuffer,
+        fallbackBuffer: CVPixelBuffer?,
+        retainedObjects: [AnyObject]
+    ) {
+        self.destinationBuffer = destinationBuffer
+        self.fallbackBuffer = fallbackBuffer
+        self.retainedObjects = retainedObjects
+    }
+}
+
+private final class MPVMetalGPUCompletionPayload: @unchecked Sendable {
+    let commandBuffer: MTLCommandBuffer
+    let resources: MPVMetalGPUCompletionResources
+
+    init(commandBuffer: MTLCommandBuffer, resources: MPVMetalGPUCompletionResources) {
+        self.commandBuffer = commandBuffer
+        self.resources = resources
+    }
+}
+
+/// Last-resort nonblocking cleanup for a host that releases a renderer without awaiting `stop()`.
+/// Normal teardown disarms this owner after transferring the same resources to the explicit stop
+/// pipeline. Pointer values are stored as integers so the cleanup snapshot is safely transferable.
+private final class MPVMetalSampleBufferEmergencyCleanup: @unchecked Sendable {
+    private final class Snapshot: @unchecked Sendable {
+        let handleAddress: UInt
+        let contextAddress: UInt
+        let renderUserdataAddress: UInt
+        let renderToken: MPVMetalSampleBufferCallbackToken?
+        let eventToken: MPVMetalSampleBufferCallbackToken?
+        let eventQueueGroup: DispatchGroup
+        let gpuConversionGroup: DispatchGroup
+        let renderQueue: DispatchQueue
+        let displayLayer: AVSampleBufferDisplayLayer
+
+        init(
+            handleAddress: UInt,
+            contextAddress: UInt,
+            renderUserdataAddress: UInt,
+            renderToken: MPVMetalSampleBufferCallbackToken?,
+            eventToken: MPVMetalSampleBufferCallbackToken?,
+            eventQueueGroup: DispatchGroup,
+            gpuConversionGroup: DispatchGroup,
+            renderQueue: DispatchQueue,
+            displayLayer: AVSampleBufferDisplayLayer
+        ) {
+            self.handleAddress = handleAddress
+            self.contextAddress = contextAddress
+            self.renderUserdataAddress = renderUserdataAddress
+            self.renderToken = renderToken
+            self.eventToken = eventToken
+            self.eventQueueGroup = eventQueueGroup
+            self.gpuConversionGroup = gpuConversionGroup
+            self.renderQueue = renderQueue
+            self.displayLayer = displayLayer
+        }
+    }
+
+    private let lock = NSLock()
+    private var snapshot: Snapshot?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+
+    func retainMemoryPressureSource(_ source: DispatchSourceMemoryPressure) {
+        lock.lock()
+        memoryPressureSource = source
+        lock.unlock()
+    }
+
+    func install(
+        handle: OpaquePointer,
+        context: OpaquePointer,
+        renderUserdata: UnsafeMutableRawPointer,
+        renderToken: MPVMetalSampleBufferCallbackToken?,
+        eventToken: MPVMetalSampleBufferCallbackToken?,
+        eventQueueGroup: DispatchGroup,
+        gpuConversionGroup: DispatchGroup,
+        renderQueue: DispatchQueue,
+        displayLayer: AVSampleBufferDisplayLayer
+    ) {
+        let installed = Snapshot(
+            handleAddress: UInt(bitPattern: handle),
+            contextAddress: UInt(bitPattern: context),
+            renderUserdataAddress: UInt(bitPattern: renderUserdata),
+            renderToken: renderToken,
+            eventToken: eventToken,
+            eventQueueGroup: eventQueueGroup,
+            gpuConversionGroup: gpuConversionGroup,
+            renderQueue: renderQueue,
+            displayLayer: displayLayer
+        )
+        lock.lock()
+        snapshot = installed
+        lock.unlock()
+    }
+
+    func disarmNativeResources() {
+        lock.lock()
+        snapshot = nil
+        lock.unlock()
+    }
+
+    func cleanup() {
+        lock.lock()
+        let cleanupSnapshot = snapshot
+        snapshot = nil
+        let pressureSource = memoryPressureSource
+        memoryPressureSource = nil
+        lock.unlock()
+
+        pressureSource?.cancel()
+        guard let cleanupSnapshot else { return }
+
+        cleanupSnapshot.renderToken?.deactivate()
+        cleanupSnapshot.eventToken?.deactivate()
+        if let context = OpaquePointer(bitPattern: cleanupSnapshot.contextAddress) {
+            mpv_render_context_set_update_callback(context, nil, nil)
+        }
+        if let handle = OpaquePointer(bitPattern: cleanupSnapshot.handleAddress) {
+            mpv_wakeup(handle)
+        }
+
+        cleanupSnapshot.eventQueueGroup.notify(queue: cleanupSnapshot.renderQueue) {
+            if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
+                cleanupSnapshot.displayLayer.sampleBufferRenderer.stopRequestingMediaData()
+            } else {
+                cleanupSnapshot.displayLayer.stopRequestingMediaData()
+            }
+            cleanupSnapshot.gpuConversionGroup.notify(queue: cleanupSnapshot.renderQueue) {
+                if let context = OpaquePointer(bitPattern: cleanupSnapshot.contextAddress) {
+                    mpv_render_context_free(context)
+                }
+                if let handle = OpaquePointer(bitPattern: cleanupSnapshot.handleAddress) {
+                    mpv_terminate_destroy(handle)
+                }
+                if let renderUserdata = UnsafeMutableRawPointer(
+                    bitPattern: cleanupSnapshot.renderUserdataAddress
+                ) {
+                    Unmanaged<MPVMetalSampleBufferCallbackToken>
+                        .fromOpaque(renderUserdata)
+                        .release()
+                }
+                DispatchQueue.main.async {
+                    cleanupSnapshot.displayLayer.controlTimebase = nil
+                    cleanupSnapshot.displayLayer.flushAndRemoveImage()
+                }
+            }
+        }
+    }
+
+    deinit { cleanup() }
+}
+
+@preconcurrency @MainActor
 public final class MPVMetalSampleBufferRenderer {
     public static var isSupported: Bool {
         MTLCreateSystemDefaultDevice() != nil
@@ -164,33 +654,84 @@ public final class MPVMetalSampleBufferRenderer {
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVMetalSampleBufferRendererDiagnostics) -> Void)?
 
+    /// Main-actor configuration accepted from the host. Rendering reads only `renderOptions`,
+    /// which is installed and consumed on `renderQueue`.
     private var options: MPVMetalSampleBufferRendererOptions
+    private var renderOptions: MPVMetalSampleBufferRendererOptions
     private let eventQueue = DispatchQueue(label: "mpvkit.sample-buffer.events", qos: .utility)
+    private let renderQueue = DispatchQueue(label: "mpvkit.sample-buffer.render", qos: .userInitiated)
     private let eventQueueGroup = DispatchGroup()
+    private let gpuConversionGroup = DispatchGroup()
+    private let emergencyCleanup = MPVMetalSampleBufferEmergencyCleanup()
     private var mpv: OpaquePointer?
     private var renderContext: OpaquePointer?
-    private var displayLink: CADisplayLink?
+    private var renderCallbackToken: MPVMetalSampleBufferCallbackToken?
+    private var eventCallbackToken: MPVMetalSampleBufferCallbackToken?
+    private var renderCallbackUserdata: UnsafeMutableRawPointer?
+    private var engineGeneration: UInt64 = 0
+    private var loadGeneration: UInt64 = 0
+    private let renderLifecycleFence = MPVRenderLifecycleFence()
+    private var publishedRenderDiagnostics = MPVMetalSampleBufferRenderDiagnosticsSnapshot()
+    private var loadIdentityTracker = MPVLoadIdentityTracker()
+    private var deferredLoadActions = MPVGenerationDeferredActions<MPVMetalSampleBufferDeferredLoadAction>()
+    private var isAwaitingCurrentFileLoaded = false
+    private var scheduledRenderWorkItem: DispatchWorkItem?
+    private var demandScheduler = MPVFrameDemandScheduler()
+    private var legacyPrimeBudget = MPVLegacyPrimeBudget(capacity: 2)
+    private var poolExhaustionDropCount = 0
+    /// Stale mpv events are rejected on the main actor. Render/GPU stale drops use the
+    /// render-queue-owned counter with the same base name below and are published by snapshot.
+    private var eventStaleGenerationDropCount = 0
+    private var staleGenerationDropCount = 0
+    private var lastGPULatencyMilliseconds: Double = 0
     private var pixelBufferPool: CVPixelBufferPool?
     private var pixelBufferPoolAuxAttributes: CFDictionary?
+    private var hdrPixelBufferPool: CVPixelBufferPool?
+    private var hdrPixelBufferPoolAuxAttributes: CFDictionary?
     private var formatDescription: CMVideoFormatDescription?
     private var poolWidth = 0
     private var poolHeight = 0
     private var videoSize: CGSize = .zero
+    private var renderVideoSize: CGSize = .zero
+    private var displayBoundsSnapshot: CGRect = .zero
+    private var presentationScaleSnapshot: CGFloat = 1
     private var cachedPosition: Double = 0
     private var cachedDuration: Double = 0
-    /// True once MPV_EVENT_FILE_LOADED has fired for the current load. Absolute seeks issued
-    /// earlier are deferred and replayed from `pendingSeek`.
+    private var cachedVideoPTS: Double?
+    private var cachedSourceFPS: Double?
+    private var cachedSpeed: Double = 1
+    private var isPausedForCache = false
+    private var renderPosition: Double = 0
+    private var renderVideoPTS: Double?
+    private var renderSourceFPS: Double?
+    private var renderSpeed: Double = 1
+    private var renderIsPaused = true
+    private var renderIsBuffering = false
+    private var sampleTimeline = MPVSampleTimeline()
+    private var timelineIsAnchored = false
+    private var allowsPausedDuplicateFrame = false
+    private var flushInFlight = false
+    private var flushCoordinator = MPVFlushEpochCoordinator()
+    private var pendingDisplayFlush: MPVMetalSampleBufferDisplayFlushRequest?
+    private var displayRecoveryGate = MPVDisplayLayerRecoveryGate()
+    private var pendingDisplayRecoveryFrame: MPVMetalSampleBufferPendingRecoveryFrame?
+    private var displayRecoveryProbeGeneration: UInt64?
+    private var finishesStopAfterDisplayFlush = false
+    /// True once MPV_EVENT_FILE_LOADED has fired for the current load. mpv silently drops an
+    /// absolute seek issued before the file is loaded, so seeks requested earlier are deferred
+    /// (see `pendingSeek`) and replayed here.
     private var isFileLoaded = false
+    private var renderIsFileLoaded = false
+    /// A seek target requested before the file finished loading. Applied on FILE_LOADED so a PiP
+    /// hand-off that loads this instance and immediately seeks to the live position actually starts
+    /// there instead of from the beginning.
     private var pendingSeek: Double?
     private var isPaused = true
     private var isRunning = false
     private var isStopping = false
-    private var isRenderScheduled = false
-    private var hasPendingRenderUpdate = false
-    private var isRenderFallbackScheduled = false
-    private var renderFallbackGeneration: UInt64 = 0
-    private var forcedFrameCount = 0
     /// Becomes true only after libmpv reports a real frame update for the current loaded file.
+    /// Forced renders before that point can contain mpv's blank pre-file framebuffer and must not
+    /// make the host believe PiP has been primed.
     private var hasReceivedVideoFrameUpdate = false
     private var frameCount = 0
     private var lastFrameDiagnosticsEmissionTime: CFTimeInterval?
@@ -209,6 +750,7 @@ public final class MPVMetalSampleBufferRenderer {
     private var metalTextureCache: CVMetalTextureCache?
     private var hdrConversionPipeline: MTLComputePipelineState?
     private var highBitDepthConversionPipeline: MTLComputePipelineState?
+    private var highBitDepthStagingPool: MPVHighBitDepthStagingPool?
     private var metalCompatibilityProbeSucceeded = false
     private var presentationBackend: MPVMetalSampleBufferPresentationBackend = .softwareIOSurface
     private var lastPixelFormatDescription = "BGRA8"
@@ -226,6 +768,8 @@ public final class MPVMetalSampleBufferRenderer {
     private var videoSignalPeak: Double = 0
     private var swFormat = Array("bgr0".utf8CString)
     private var highBitDepthSwFormat = Array("rgba64".utf8CString)
+    private var stopContinuations: [CheckedContinuation<Void, Never>] = []
+    private var timelineWaiters: [MPVMetalSampleBufferTimelineWaiter] = []
 
     public init(
         displayLayer: AVSampleBufferDisplayLayer,
@@ -233,8 +777,10 @@ public final class MPVMetalSampleBufferRenderer {
     ) {
         self.displayLayer = displayLayer
         self.options = options
+        self.renderOptions = options
         self.metalDevice = MTLCreateSystemDefaultDevice()
         configureDisplayLayer()
+        capturePresentationGeometry()
         if let metalDevice {
             metalCommandQueue = metalDevice.makeCommandQueue()
             var cache: CVMetalTextureCache?
@@ -242,24 +788,31 @@ public final class MPVMetalSampleBufferRenderer {
                 metalTextureCache = cache
             }
         }
+        let pressureSource = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        pressureSource.setEventHandler { [weak self] in
+            guard let self, let cache = self.metalTextureCache else { return }
+            let cacheReference = MPVMetalUncheckedSendableReference(cache)
+            // Serialize the exceptional cache flush with all texture creation/conversion work.
+            self.enqueueRenderWork {
+                CVMetalTextureCacheFlush(cacheReference.value, 0)
+            }
+        }
+        pressureSource.resume()
+        emergencyCleanup.retainMemoryPressureSource(pressureSource)
     }
 
     deinit {
-        stop()
+        emergencyCleanup.cleanup()
     }
 
     public func start() throws {
-        if !Thread.isMainThread {
-            var result: Result<Void, Error>!
-            DispatchQueue.main.sync {
-                result = Result { try self.start() }
-            }
-            try result.get()
-            return
-        }
-
         guard !isRunning else { return }
-        isStopping = false
+        guard !isStopping else {
+            throw MPVMetalSampleBufferRendererError.teardownInProgress
+        }
         guard metalDevice != nil else {
             throw MPVMetalSampleBufferRendererError.metalUnavailable
         }
@@ -297,7 +850,9 @@ public final class MPVMetalSampleBufferRenderer {
             throw MPVMetalSampleBufferRendererError.mpvInitializationFailed(initStatus)
         }
 
-        let renderStatus = createRenderContext(handle: handle)
+        engineGeneration &+= 1
+        let generation = engineGeneration
+        let renderStatus = createRenderContext(handle: handle, engineGeneration: generation)
         guard renderStatus >= 0, renderContext != nil else {
             mpv_terminate_destroy(handle)
             mpv = nil
@@ -307,102 +862,276 @@ public final class MPVMetalSampleBufferRenderer {
         }
 
         observeProperties(handle: handle)
-        installWakeupHandler(handle: handle)
-        startDisplayLink()
+        startEventLoop(handle: handle, engineGeneration: generation)
+        if let context = renderContext,
+           let renderUserdata = renderCallbackUserdata {
+            emergencyCleanup.install(
+                handle: handle,
+                context: context,
+                renderUserdata: renderUserdata,
+                renderToken: renderCallbackToken,
+                eventToken: eventCallbackToken,
+                eventQueueGroup: eventQueueGroup,
+                gpuConversionGroup: gpuConversionGroup,
+                renderQueue: renderQueue,
+                displayLayer: displayLayer
+            )
+        }
         isRunning = true
+        updateRenderLifecycleFence()
         updateState(.ready)
     }
 
     public func stop() {
-        if !Thread.isMainThread {
-            DispatchQueue.main.sync {
-                self.stop()
+        guard !isStopping else { return }
+        guard state != .stopped else { return }
+        guard mpv != nil || renderContext != nil else {
+            isStopping = true
+            isRunning = false
+            engineGeneration &+= 1
+            updateRenderLifecycleFence()
+            updateState(.stopping)
+            let stoppingLoadGeneration = loadGeneration
+            enqueueRenderWork { [weak self] in
+                guard let self else { return }
+                self.pendingDisplayFlush = nil
+                self.pendingDisplayRecoveryFrame = nil
+                self.displayRecoveryProbeGeneration = nil
+                self.displayRecoveryGate.cancel()
+                self.finishesStopAfterDisplayFlush = true
+                _ = self.flushCoordinator.beginEpoch()
+                self.requestDisplayFlush(
+                    removingDisplayedImage: true,
+                    loadGeneration: stoppingLoadGeneration,
+                    pendingSample: nil
+                )
             }
             return
         }
 
-        stopDisplayLink()
         isStopping = true
-        if let context = renderContext {
+        isRunning = false
+        engineGeneration &+= 1
+        updateRenderLifecycleFence()
+        updateState(.stopping)
+
+        let context = renderContext
+        let handle = mpv
+        let renderToken = renderCallbackToken
+        let eventToken = eventCallbackToken
+        let renderUserdata = renderCallbackUserdata
+        emergencyCleanup.disarmNativeResources()
+        mpv = nil
+        renderCallbackToken = nil
+        eventCallbackToken = nil
+        renderCallbackUserdata = nil
+
+        renderToken?.deactivate()
+        eventToken?.deactivate()
+        if let context {
             mpv_render_context_set_update_callback(context, nil, nil)
-            mpv_render_context_free(context)
-            renderContext = nil
         }
-        if let handle = mpv {
-            mpv_set_wakeup_callback(handle, nil, nil)
+        if let handle {
             mpv_wakeup(handle)
         }
-        eventQueueGroup.wait()
-        if let handle = mpv {
-            mpv_terminate_destroy(handle)
-            mpv = nil
+
+        let displayLayer = self.displayLayer
+        let gpuConversionGroup = self.gpuConversionGroup
+        let renderQueue = self.renderQueue
+        let stoppingLoadGeneration = loadGeneration
+        let eventDrain = MPVMetalSampleBufferReadinessHandler { [weak self] in
+            self?.scheduledRenderWorkItem?.cancel()
+            self?.scheduledRenderWorkItem = nil
+            _ = self?.demandScheduler.beginGeneration()
+            self?.stopRequestingDisplayData()
+            let gpuDrain = MPVMetalSampleBufferReadinessHandler { [weak self] in
+                if let context {
+                    mpv_render_context_free(context)
+                    self?.renderContext = nil
+                }
+                if let handle {
+                    mpv_terminate_destroy(handle)
+                }
+                if let renderUserdata {
+                    Unmanaged<MPVMetalSampleBufferCallbackToken>.fromOpaque(renderUserdata).release()
+                }
+                guard let self else {
+                    DispatchQueue.main.async {
+                        displayLayer.controlTimebase = nil
+                        displayLayer.flushAndRemoveImage()
+                    }
+                    return
+                }
+                self.pendingDisplayFlush = nil
+                self.pendingDisplayRecoveryFrame = nil
+                self.displayRecoveryProbeGeneration = nil
+                self.displayRecoveryGate.cancel()
+                self.finishesStopAfterDisplayFlush = true
+                _ = self.flushCoordinator.beginEpoch()
+                self.requestDisplayFlush(
+                    removingDisplayedImage: true,
+                    loadGeneration: stoppingLoadGeneration,
+                    pendingSample: nil
+                )
+            }
+            gpuConversionGroup.notify(queue: renderQueue) { gpuDrain() }
         }
-        resetDisplayLayer(removingDisplayedImage: true)
-        pixelBufferPool = nil
-        pixelBufferPoolAuxAttributes = nil
-        formatDescription = nil
-        poolWidth = 0
-        poolHeight = 0
+        eventQueueGroup.notify(queue: renderQueue) { eventDrain() }
+    }
+
+    public func waitUntilStopped() async {
+        await withCheckedContinuation { continuation in
+            performOnMain {
+                if !self.isStopping, self.mpv == nil, self.renderContext == nil {
+                    continuation.resume()
+                } else {
+                    self.stopContinuations.append(continuation)
+                }
+            }
+        }
+    }
+
+    /// Waits for timeline mutations already submitted by seek/pause/rate calls to reach the serial
+    /// render queue. When `requiringCurrentFrame` is true, success additionally requires a sample
+    /// from that exact load and presentation epoch after its flush/timebase update. Replacement or
+    /// stop resolves false; an old frame can never satisfy a newer seek.
+    public func waitForTimelineUpdate(requiringCurrentFrame: Bool = false) async -> Bool {
+        let lifecycle = renderLifecycleFence.snapshot()
+        return await withCheckedContinuation { continuation in
+            enqueueRenderWork { [weak self] in
+                guard let self,
+                      self.renderLifecycleFence.accepts(
+                        engineGeneration: lifecycle.engineGeneration,
+                        loadGeneration: lifecycle.loadGeneration
+                      ) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                guard requiringCurrentFrame else {
+                    continuation.resume(returning: true)
+                    return
+                }
+                let epoch = self.sampleTimeline.epoch
+                if self.sampleTimeline.lastEnqueuedPTS != nil,
+                   !self.sampleTimeline.needsFlush {
+                    continuation.resume(returning: true)
+                } else {
+                    self.timelineWaiters.append(MPVMetalSampleBufferTimelineWaiter(
+                        engineGeneration: lifecycle.engineGeneration,
+                        loadGeneration: lifecycle.loadGeneration,
+                        timelineEpoch: epoch,
+                        continuation: continuation
+                    ))
+                }
+            }
+        }
+    }
+
+    private func cancelTimelineWaiters(loadGeneration: UInt64? = nil) {
+        var remaining: [MPVMetalSampleBufferTimelineWaiter] = []
+        for waiter in timelineWaiters {
+            if loadGeneration == nil || waiter.loadGeneration == loadGeneration {
+                waiter.continuation.resume(returning: false)
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        timelineWaiters = remaining
+    }
+
+    private func retargetTimelineWaiters(loadGeneration: UInt64, timelineEpoch: UInt64) {
+        timelineWaiters = timelineWaiters.map { waiter in
+            guard waiter.loadGeneration == loadGeneration else { return waiter }
+            return MPVMetalSampleBufferTimelineWaiter(
+                engineGeneration: waiter.engineGeneration,
+                loadGeneration: loadGeneration,
+                timelineEpoch: timelineEpoch,
+                continuation: waiter.continuation
+            )
+        }
+    }
+
+    private func completeTimelineWaiters(
+        engineGeneration: UInt64,
+        loadGeneration: UInt64,
+        timelineEpoch: UInt64
+    ) {
+        for waiter in timelineWaiters {
+            waiter.continuation.resume(returning:
+                waiter.engineGeneration == engineGeneration
+                    && waiter.loadGeneration == loadGeneration
+                    && waiter.timelineEpoch <= timelineEpoch
+            )
+        }
+        timelineWaiters.removeAll(keepingCapacity: false)
+    }
+
+    private func finishStopping(renderDiagnostics: MPVMetalSampleBufferRenderDiagnosticsSnapshot) {
+        publishedRenderDiagnostics = renderDiagnostics
         videoSize = .zero
         cachedPosition = 0
         cachedDuration = 0
-        isRunning = false
         isStopping = false
+        updateRenderLifecycleFence()
         isFileLoaded = false
+        isAwaitingCurrentFileLoaded = false
+        loadIdentityTracker.reset()
+        deferredLoadActions.cancel()
         pendingSeek = nil
-        isRenderScheduled = false
-        clearPendingRenderUpdate()
-        forcedFrameCount = 0
-        hasReceivedVideoFrameUpdate = false
-        frameCount = 0
+        eventStaleGenerationDropCount = 0
         lastFrameDiagnosticsEmissionTime = nil
-        renderAttemptCount = 0
-        renderFailureCount = 0
-        allocationFailureCount = 0
-        enqueueFailureCount = 0
-        metalPresentationFrameCount = 0
-        metalPresentationFailureCount = 0
-        highBitDepthRenderingFailureCount = 0
-        hdrPresentationDisabled = false
-        formatDescriptionMetadataSignature = ""
-        lastPixelFormatDescription = "BGRA8"
-        lastSourcePixelFormatDescription = "bgr0/BGRA8"
-        lastPixelFormatType = kCVPixelFormatType_32BGRA
-        hdrMetadataApplied = false
-        highBitDepthRenderingDisabled = false
-        highBitDepthRenderingActive = false
+        cachedVideoPTS = nil
+        cachedSourceFPS = nil
+        cachedSpeed = 1
+        isPausedForCache = false
         updateState(.stopped)
+        let continuations = stopContinuations
+        stopContinuations.removeAll()
+        continuations.forEach { $0.resume() }
     }
 
     public func load(_ url: URL, headers: [String: String]? = nil) {
+        load(url, headers: headers, preservingDisplayedImage: false)
+    }
+
+    /// The compatibility PiP bridge uses this during an active shared-GPU failover so AVKit can
+    /// keep presenting the last valid native frame until this renderer has a replacement sample.
+    /// Normal loads remove the old image immediately.
+    func load(
+        _ url: URL,
+        headers: [String: String]? = nil,
+        preservingDisplayedImage: Bool
+    ) {
         performOnMain {
             guard self.mpv != nil else { return }
             self.isFileLoaded = false
             self.pendingSeek = nil
-            self.hasReceivedVideoFrameUpdate = false
-            self.clearPendingRenderUpdate()
-            self.frameCount = 0
+            self.beginNewLoadGeneration(removingDisplayedImage: !preservingDisplayedImage)
+            self.eventStaleGenerationDropCount = 0
+            self.deferredLoadActions.beginGeneration(self.loadGeneration)
+            self.isAwaitingCurrentFileLoaded = true
             self.lastFrameDiagnosticsEmissionTime = nil
-            self.renderAttemptCount = 0
-            self.renderFailureCount = 0
-            self.allocationFailureCount = 0
-            self.enqueueFailureCount = 0
-            self.metalPresentationFrameCount = 0
-            self.metalPresentationFailureCount = 0
-            self.highBitDepthRenderingFailureCount = 0
-            self.lastPresentationTime = 0
             self.videoSize = .zero
             self.cachedPosition = 0
             self.cachedDuration = 0
-            self.resetDisplayLayer(removingDisplayedImage: true)
+            self.setDisplayLayerExtendedDynamicRange(enabled: false)
             self.updateState(.loading)
             self.updateHTTPHeaders(headers)
             let target = url.isFileURL ? url.path : url.absoluteString
+            let loadIdentity = self.loadIdentityTracker.submit(clientGeneration: self.loadGeneration)
+            let replacedPlaylistEntryID = self.currentPlaylistEntryID()
             let status = self.command(["loadfile", target, "replace"])
             if status < 0 {
+                self.loadIdentityTracker.cancel(loadIdentity)
+                self.deferredLoadActions.cancel()
+                self.isAwaitingCurrentFileLoaded = false
                 self.reportError("loadfile failed status=\(status)")
             } else {
-                self.forceRenderBurst(count: 8)
+                if let playlistEntryID = self.currentPlaylistEntryID(),
+                   playlistEntryID != replacedPlaylistEntryID {
+                    self.loadIdentityTracker.bind(playlistEntryID: playlistEntryID, to: loadIdentity)
+                }
+                self.requestForcedFrames(count: 2)
             }
         }
     }
@@ -412,7 +1141,8 @@ public final class MPVMetalSampleBufferRenderer {
             self.isPaused = false
             self.setFlagProperty("pause", false)
             self.updateState(.playing)
-            self.forceRenderBurst(count: 3)
+            self.updateTimelineRate()
+            self.requestForcedFrames(count: 2)
         }
     }
 
@@ -421,20 +1151,26 @@ public final class MPVMetalSampleBufferRenderer {
             self.isPaused = true
             self.setFlagProperty("pause", true)
             self.updateState(.paused)
-            self.forceRenderBurst(count: 1)
+            self.updateTimelineRate()
+            self.requestForcedFrames(count: 1)
         }
     }
 
     public func seek(to seconds: Double) {
-        let clamped = max(0, seconds)
+        let clamped = seconds.isFinite ? max(0, seconds) : 0
         performOnMain {
             self.cachedPosition = clamped
+            self.requestTimelineDiscontinuity(removingDisplayedImage: false)
             guard self.isFileLoaded else {
+                // File not loaded yet (e.g. the PiP hand-off loads this instance then immediately
+                // seeks to the live position). mpv drops absolute seeks issued before FILE_LOADED,
+                // so defer and replay on load — otherwise playback (and the frames fed to PiP)
+                // would start from 0 while the timestamps say `clamped`, jumping back once decoded.
                 self.pendingSeek = clamped
                 return
             }
             _ = self.command(["seek", "\(clamped)", "absolute+exact"])
-            self.forceRenderBurst(count: 6)
+            self.requestForcedFrames(count: 2)
         }
     }
 
@@ -442,52 +1178,73 @@ public final class MPVMetalSampleBufferRenderer {
         seek(to: cachedPosition + seconds)
     }
 
+    @available(*, deprecated, message: "Use MPVGPUPlayerRenderer.preparePictureInPicture() async throws")
     public func primeFrames(reason: String = "manual", count: Int = 6) {
+        primeCompatibilityFrames(reason: reason, count: count)
+    }
+
+    func primeCompatibilityFrames(reason: String, count: Int) {
         _ = reason
         performOnMain {
-            self.forceRenderBurst(count: count)
+            self.capturePresentationGeometry()
+            let accepted = self.legacyPrimeBudget.consume(requested: max(1, count))
+            self.requestForcedFrames(count: accepted)
         }
     }
 
     public func updateOptions(_ newOptions: MPVMetalSampleBufferRendererOptions) {
         performOnMain {
             guard self.options != newOptions else { return }
-            let previousMaximumFrameSize = self.options.maximumFrameSize
-            let previousPreferredFramesPerSecond = self.options.preferredFramesPerSecond
-            let previousPreferredPiPFramesPerSecond = self.options.preferredPiPFramesPerSecond
-            let previousPrefersHDRPresentation = self.options.prefersHDRPresentation
-            let previousPrefersHighBitDepthRendering = self.options.prefersHighBitDepthRendering
+            let previousOptions = self.options
             self.options = newOptions
+            self.enqueueRenderWork { [weak self] in
+                guard let self else { return }
+                self.renderOptions = newOptions
+                let sizeOrCapacityChanged = previousOptions.maximumFrameSize != newOptions.maximumFrameSize
+                    || previousOptions.maximumInFlightFrameCount != newOptions.maximumInFlightFrameCount
+                let hdrChanged = previousOptions.prefersHDRPresentation != newOptions.prefersHDRPresentation
+                    || previousOptions.prefersHighBitDepthRendering != newOptions.prefersHighBitDepthRendering
 
-            if previousPreferredFramesPerSecond != newOptions.preferredFramesPerSecond
-                || previousPreferredPiPFramesPerSecond != newOptions.preferredPiPFramesPerSecond {
-                self.applyDisplayLinkFrameRate()
-            }
+                if sizeOrCapacityChanged || hdrChanged {
+                    // Pool/cache replacement is queued after every outstanding Metal completion.
+                    // Existing command buffers retain their buffers and texture references until
+                    // that point, so a Stage Manager resize cannot invalidate an active encode.
+                    self.gpuConversionGroup.notify(queue: self.renderQueue) { [weak self] in
+                        guard let self else { return }
+                        self.flushMetalTextureCache()
+                        self.pixelBufferPool = nil
+                        self.pixelBufferPoolAuxAttributes = nil
+                        self.hdrPixelBufferPool = nil
+                        self.hdrPixelBufferPoolAuxAttributes = nil
+                        self.highBitDepthStagingPool = nil
+                        self.formatDescription = nil
+                        self.poolWidth = 0
+                        self.poolHeight = 0
+                        if hdrChanged {
+                            self.hdrPresentationDisabled = false
+                            self.highBitDepthRenderingDisabled = false
+                            self.highBitDepthRenderingActive = false
+                            self.formatDescriptionMetadataSignature = ""
+                        }
+                        self.requestForcedFrames(count: 2)
+                    }
+                } else {
+                    self.requestForcedFrames(count: 1)
+                }
 
-            if previousMaximumFrameSize != newOptions.maximumFrameSize {
-                self.pixelBufferPool = nil
-                self.pixelBufferPoolAuxAttributes = nil
-                self.formatDescription = nil
-                self.poolWidth = 0
-                self.poolHeight = 0
+                let extendedRangeEnabled = newOptions.prefersHDRPresentation && self.streamLooksHDR
+                DispatchQueue.main.async { @MainActor [weak self] in
+                    self?.setDisplayLayerExtendedDynamicRange(enabled: extendedRangeEnabled)
+                }
             }
-            if previousPrefersHDRPresentation != newOptions.prefersHDRPresentation
-                || previousPrefersHighBitDepthRendering != newOptions.prefersHighBitDepthRendering {
-                self.hdrPresentationDisabled = false
-                self.highBitDepthRenderingDisabled = false
-                self.highBitDepthRenderingActive = false
-                self.formatDescription = nil
-                self.formatDescriptionMetadataSignature = ""
-                self.applyDisplayLayerDynamicRangePreference()
-            }
-
-            self.forceRenderBurst(count: 6)
-            self.onDiagnostics?(self.diagnosticsSnapshot())
         }
     }
 
     public func setSpeed(_ speed: Double) {
-        setStringProperty("speed", "\(max(0.1, speed))")
+        let clamped = speed.isFinite ? max(0.1, speed) : 1
+        cachedSpeed = clamped
+        setStringProperty("speed", "\(clamped)")
+        updateTimelineRate()
     }
 
     public func getSpeed() -> Double {
@@ -511,20 +1268,79 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     public func setAudioTrack(id: Int) {
-        setStringProperty("aid", id < 0 ? "no" : "\(id)")
+        guard !deferLoadActionIfNeeded(.audioTrack(id)) else { return }
+        applyAudioTrack(id)
+    }
+
+    /// Internal string form preserves mpv's `auto`/`no` values as well as numeric track IDs while
+    /// the outer renderer temporarily suppresses its own video output.
+    func setVideoTrackSelection(_ selection: String) {
+        guard !deferLoadActionIfNeeded(.videoTrack(selection)) else { return }
+        applyVideoTrackSelection(selection)
+    }
+
+    func currentVideoTrackSelection() -> String {
+        getStringProperty("vid") ?? "auto"
     }
 
     public func setSubtitleTrack(id: Int) {
-        setStringProperty("sid", id < 0 ? "no" : "\(id)")
-        forceRenderBurst(count: 3)
+        guard !deferLoadActionIfNeeded(.subtitleTrack(id)) else { return }
+        applySubtitleTrack(id)
     }
 
     public func disableSubtitles() {
-        setStringProperty("sid", "no")
-        forceRenderBurst(count: 2)
+        setSubtitleTrack(id: -1)
     }
 
     public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true) {
+        guard !deferLoadActionIfNeeded(
+            .externalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
+        ) else { return }
+        applyExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
+    }
+
+    public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) {
+        guard !deferLoadActionIfNeeded(.subtitleStyle(style)) else { return }
+        applySubtitleStyleImmediately(style)
+    }
+
+    private func deferLoadActionIfNeeded(_ action: MPVMetalSampleBufferDeferredLoadAction) -> Bool {
+        guard isAwaitingCurrentFileLoaded else { return false }
+        return deferredLoadActions.append(action, generation: loadGeneration)
+    }
+
+    private func applyDeferredLoadActions(generation: UInt64) {
+        for action in deferredLoadActions.drain(generation: generation) {
+            switch action {
+            case .videoTrack(let selection):
+                applyVideoTrackSelection(selection)
+            case .audioTrack(let id):
+                applyAudioTrack(id)
+            case .subtitleTrack(let id):
+                applySubtitleTrack(id)
+            case .externalSubtitles(let urls, let names, let selectFirst):
+                applyExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
+            case .subtitleStyle(let style):
+                applySubtitleStyleImmediately(style)
+            }
+        }
+    }
+
+    private func applyAudioTrack(_ id: Int) {
+        setStringProperty("aid", id < 0 ? "no" : "\(id)")
+    }
+
+    private func applyVideoTrackSelection(_ selection: String) {
+        setStringProperty("vid", selection)
+        requestPausedPresentationRefresh()
+    }
+
+    private func applySubtitleTrack(_ id: Int) {
+        setStringProperty("sid", id < 0 ? "no" : "\(id)")
+        requestPausedPresentationRefresh()
+    }
+
+    private func applyExternalSubtitles(urls: [String], names: [String]?, selectFirst: Bool) {
         for (index, url) in urls.enumerated() {
             var args = ["sub-add", url, index == 0 && selectFirst ? "select" : "auto"]
             if let names, names.indices.contains(index) {
@@ -532,16 +1348,18 @@ public final class MPVMetalSampleBufferRenderer {
             }
             _ = command(args)
         }
-        forceRenderBurst(count: 6)
+        requestPausedPresentationRefresh()
     }
 
-    public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) {
+    private func applySubtitleStyleImmediately(_ style: MPVMetalSampleBufferSubtitleStyle) {
+        let fontSize = style.fontSize.isFinite ? max(1, Int(style.fontSize)) : 36
+        let strokeWidth = style.strokeWidth.isFinite ? max(0, style.strokeWidth) : 0
         setStringProperty("sub-visibility", style.isVisible ? "yes" : "no")
-        setStringProperty("sub-font-size", "\(max(1, Int(style.fontSize)))")
-        setStringProperty("sub-border-size", "\(max(0, style.strokeWidth))")
+        setStringProperty("sub-font-size", "\(fontSize)")
+        setStringProperty("sub-border-size", "\(strokeWidth)")
         setStringProperty("sub-color", mpvColorString(style.foregroundColor))
         setStringProperty("sub-border-color", mpvColorString(style.strokeColor))
-        forceRenderBurst(count: 3)
+        requestPausedPresentationRefresh()
     }
 
     @discardableResult
@@ -558,6 +1376,7 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     public func diagnosticsSnapshot() -> MPVMetalSampleBufferRendererDiagnostics {
+        let render = publishedRenderDiagnostics
         let statusName: String
         switch displayRenderingStatus {
         case .unknown: statusName = "unknown"
@@ -567,6 +1386,43 @@ public final class MPVMetalSampleBufferRenderer {
         }
         return MPVMetalSampleBufferRendererDiagnostics(
             state: state,
+            frameCount: render.frameCount,
+            renderAttemptCount: render.renderAttemptCount,
+            renderFailureCount: render.renderFailureCount,
+            allocationFailureCount: render.allocationFailureCount,
+            enqueueFailureCount: render.enqueueFailureCount,
+            lastRenderStatus: render.lastRenderStatus,
+            lastFrameSize: render.lastFrameSize,
+            lastPresentationTime: render.lastPresentationTime,
+            displayLayerStatus: statusName,
+            displayLayerReadyForMoreMediaData: displayRendererReadyForMoreMediaData,
+            metalCompatibilityProbeSucceeded: render.metalCompatibilityProbeSucceeded,
+            presentationBackend: render.presentationBackend,
+            metalPresentationFrameCount: render.metalPresentationFrameCount,
+            metalPresentationFailureCount: render.metalPresentationFailureCount,
+            pixelFormatDescription: render.pixelFormatDescription,
+            sourcePixelFormatDescription: render.sourcePixelFormatDescription,
+            highBitDepthRenderingActive: render.highBitDepthRenderingActive,
+            highBitDepthRenderingFailureCount: render.highBitDepthRenderingFailureCount,
+            hdrMetadataApplied: render.hdrMetadataApplied,
+            videoColorPrimaries: render.videoColorPrimaries,
+            videoTransferFunction: render.videoTransferFunction,
+            videoSignalPeak: render.videoSignalPeak,
+            renderAPI: "libmpv-\(MPV_RENDER_API_TYPE_SW):\(render.sourcePixelFormatDescription)",
+            backendDescription: render.backendDescription,
+            coalescedRenderRequestCount: render.coalescedRenderRequestCount,
+            backpressureDropCount: render.backpressureDropCount,
+            poolExhaustionDropCount: render.poolExhaustionDropCount,
+            staleGenerationDropCount: render.staleGenerationDropCount + eventStaleGenerationDropCount,
+            inFlightGPUFrameCount: render.inFlightGPUFrameCount,
+            lastGPULatencyMilliseconds: render.lastGPULatencyMilliseconds,
+            timelineEpoch: render.timelineEpoch,
+            timelineRate: render.timelineRate
+        )
+    }
+
+    private func makeRenderDiagnosticsSnapshot() -> MPVMetalSampleBufferRenderDiagnosticsSnapshot {
+        MPVMetalSampleBufferRenderDiagnosticsSnapshot(
             frameCount: frameCount,
             renderAttemptCount: renderAttemptCount,
             renderFailureCount: renderFailureCount,
@@ -575,8 +1431,6 @@ public final class MPVMetalSampleBufferRenderer {
             lastRenderStatus: lastRenderStatus,
             lastFrameSize: lastFrameSize,
             lastPresentationTime: lastPresentationTime,
-            displayLayerStatus: statusName,
-            displayLayerReadyForMoreMediaData: displayRendererReadyForMoreMediaData,
             metalCompatibilityProbeSucceeded: metalCompatibilityProbeSucceeded,
             presentationBackend: presentationBackend,
             metalPresentationFrameCount: metalPresentationFrameCount,
@@ -589,39 +1443,199 @@ public final class MPVMetalSampleBufferRenderer {
             videoColorPrimaries: videoColorPrimaries,
             videoTransferFunction: videoTransferFunction,
             videoSignalPeak: videoSignalPeak,
-            renderAPI: "libmpv-\(MPV_RENDER_API_TYPE_SW):\(lastSourcePixelFormatDescription)",
-            backendDescription: backendDescription()
+            backendDescription: backendDescription(),
+            coalescedRenderRequestCount: demandScheduler.coalescedRequestCount,
+            backpressureDropCount: demandScheduler.backpressureCount,
+            poolExhaustionDropCount: poolExhaustionDropCount,
+            staleGenerationDropCount: staleGenerationDropCount,
+            inFlightGPUFrameCount: demandScheduler.inFlightCount,
+            lastGPULatencyMilliseconds: lastGPULatencyMilliseconds,
+            timelineEpoch: sampleTimeline.epoch,
+            timelineRate: sampleTimeline.effectiveRate
         )
+    }
+
+    private func publishRenderDiagnostics(
+        engineGeneration: UInt64,
+        loadGeneration: UInt64
+    ) {
+        let snapshot = makeRenderDiagnosticsSnapshot()
+        DispatchQueue.main.async { @MainActor [weak self] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(
+                    engineGeneration: engineGeneration,
+                    loadGeneration: loadGeneration
+                  ) else { return }
+            self.publishedRenderDiagnostics = snapshot
+        }
     }
 
     private func configureDisplayLayer() {
         displayLayer.videoGravity = .resizeAspect
+        #if os(macOS)
+        displayLayer.backgroundColor = NSColor.black.cgColor
+        #else
         displayLayer.backgroundColor = UIColor.black.cgColor
+        #endif
         displayLayer.isOpaque = true
         applyDisplayLayerDynamicRangePreference()
     }
 
     private var displayRenderingStatus: AVQueuedSampleBufferRenderingStatus {
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
             return displayLayer.sampleBufferRenderer.status
         }
         return displayLayer.status
     }
 
+    private var displayRendererIsFailed: Bool {
+        displayRenderingStatus == .failed
+    }
+
+    private var displayRendererFailureDescription: String {
+        let error: NSError?
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
+            error = displayLayer.sampleBufferRenderer.error.map { $0 as NSError }
+        } else {
+            error = displayLayer.error.map { $0 as NSError }
+        }
+        let detail = error.map { "\($0.domain)#\($0.code)" } ?? "unknown error"
+        return "sample-buffer renderer remained failed after recovery flush (\(detail))"
+    }
+
     private var displayRendererReadyForMoreMediaData: Bool {
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
             return displayLayer.sampleBufferRenderer.isReadyForMoreMediaData
         }
         return displayLayer.isReadyForMoreMediaData
     }
 
-    private func applyDisplayLayerDynamicRangePreference() {
-        if #available(iOS 17.0, *) {
-            displayLayer.wantsExtendedDynamicRangeContent = options.prefersHDRPresentation
+    private func retainLatestDisplayRecoveryFrame(
+        _ frame: MPVMetalSampleBufferPendingRecoveryFrame
+    ) {
+        if pendingDisplayRecoveryFrame != nil {
+            staleGenerationDropCount += 1
+        }
+        pendingDisplayRecoveryFrame = MPVMetalSampleBufferPendingRecoveryFrame(
+            pixelBuffer: frame.pixelBuffer,
+            forceSDR: frame.forceSDR,
+            loadGeneration: frame.loadGeneration,
+            timelineEpoch: sampleTimeline.epoch
+        )
+    }
+
+    /// Returns true while rendering must stay parked for a failed renderer or a serialized
+    /// recovery flush. The one post-flush probe is carried through to sample enqueue so no second
+    /// allocation/render can start before `.rendering` proves recovery.
+    private func recoverDisplayRendererIfNeeded(
+        loadGeneration: UInt64,
+        retaining frame: MPVMetalSampleBufferPendingRecoveryFrame? = nil
+    ) -> Bool {
+        guard renderLifecycleFence.accepts(loadGeneration: loadGeneration) else { return true }
+
+        if displayRenderingStatus == .rendering,
+           displayRecoveryGate.markRenderingSucceeded(generation: loadGeneration) {
+            displayRecoveryProbeGeneration = nil
+        }
+
+        if displayRendererIsFailed {
+            switch displayRecoveryGate.observeFailure(generation: loadGeneration) {
+            case .recover:
+                scheduledRenderWorkItem?.cancel()
+                scheduledRenderWorkItem = nil
+                demandScheduler.cancelScheduledWork()
+                if demandScheduler.isWaitingForReadiness {
+                    _ = demandScheduler.becomeReady(generation: loadGeneration)
+                }
+                stopRequestingDisplayData()
+                if lastPixelFormatType == kCVPixelFormatType_64RGBAHalf {
+                    hdrPresentationDisabled = true
+                }
+                sampleTimeline.beginDiscontinuity()
+                retargetTimelineWaiters(
+                    loadGeneration: loadGeneration,
+                    timelineEpoch: sampleTimeline.epoch
+                )
+                timelineIsAnchored = false
+                allowsPausedDuplicateFrame = true
+                _ = flushCoordinator.beginEpoch()
+                if let frame {
+                    retainLatestDisplayRecoveryFrame(frame)
+                }
+                requestDisplayFlush(
+                    removingDisplayedImage: false,
+                    loadGeneration: loadGeneration,
+                    pendingSample: nil,
+                    recoversDisplayRenderer: true
+                )
+            case .wait:
+                if let frame {
+                    retainLatestDisplayRecoveryFrame(frame)
+                }
+            case .report:
+                pendingDisplayRecoveryFrame = nil
+                displayRecoveryProbeGeneration = nil
+                reportError(displayRendererFailureDescription)
+            case .terminal, .stale:
+                break
+            }
+            return true
+        }
+
+        if displayRecoveryProbeGeneration == loadGeneration {
+            return false
+        }
+        if displayRecoveryGate.beginRenderingProbe(generation: loadGeneration) {
+            displayRecoveryProbeGeneration = loadGeneration
+            return false
+        }
+        if displayRecoveryGate.blocksRendering(generation: loadGeneration) {
+            if let frame {
+                retainLatestDisplayRecoveryFrame(frame)
+            }
+            return true
+        }
+        return false
+    }
+
+    private func completeDisplayRendererRecoveryIfNeeded(
+        request: MPVMetalSampleBufferDisplayFlushRequest
+    ) -> String? {
+        guard request.recoversDisplayRenderer,
+              let recoveryTimelineEpoch = request.recoveryTimelineEpoch else { return nil }
+        switch displayRecoveryGate.complete(
+            generation: request.loadGeneration,
+            rendererRemainsFailed: displayRendererIsFailed
+        ) {
+        case .awaitingRendering:
+            sampleTimeline.didFlush(epoch: recoveryTimelineEpoch)
+            return nil
+        case .failed:
+            return displayRendererFailureDescription
+        case .stale:
+            return nil
         }
     }
 
-    private func createRenderContext(handle: OpaquePointer) -> Int32 {
+    private func applyDisplayLayerDynamicRangePreference() {
+        setDisplayLayerExtendedDynamicRange(enabled: options.prefersHDRPresentation && streamLooksHDR)
+    }
+
+    private func setDisplayLayerExtendedDynamicRange(enabled: Bool) {
+        #if os(iOS)
+        if #available(iOS 17.0, *) {
+            displayLayer.wantsExtendedDynamicRangeContent = enabled
+        }
+        #endif
+    }
+
+    private func flushMetalTextureCache() {
+        if let metalTextureCache {
+            CVMetalTextureCacheFlush(metalTextureCache, 0)
+        }
+    }
+
+    private func createRenderContext(handle: OpaquePointer, engineGeneration: UInt64) -> Int32 {
         let apiString = MPV_RENDER_API_TYPE_SW as NSString
         let api = UnsafeMutableRawPointer(mutating: apiString.utf8String)
         var params = [
@@ -633,11 +1647,19 @@ public final class MPVMetalSampleBufferRenderer {
             return mpv_render_context_create(&renderContext, handle, baseAddress)
         }
         if status >= 0, let context = renderContext {
+            let token = MPVMetalSampleBufferCallbackToken(
+                renderer: self,
+                engineGeneration: engineGeneration,
+                kind: .render
+            )
+            let userdata = Unmanaged.passRetained(token).toOpaque()
+            renderCallbackToken = token
+            renderCallbackUserdata = userdata
             mpv_render_context_set_update_callback(context, { userdata in
                 guard let userdata else { return }
-                let renderer = Unmanaged<MPVMetalSampleBufferRenderer>.fromOpaque(userdata).takeUnretainedValue()
-                renderer.scheduleRender(force: false)
-            }, Unmanaged.passUnretained(self).toOpaque())
+                let token = Unmanaged<MPVMetalSampleBufferCallbackToken>.fromOpaque(userdata).takeUnretainedValue()
+                token.signal()
+            }, userdata)
         }
         return status
     }
@@ -648,6 +1670,9 @@ public final class MPVMetalSampleBufferRenderer {
             ("dheight", MPV_FORMAT_INT64),
             ("duration", MPV_FORMAT_DOUBLE),
             ("time-pos", MPV_FORMAT_DOUBLE),
+            ("video-pts", MPV_FORMAT_DOUBLE),
+            ("estimated-vf-fps", MPV_FORMAT_DOUBLE),
+            ("speed", MPV_FORMAT_DOUBLE),
             ("pause", MPV_FORMAT_FLAG),
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("track-list", MPV_FORMAT_NONE),
@@ -663,67 +1688,119 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
-    private func installWakeupHandler(handle: OpaquePointer) {
-        mpv_set_wakeup_callback(handle, { userdata in
-            guard let userdata else { return }
-            let renderer = Unmanaged<MPVMetalSampleBufferRenderer>.fromOpaque(userdata).takeUnretainedValue()
-            let group = renderer.eventQueueGroup
-            group.enter()
-            renderer.eventQueue.async { [weak renderer] in
-                defer { group.leave() }
-                renderer?.readEvents()
-            }
-        }, Unmanaged.passUnretained(self).toOpaque())
-    }
-
-    private func readEvents() {
-        guard let handle = mpv, !isStopping else { return }
-        while !isStopping {
-            guard let eventPointer = mpv_wait_event(handle, 0) else { break }
-            let event = eventPointer.pointee
-            if event.event_id == MPV_EVENT_NONE {
-                break
-            }
-
-            switch event.event_id {
-            case MPV_EVENT_START_FILE:
-                performOnMain { self.updateState(.loading) }
-            case MPV_EVENT_FILE_LOADED:
-                performOnMain {
-                    self.isFileLoaded = true
-                    if let pending = self.pendingSeek {
-                        self.pendingSeek = nil
-                        _ = self.command(["seek", "\(pending)", "absolute+exact"])
-                    }
-                    self.updateState(self.isPaused ? .paused : .playing)
-                    self.forceRenderBurst(count: 8)
+    private func startEventLoop(handle: OpaquePointer, engineGeneration: UInt64) {
+        let token = MPVMetalSampleBufferCallbackToken(
+            renderer: self,
+            engineGeneration: engineGeneration,
+            kind: .events
+        )
+        eventCallbackToken = token
+        let group = eventQueueGroup
+        let handleAddress = UInt(bitPattern: handle)
+        group.enter()
+        eventQueue.async { [weak self, token] in
+            defer { group.leave() }
+            guard let handle = OpaquePointer(bitPattern: handleAddress) else { return }
+            var activePlaylistEntryID: Int64?
+            while token.active {
+                guard let eventPointer = mpv_wait_event(handle, -1) else { break }
+                guard token.active else { break }
+                guard let event = copyMPVMetalSampleBufferEvent(
+                    eventPointer.pointee,
+                    activePlaylistEntryID: &activePlaylistEntryID
+                ) else {
+                    continue
                 }
-            case MPV_EVENT_VIDEO_RECONFIG:
-                performOnMain {
-                    self.refreshVideoSize()
-                    self.forceRenderBurst(count: 4)
+                DispatchQueue.main.async { @MainActor [weak self] in
+                    self?.handle(event, engineGeneration: engineGeneration)
                 }
-            case MPV_EVENT_PROPERTY_CHANGE:
-                if let data = event.data {
-                    let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
-                    guard let namePointer = property.name else { break }
-                    let name = String(cString: namePointer)
-                    performOnMain { self.refreshProperty(named: name) }
-                }
-            case MPV_EVENT_LOG_MESSAGE:
-                if let logPointer = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) {
-                    let text = logPointer.pointee.text.map { String(cString: $0) } ?? ""
-                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.localizedCaseInsensitiveContains("error") {
-                        performOnMain { self.onError?(trimmed) }
-                    }
-                }
-            case MPV_EVENT_SHUTDOWN:
-                performOnMain { self.updateState(.stopped) }
-            default:
-                break
+                if case .shutdown = event { break }
             }
         }
+    }
+
+    private func handle(_ event: MPVMetalSampleBufferEvent, engineGeneration: UInt64) {
+        guard !isStopping, self.engineGeneration == engineGeneration else { return }
+        switch event {
+        case .startFile(let playlistEntryID):
+            guard let identity = loadIdentityTracker.didStart(playlistEntryID: playlistEntryID),
+                  loadIdentityTracker.isLatest(identity),
+                  identity.clientGeneration == loadGeneration else {
+                eventStaleGenerationDropCount += 1
+                return
+            }
+            updateState(.loading)
+        case .fileLoaded(let playlistEntryID):
+            guard eventBelongsToCurrentLoad(playlistEntryID) else {
+                eventStaleGenerationDropCount += 1
+                return
+            }
+            isFileLoaded = true
+            let loadedGeneration = loadGeneration
+            isAwaitingCurrentFileLoaded = false
+            applyDeferredLoadActions(generation: loadGeneration)
+            if let pending = pendingSeek {
+                self.pendingSeek = nil
+                requestTimelineDiscontinuity(removingDisplayedImage: false)
+                _ = command(["seek", "\(pending)", "absolute+exact"])
+            }
+            // Do not let render work observe FILE_LOADED until generation-scoped tracks,
+            // subtitles, style, and the pending seek are synchronously installed on mpv.
+            enqueueRenderWork { [weak self] in
+                guard let self,
+                      self.renderLifecycleFence.accepts(loadGeneration: loadedGeneration) else { return }
+                self.renderIsFileLoaded = true
+            }
+            updateState(isPaused ? .paused : .playing)
+            requestForcedFrames(count: 2)
+        case .videoReconfigure(let playlistEntryID):
+            guard eventBelongsToCurrentLoad(playlistEntryID) else {
+                eventStaleGenerationDropCount += 1
+                return
+            }
+            refreshVideoSize()
+            requestForcedFrames(count: 2)
+        case .endFile(let playlistEntryID):
+            _ = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
+        case .propertyChange(let name, let playlistEntryID):
+            if !MPVLoadPropertyFence.shouldAccept(
+                property: name,
+                hasPlaylistEntryID: playlistEntryID != nil,
+                awaitingFileLoaded: isAwaitingCurrentFileLoaded
+            ) {
+                eventStaleGenerationDropCount += 1
+                return
+            }
+            guard eventBelongsToCurrentLoad(playlistEntryID, allowsUnscopedEvent: true) else {
+                eventStaleGenerationDropCount += 1
+                return
+            }
+            refreshProperty(named: name)
+        case .logError(let message, let playlistEntryID):
+            if let playlistEntryID {
+                guard eventBelongsToCurrentLoad(playlistEntryID) else {
+                    eventStaleGenerationDropCount += 1
+                    return
+                }
+            } else if isAwaitingCurrentFileLoaded {
+                eventStaleGenerationDropCount += 1
+                return
+            }
+            onError?(message)
+        case .shutdown:
+            stop()
+        }
+    }
+
+    private func eventBelongsToCurrentLoad(
+        _ playlistEntryID: Int64?,
+        allowsUnscopedEvent: Bool = false
+    ) -> Bool {
+        guard let playlistEntryID else { return allowsUnscopedEvent }
+        guard let identity = loadIdentityTracker.identity(forPlaylistEntryID: playlistEntryID) else {
+            return false
+        }
+        return loadIdentityTracker.isLatest(identity) && identity.clientGeneration == loadGeneration
     }
 
     private func refreshProperty(named name: String) {
@@ -733,21 +1810,64 @@ public final class MPVMetalSampleBufferRenderer {
         case "duration":
             cachedDuration = getDoubleProperty("duration") ?? 0
         case "time-pos":
-            cachedPosition = getDoubleProperty("time-pos") ?? cachedPosition
+            let position = getDoubleProperty("time-pos") ?? cachedPosition
+            cachedPosition = position
+            let generation = loadGeneration
+            enqueueRenderWork { [weak self] in
+                guard let self,
+                      self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+                self.renderPosition = position
+            }
+        case "video-pts":
+            if let value = getDoubleProperty("video-pts"), value.isFinite {
+                cachedVideoPTS = value
+                let generation = loadGeneration
+                enqueueRenderWork { [weak self] in
+                    guard let self,
+                          self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+                    self.renderVideoPTS = value
+                }
+            }
+        case "estimated-vf-fps":
+            let generation = loadGeneration
+            if let value = getDoubleProperty("estimated-vf-fps"), value.isFinite, value > 0 {
+                cachedSourceFPS = value
+                enqueueRenderWork { [weak self] in
+                    guard let self,
+                          self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+                    self.renderSourceFPS = value
+                }
+            } else {
+                cachedSourceFPS = nil
+                enqueueRenderWork { [weak self] in
+                    guard let self,
+                          self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+                    self.renderSourceFPS = nil
+                }
+            }
+        case "speed":
+            cachedSpeed = max(0.1, getDoubleProperty("speed") ?? cachedSpeed)
+            updateTimelineRate()
         case "pause":
             isPaused = getFlagProperty("pause")
-            updateState(isPaused ? .paused : .playing)
-        case "paused-for-cache":
-            if getFlagProperty("paused-for-cache") {
-                updateState(.loading)
-            } else {
+            if !isAwaitingCurrentFileLoaded {
                 updateState(isPaused ? .paused : .playing)
             }
+            updateTimelineRate()
+        case "paused-for-cache":
+            isPausedForCache = getFlagProperty("paused-for-cache")
+            if isPausedForCache {
+                updateState(.loading)
+            } else if !isAwaitingCurrentFileLoaded {
+                updateState(isPaused ? .paused : .playing)
+            }
+            updateTimelineRate()
         case "track-list", "sid", "aid":
-            forceRenderBurst(count: 2)
+            requestForcedFrames(count: 1)
         case "video-params/primaries", "video-params/gamma", "video-params/colormatrix", "video-params/sig-peak":
             refreshVideoColorMetadata()
-            forceRenderBurst(count: 2)
+            requestTimelineDiscontinuity(removingDisplayedImage: false)
+            requestForcedFrames(count: 1)
         default:
             break
         }
@@ -757,114 +1877,345 @@ public final class MPVMetalSampleBufferRenderer {
         let width = getIntProperty("dwidth") ?? 0
         let height = getIntProperty("dheight") ?? 0
         if width > 0, height > 0 {
-            videoSize = CGSize(width: width, height: height)
+            let size = CGSize(width: width, height: height)
+            videoSize = size
+            let generation = loadGeneration
+            enqueueRenderWork { [weak self] in
+                guard let self,
+                      self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+                self.renderVideoSize = size
+            }
         }
     }
 
     private func refreshVideoColorMetadata() {
-        videoColorPrimaries = getStringProperty("video-params/primaries") ?? ""
-        videoTransferFunction = getStringProperty("video-params/gamma") ?? ""
-        videoYCbCrMatrix = getStringProperty("video-params/colormatrix") ?? ""
-        videoSignalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
-        formatDescription = nil
-        formatDescriptionMetadataSignature = ""
-    }
-
-    private func startDisplayLink() {
-        stopDisplayLink()
-        let link = CADisplayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
-        displayLink = link
-        applyDisplayLinkFrameRate()
-        link.add(to: .main, forMode: .common)
-    }
-
-    private func applyDisplayLinkFrameRate() {
-        guard let link = displayLink else { return }
-        let fps = max(1, options.preferredFramesPerSecond)
-        if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(
-                minimum: Float(min(options.preferredPiPFramesPerSecond, fps)),
-                maximum: Float(fps),
-                preferred: Float(fps)
-            )
-        } else {
-            link.preferredFramesPerSecond = fps
+        let generation = loadGeneration
+        let primaries = getStringProperty("video-params/primaries") ?? ""
+        let transfer = getStringProperty("video-params/gamma") ?? ""
+        let matrix = getStringProperty("video-params/colormatrix") ?? ""
+        let signalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
+        enqueueRenderWork { [weak self] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+            self.videoColorPrimaries = primaries
+            self.videoTransferFunction = transfer
+            self.videoYCbCrMatrix = matrix
+            self.videoSignalPeak = signalPeak
+            self.formatDescription = nil
+            self.formatDescriptionMetadataSignature = ""
+            self.flushMetalTextureCache()
+            let extendedRangeEnabled = self.renderOptions.prefersHDRPresentation && self.streamLooksHDR
+            DispatchQueue.main.async { @MainActor [weak self] in
+                self?.setDisplayLayerExtendedDynamicRange(enabled: extendedRangeEnabled)
+            }
         }
     }
 
-    private func stopDisplayLink() {
-        displayLink?.invalidate()
-        displayLink = nil
+    fileprivate func scheduleRender(force: Bool, engineGeneration: UInt64) {
+        enqueueRenderWork { [weak self] in
+            guard let self else { return }
+            let lifecycle = self.renderLifecycleFence.snapshot()
+            guard lifecycle.isRunning,
+                  !lifecycle.isStopping,
+                  lifecycle.engineGeneration == engineGeneration else { return }
+            let loadGeneration = lifecycle.loadGeneration
+            if self.demandScheduler.request(
+                forcedCount: force ? 1 : 0,
+                generation: loadGeneration
+            ) {
+                self.schedulePendingRenderIfNeeded(
+                    engineGeneration: engineGeneration,
+                    loadGeneration: loadGeneration
+                )
+            }
+        }
     }
 
-    @objc private func displayLinkDidFire(_ link: CADisplayLink) {
-        guard isRunning else { return }
-        let force = forcedFrameCount > 0
-        guard hasPendingRenderUpdate || force else { return }
-        clearPendingRenderUpdate()
-        renderFrame(force: force)
+    private func requestForcedFrames(count: Int) {
+        let boundedCount = min(2, max(0, count))
+        guard boundedCount > 0 else { return }
+        let lifecycle = renderLifecycleFence.snapshot()
+        enqueueRenderWork { [weak self] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(
+                    engineGeneration: lifecycle.engineGeneration,
+                    loadGeneration: lifecycle.loadGeneration
+                  ) else { return }
+            let loadGeneration = lifecycle.loadGeneration
+            if self.demandScheduler.request(forcedCount: boundedCount, generation: loadGeneration) {
+                self.schedulePendingRenderIfNeeded(
+                    engineGeneration: lifecycle.engineGeneration,
+                    loadGeneration: loadGeneration
+                )
+            }
+        }
     }
 
-    private func scheduleRender(force: Bool) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isRunning else { return }
-            guard force else {
-                self.hasPendingRenderUpdate = true
-                self.scheduleRenderFallbackIfNeeded()
+    private func schedulePendingRenderIfNeeded(engineGeneration: UInt64, loadGeneration: UInt64) {
+        guard scheduledRenderWorkItem == nil,
+              !flushInFlight,
+              demandScheduler.canSchedule,
+              demandScheduler.markWorkScheduled(generation: loadGeneration) else { return }
+
+        let configuredFPS = Double(max(1, min(renderOptions.preferredFramesPerSecond, renderOptions.preferredPiPFramesPerSecond)))
+        let effectiveFPS = renderSourceFPS.map { min(configuredFPS, max(1, $0)) } ?? configuredFPS
+        let interval = 1.0 / effectiveFPS
+        let delay = max(
+            0,
+            demandScheduler.lastWorkTime + interval - ProcessInfo.processInfo.systemUptime
+        )
+        var workItem: DispatchWorkItem!
+        workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.scheduledRenderWorkItem === workItem {
+                self.scheduledRenderWorkItem = nil
+            }
+            self.processRenderDemand(
+                engineGeneration: engineGeneration,
+                loadGeneration: loadGeneration
+            )
+        }
+        scheduledRenderWorkItem = workItem
+        renderQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func processRenderDemand(engineGeneration: UInt64, loadGeneration: UInt64) {
+        guard renderLifecycleFence.accepts(
+            engineGeneration: engineGeneration,
+            loadGeneration: loadGeneration
+        ) else {
+            staleGenerationDropCount += 1
+            demandScheduler.cancelScheduledWork()
+            return
+        }
+        guard demandScheduler.inFlightCount == 0, !flushInFlight else {
+            demandScheduler.cancelScheduledWork()
+            return
+        }
+        if recoverDisplayRendererIfNeeded(loadGeneration: loadGeneration) {
+            demandScheduler.cancelScheduledWork()
+            return
+        }
+        guard displayRendererReadyForMoreMediaData else {
+            demandScheduler.waitForReadiness(generation: loadGeneration)
+            armDisplayReadinessCallback(engineGeneration: engineGeneration, loadGeneration: loadGeneration)
+            return
+        }
+
+        guard let demand = demandScheduler.consume(
+            at: ProcessInfo.processInfo.systemUptime,
+            generation: loadGeneration
+        ) else { return }
+        renderFrame(force: demand.isForced, loadGeneration: loadGeneration)
+        if demandScheduler.canSchedule {
+            schedulePendingRenderIfNeeded(engineGeneration: engineGeneration, loadGeneration: loadGeneration)
+        }
+    }
+
+    private func armDisplayReadinessCallback(engineGeneration: UInt64, loadGeneration: UInt64) {
+        guard demandScheduler.isWaitingForReadiness else { return }
+        let readinessHandler = MPVMetalSampleBufferReadinessHandler { [weak self] in
+            guard let self else { return }
+            guard self.demandScheduler.isWaitingForReadiness else { return }
+            if self.recoverDisplayRendererIfNeeded(loadGeneration: loadGeneration) {
                 return
             }
-
-            self.clearPendingRenderUpdate()
-            self.forcedFrameCount = max(self.forcedFrameCount, 1)
-            guard !self.isRenderScheduled else { return }
-            self.isRenderScheduled = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.isRenderScheduled = false
-                self.clearPendingRenderUpdate()
-                self.renderFrame(force: force)
+            guard self.displayRendererReadyForMoreMediaData else { return }
+            self.stopRequestingDisplayData()
+            guard self.renderLifecycleFence.accepts(
+                engineGeneration: engineGeneration,
+                loadGeneration: loadGeneration
+            ) else {
+                self.staleGenerationDropCount += 1
+                return
             }
+            if self.demandScheduler.becomeReady(generation: loadGeneration) {
+                if let recoveryFrame = self.pendingDisplayRecoveryFrame,
+                   recoveryFrame.loadGeneration == loadGeneration,
+                   recoveryFrame.timelineEpoch == self.sampleTimeline.epoch {
+                    self.pendingDisplayRecoveryFrame = nil
+                    _ = self.enqueue(
+                        buffer: recoveryFrame.pixelBuffer,
+                        forceSDR: recoveryFrame.forceSDR,
+                        loadGeneration: loadGeneration
+                    )
+                    return
+                }
+                self.schedulePendingRenderIfNeeded(
+                    engineGeneration: engineGeneration,
+                    loadGeneration: loadGeneration
+                )
+            }
+        }
+        let callback: @Sendable () -> Void = { readinessHandler() }
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
+            displayLayer.sampleBufferRenderer.requestMediaDataWhenReady(on: renderQueue, using: callback)
+        } else {
+            displayLayer.requestMediaDataWhenReady(on: renderQueue, using: callback)
         }
     }
 
-    private func scheduleRenderFallbackIfNeeded() {
-        guard !isRenderFallbackScheduled else { return }
-        isRenderFallbackScheduled = true
-        renderFallbackGeneration &+= 1
-        let generation = renderFallbackGeneration
-        let delay = 1.0 / Double(max(1, options.preferredFramesPerSecond))
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+    private func stopRequestingDisplayData() {
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
+            displayLayer.sampleBufferRenderer.stopRequestingMediaData()
+        } else {
+            displayLayer.stopRequestingMediaData()
+        }
+    }
+
+    private func beginNewLoadGeneration(removingDisplayedImage: Bool = true) {
+        loadGeneration &+= 1
+        updateRenderLifecycleFence()
+        legacyPrimeBudget.reset()
+        cachedVideoPTS = nil
+        cachedSourceFPS = nil
+        let generation = loadGeneration
+        let engineGeneration = self.engineGeneration
+        let initialSpeed = cachedSpeed
+        let initiallyPaused = isPaused
+        let initiallyBuffering = isPausedForCache
+        enqueueRenderWork { [weak self] in
             guard let self,
-                  self.isRunning,
-                  self.isRenderFallbackScheduled,
-                  self.renderFallbackGeneration == generation else { return }
-            self.isRenderFallbackScheduled = false
-            guard self.hasPendingRenderUpdate else { return }
-            self.hasPendingRenderUpdate = false
-            self.renderFrame(force: false)
+                  self.renderLifecycleFence.accepts(
+                    engineGeneration: engineGeneration,
+                    loadGeneration: generation
+                  ) else {
+                self?.staleGenerationDropCount += 1
+                return
+            }
+            self.frameCount = 0
+            self.renderAttemptCount = 0
+            self.renderFailureCount = 0
+            self.allocationFailureCount = 0
+            self.enqueueFailureCount = 0
+            self.metalPresentationFrameCount = 0
+            self.metalPresentationFailureCount = 0
+            self.highBitDepthRenderingFailureCount = 0
+            self.lastPresentationTime = 0
+            self.cancelTimelineWaiters()
+            self.demandScheduler.beginGeneration(generation)
+            self.displayRecoveryGate.beginGeneration(generation)
+            self.pendingDisplayRecoveryFrame = nil
+            self.displayRecoveryProbeGeneration = nil
+            self.scheduledRenderWorkItem?.cancel()
+            self.scheduledRenderWorkItem = nil
+            self.stopRequestingDisplayData()
+            self.highBitDepthStagingPool = nil
+            self.renderVideoSize = .zero
+            self.renderPosition = 0
+            self.renderVideoPTS = nil
+            self.renderSourceFPS = nil
+            self.renderIsFileLoaded = false
+            self.hasReceivedVideoFrameUpdate = false
+            self.renderSpeed = initialSpeed
+            self.renderIsPaused = initiallyPaused
+            self.renderIsBuffering = initiallyBuffering
+            self.videoColorPrimaries = ""
+            self.videoTransferFunction = ""
+            self.videoYCbCrMatrix = ""
+            self.videoSignalPeak = 0
+            self.formatDescription = nil
+            self.formatDescriptionMetadataSignature = ""
+            self.sampleTimeline.beginDiscontinuity()
+            self.timelineIsAnchored = false
+            self.allowsPausedDuplicateFrame = false
+            _ = self.flushCoordinator.beginEpoch()
+            self.requestDisplayFlush(
+                removingDisplayedImage: removingDisplayedImage,
+                loadGeneration: generation,
+                pendingSample: nil
+            )
+            self.publishRenderDiagnostics(
+                engineGeneration: engineGeneration,
+                loadGeneration: generation
+            )
         }
     }
 
-    private func clearPendingRenderUpdate() {
-        hasPendingRenderUpdate = false
-        isRenderFallbackScheduled = false
-        renderFallbackGeneration &+= 1
-    }
-
-    private func forceRenderBurst(count: Int) {
-        guard count > 0 else { return }
-        forcedFrameCount = max(forcedFrameCount, count)
-        for index in 0..<count {
-            DispatchQueue.main.asyncAfter(deadline: .now() + (0.04 * Double(index))) { [weak self] in
-                self?.scheduleRender(force: true)
+    private func requestTimelineDiscontinuity(removingDisplayedImage: Bool) {
+        let loadGeneration = self.loadGeneration
+        enqueueRenderWork { [weak self] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(loadGeneration: loadGeneration) else { return }
+            self.sampleTimeline.beginDiscontinuity()
+            self.retargetTimelineWaiters(
+                loadGeneration: loadGeneration,
+                timelineEpoch: self.sampleTimeline.epoch
+            )
+            self.timelineIsAnchored = false
+            _ = self.flushCoordinator.beginEpoch()
+            if removingDisplayedImage {
+                self.requestDisplayFlush(
+                    removingDisplayedImage: true,
+                    loadGeneration: loadGeneration,
+                    pendingSample: nil
+                )
             }
         }
     }
 
-    private func renderFrame(force: Bool) {
-        guard let context = renderContext, isFileLoaded else { return }
-        if forcedFrameCount > 0 {
-            forcedFrameCount -= 1
+    private func requestPausedPresentationRefresh() {
+        let shouldCreatePresentationEpoch = isPaused || isPausedForCache
+        let generation = loadGeneration
+        if shouldCreatePresentationEpoch {
+            enqueueRenderWork { [weak self] in
+                guard let self,
+                      self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+                self.allowsPausedDuplicateFrame = true
+                self.sampleTimeline.beginDiscontinuity()
+                self.retargetTimelineWaiters(
+                    loadGeneration: generation,
+                    timelineEpoch: self.sampleTimeline.epoch
+                )
+                self.timelineIsAnchored = false
+                _ = self.flushCoordinator.beginEpoch()
+            }
+        }
+        requestForcedFrames(count: 2)
+    }
+
+    private func updateTimelineRate() {
+        let generation = loadGeneration
+        let paused = isPaused
+        let buffering = isPausedForCache
+        let speed = cachedSpeed
+        let rate = (paused || buffering) ? 0 : speed
+        enqueueRenderWork { [weak self] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+            self.renderIsPaused = paused
+            self.renderIsBuffering = buffering
+            self.renderSpeed = speed
+            self.sampleTimeline.updatePlayback(
+                paused: paused,
+                buffering: buffering,
+                rate: speed
+            )
+            if let timebase = self.displayLayer.controlTimebase {
+                CMTimebaseSetRate(timebase, rate: rate)
+            }
+        }
+    }
+
+    private func capturePresentationGeometry() {
+        let bounds = displayLayer.bounds
+        let scale = presentationScale
+        enqueueRenderWork { [weak self] in
+            self?.displayBoundsSnapshot = bounds
+            self?.presentationScaleSnapshot = scale
+        }
+    }
+
+    private func renderFrame(force: Bool, loadGeneration: UInt64) {
+        guard renderLifecycleFence.accepts(loadGeneration: loadGeneration),
+              let context = renderContext,
+              renderIsFileLoaded else { return }
+        if recoverDisplayRendererIfNeeded(loadGeneration: loadGeneration) {
+            _ = demandScheduler.request(
+                forcedCount: force ? 1 : 0,
+                generation: loadGeneration
+            )
+            return
         }
 
         let updateFlags = UInt32(mpv_render_context_update(context))
@@ -886,14 +2237,14 @@ public final class MPVMetalSampleBufferRenderer {
         }
 
         if shouldUseHighBitDepthRendering,
-           renderHighBitDepthFrame(context: context, width: width, height: height) {
+           renderHighBitDepthFrame(context: context, width: width, height: height, loadGeneration: loadGeneration) {
             return
         }
 
-        renderBGRAFrame(context: context, width: width, height: height)
+        renderBGRAFrame(context: context, width: width, height: height, loadGeneration: loadGeneration)
     }
 
-    private func renderBGRAFrame(context: OpaquePointer, width: Int, height: Int) {
+    private func renderBGRAFrame(context: OpaquePointer, width: Int, height: Int, loadGeneration: UInt64) {
         guard let buffer = makePixelBuffer(width: width, height: height) else {
             allocationFailureCount += 1
             return
@@ -944,20 +2295,38 @@ public final class MPVMetalSampleBufferRenderer {
             reportError("sample-buffer render failed status=\(result)")
             return
         }
+        guard renderLifecycleFence.accepts(loadGeneration: loadGeneration) else {
+            staleGenerationDropCount += 1
+            return
+        }
 
         highBitDepthRenderingActive = false
         lastSourcePixelFormatDescription = "bgr0/BGRA8"
         probeMetalCompatibility(buffer: buffer, width: width, height: height)
-        let presentationBuffer = makeMetalPresentationBuffer(from: buffer, width: width, height: height) ?? buffer
-        if !enqueue(buffer: presentationBuffer), presentationBuffer !== buffer {
-            hdrPresentationDisabled = true
-            presentationBackend = .metalIOSurface
-            _ = enqueue(buffer: buffer)
+        if shouldUseHDRPresentation,
+           beginHDRMetalPresentation(
+            from: buffer,
+            width: width,
+            height: height,
+            loadGeneration: loadGeneration
+           ) {
+            return
         }
+        presentationBackend = metalCompatibilityProbeSucceeded ? .metalIOSurface : .softwareIOSurface
+        _ = enqueue(
+            buffer: buffer,
+            forceSDR: hdrPresentationDisabled,
+            loadGeneration: loadGeneration
+        )
     }
 
-    private func renderHighBitDepthFrame(context: OpaquePointer, width: Int, height: Int) -> Bool {
-        guard options.prefersMetalPresentation,
+    private func renderHighBitDepthFrame(
+        context: OpaquePointer,
+        width: Int,
+        height: Int,
+        loadGeneration: UInt64
+    ) -> Bool {
+        guard renderOptions.prefersMetalPresentation,
               let cache = metalTextureCache,
               let commandQueue = metalCommandQueue else {
             return false
@@ -965,15 +2334,29 @@ public final class MPVMetalSampleBufferRenderer {
 
         let bytesPerPixel = MemoryLayout<UInt16>.size * 4
         let stride = alignedBytesPerRow(width: width, bytesPerPixel: bytesPerPixel)
-        let byteCount = stride * height
-        var rawPointer: UnsafeMutableRawPointer?
-        guard posix_memalign(&rawPointer, 64, byteCount) == 0, let baseAddress = rawPointer else {
+        let stagingPool: MPVHighBitDepthStagingPool
+        if let existing = highBitDepthStagingPool,
+           existing.matches(generation: loadGeneration, width: width, height: height, stride: stride) {
+            stagingPool = existing
+        } else {
+            let replacement = MPVHighBitDepthStagingPool(
+                generation: loadGeneration,
+                width: width,
+                height: height,
+                stride: stride,
+                capacity: renderOptions.maximumInFlightFrameCount
+            )
+            highBitDepthStagingPool = replacement
+            stagingPool = replacement
+        }
+        guard let stagingLease = stagingPool.acquire() else {
             allocationFailureCount += 1
             highBitDepthRenderingFailureCount += 1
+            poolExhaustionDropCount += 1
             return false
         }
-        defer { free(baseAddress) }
-        memset(baseAddress, 0, byteCount)
+        let baseAddress = stagingLease.pointer
+        memset(baseAddress, 0, stagingLease.length)
 
         var result: Int32 = -1
         var size = [Int32(width), Int32(height)]
@@ -997,102 +2380,190 @@ public final class MPVMetalSampleBufferRenderer {
         }
         lastRenderStatus = result
         guard result >= 0 else {
+            stagingLease.release()
             highBitDepthRenderingDisabled = true
             highBitDepthRenderingActive = false
             highBitDepthRenderingFailureCount += 1
             reportError("sample-buffer rgba64 render failed status=\(result)")
-            return false
+            // `mpv_render_context_render` was already invoked for this demand. Preserve the last
+            // displayed frame; the next natural VO update will use the SDR path.
+            return true
+        }
+        guard renderLifecycleFence.accepts(loadGeneration: loadGeneration) else {
+            stagingLease.release()
+            staleGenerationDropCount += 1
+            return true
         }
 
-        guard let presentationBuffer = makeHighBitDepthHDRPresentationBuffer(
-            sourceBaseAddress: baseAddress,
+        guard beginHighBitDepthHDRPresentation(
+            stagingLease: stagingLease,
             sourceStride: stride,
             width: width,
             height: height,
             cache: cache,
-            commandQueue: commandQueue
+            commandQueue: commandQueue,
+            loadGeneration: loadGeneration
         ) else {
+            stagingLease.release()
             highBitDepthRenderingDisabled = true
             highBitDepthRenderingActive = false
             highBitDepthRenderingFailureCount += 1
-            return false
+            // The libmpv frame has already been rendered into the staging lease. Keep the last
+            // valid presentation and let the next natural VO update use SDR.
+            return true
         }
 
         highBitDepthRenderingActive = true
         lastSourcePixelFormatDescription = "rgba64/RGBA16"
         presentationBackend = .metalHighBitDepthHDRIOSurface
-        metalPresentationFrameCount += 1
-        if enqueue(buffer: presentationBuffer) {
-            return true
-        }
-
-        hdrPresentationDisabled = true
-        highBitDepthRenderingDisabled = true
-        highBitDepthRenderingActive = false
-        highBitDepthRenderingFailureCount += 1
-        return false
+        return true
     }
 
     private func currentTargetSize() -> CGSize? {
-        let source = videoSize.width > 0 && videoSize.height > 0
-            ? videoSize
+        let source = renderVideoSize.width > 0 && renderVideoSize.height > 0
+            ? renderVideoSize
             : CGSize(
-                width: max(1, displayLayer.bounds.width * UIScreen.main.scale),
-                height: max(1, displayLayer.bounds.height * UIScreen.main.scale)
+                width: max(1, displayBoundsSnapshot.width * presentationScaleSnapshot),
+                height: max(1, displayBoundsSnapshot.height * presentationScaleSnapshot)
             )
-        guard source.width > 0, source.height > 0 else { return nil }
-        let maxSize = options.maximumFrameSize
+        guard source.width.isFinite, source.height.isFinite,
+              source.width > 0, source.height > 0 else { return nil }
+        let maxSize = renderOptions.maximumFrameSize
+        guard maxSize.width.isFinite, maxSize.height.isFinite,
+              maxSize.width > 0, maxSize.height > 0 else { return nil }
         let scale = min(maxSize.width / source.width, maxSize.height / source.height, 1.0)
-        return CGSize(width: max(1, floor(source.width * scale)), height: max(1, floor(source.height * scale)))
+        let requested = MPVPixelSize(
+            width: max(1, floor(source.width * scale)),
+            height: max(1, floor(source.height * scale))
+        )
+        let previous = poolWidth > 0 && poolHeight > 0
+            ? MPVPixelSize(width: Double(poolWidth), height: Double(poolHeight))
+            : nil
+        let policy = MPVResizePolicy(
+            maximumPixelCount: maximumOutputPixelCount,
+            maximumDimension: maximumMetalTextureDimension
+        )
+        guard let resolved = policy.resolve(requested, previous: previous) else { return nil }
+        return CGSize(width: resolved.width, height: resolved.height)
+    }
+
+    private var maximumOutputPixelCount: Double {
+        #if os(macOS)
+        return 14_745_600
+        #else
+        return 8_294_400
+        #endif
+    }
+
+    private var maximumMetalTextureDimension: Double {
+        guard let metalDevice else { return 4_096 }
+        #if os(macOS)
+        // The native macOS renderer is Apple Silicon-only. Its Metal devices support 16K
+        // textures; the independent pixel cap still prevents oversized normal-video pools.
+        _ = metalDevice
+        return 16_384
+        #else
+        // Apple3 and newer support 16K 2D textures. Older iOS/tvOS GPUs are conservatively
+        // limited to 8K; the separate pixel-count cap remains the tighter normal-video limit.
+        return metalDevice.supportsFamily(.apple3) ? 16_384 : 8_192
+        #endif
+    }
+
+    private var presentationScale: CGFloat {
+        #if os(macOS)
+        return displayLayer.delegate.flatMap { ($0 as? NSView)?.window?.backingScaleFactor }
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 1
+        #else
+        displayLayer.delegate.flatMap { ($0 as? UIView)?.window?.screen.scale }
+            ?? UIScreen.main.scale
+        #endif
     }
 
     private func recreatePixelBufferPool(width: Int, height: Int) {
+        flushMetalTextureCache()
         pixelBufferPool = nil
+        pixelBufferPoolAuxAttributes = nil
+        hdrPixelBufferPool = nil
+        hdrPixelBufferPoolAuxAttributes = nil
         formatDescription = nil
         poolWidth = width
         poolHeight = height
-        let attrs = pixelBufferAttributes(width: width, height: height, pixelFormat: kCVPixelFormatType_32BGRA)
+        let standard = createPixelBufferPool(
+            width: width,
+            height: height,
+            pixelFormat: kCVPixelFormatType_32BGRA
+        )
+        pixelBufferPool = standard.pool
+        pixelBufferPoolAuxAttributes = standard.auxAttributes
+        if standard.status != kCVReturnSuccess {
+            reportError("pixel buffer pool creation failed status=\(standard.status)")
+        }
+
+        let hdr = createPixelBufferPool(
+            width: width,
+            height: height,
+            pixelFormat: kCVPixelFormatType_64RGBAHalf
+        )
+        hdrPixelBufferPool = hdr.pool
+        hdrPixelBufferPoolAuxAttributes = hdr.auxAttributes
+    }
+
+    private func createPixelBufferPool(
+        width: Int,
+        height: Int,
+        pixelFormat: OSType
+    ) -> (pool: CVPixelBufferPool?, auxAttributes: CFDictionary?, status: CVReturn) {
+        let attrs = pixelBufferAttributes(width: width, height: height, pixelFormat: pixelFormat)
         let poolAttrs: [CFString: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey: 4
+            kCVPixelBufferPoolMinimumBufferCountKey: renderOptions.maximumInFlightFrameCount
         ]
         let auxAttrs: [CFString: Any] = [
-            kCVPixelBufferPoolAllocationThresholdKey: 4
+            kCVPixelBufferPoolAllocationThresholdKey: renderOptions.maximumInFlightFrameCount
         ]
         var pool: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs as CFDictionary, attrs as CFDictionary, &pool)
-        if status == kCVReturnSuccess {
-            pixelBufferPool = pool
-            pixelBufferPoolAuxAttributes = auxAttrs as CFDictionary
-        } else {
-            reportError("pixel buffer pool creation failed status=\(status)")
-        }
+        return (
+            status == kCVReturnSuccess ? pool : nil,
+            status == kCVReturnSuccess ? auxAttrs as CFDictionary : nil,
+            status
+        )
     }
 
     private func makePixelBuffer(
         width: Int,
         height: Int,
-        pixelFormat: OSType = kCVPixelFormatType_32BGRA,
-        usesPool: Bool = true
+        pixelFormat: OSType = kCVPixelFormatType_32BGRA
     ) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
-        if usesPool, pixelFormat == kCVPixelFormatType_32BGRA, let pool = pixelBufferPool {
-            let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
-                kCFAllocatorDefault,
-                pool,
-                pixelBufferPoolAuxAttributes,
-                &buffer
-            )
-            if status == kCVReturnSuccess, buffer != nil {
-                return buffer
-            }
+        let pool: CVPixelBufferPool?
+        let auxAttributes: CFDictionary?
+        switch pixelFormat {
+        case kCVPixelFormatType_32BGRA:
+            pool = pixelBufferPool
+            auxAttributes = pixelBufferPoolAuxAttributes
+        case kCVPixelFormatType_64RGBAHalf:
+            pool = hdrPixelBufferPool
+            auxAttributes = hdrPixelBufferPoolAuxAttributes
+        default:
+            pool = nil
+            auxAttributes = nil
         }
-
-        let attrs = pixelBufferAttributes(width: width, height: height, pixelFormat: pixelFormat)
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs as CFDictionary, &buffer)
-        if status != kCVReturnSuccess {
-            reportError("pixel buffer allocation failed status=\(status)")
+        guard let pool else {
+            poolExhaustionDropCount += 1
+            return nil
         }
-        return buffer
+        let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault,
+            pool,
+            auxAttributes,
+            &buffer
+        )
+        if status == kCVReturnSuccess, buffer != nil {
+            return buffer
+        }
+        poolExhaustionDropCount += 1
+        return nil
     }
 
     /// libmpv's `bgr0` software output leaves the fourth byte undefined. CoreVideo's 32BGRA
@@ -1139,7 +2610,7 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     private func probeMetalCompatibility(buffer: CVPixelBuffer, width: Int, height: Int) {
-        guard options.createsMetalCompatibilityProbe,
+        guard renderOptions.createsMetalCompatibilityProbe,
               !metalCompatibilityProbeSucceeded,
               let cache = metalTextureCache,
               let textureFormat = metalTexturePixelFormat(for: CVPixelBufferGetPixelFormatType(buffer)) else { return }
@@ -1156,9 +2627,6 @@ public final class MPVMetalSampleBufferRenderer {
             &texture
         )
         metalCompatibilityProbeSucceeded = status == kCVReturnSuccess && texture != nil
-        if status == kCVReturnSuccess {
-            CVMetalTextureCacheFlush(cache, 0)
-        }
     }
 
     private func metalTexturePixelFormat(for pixelFormat: OSType) -> MTLPixelFormat? {
@@ -1188,138 +2656,45 @@ public final class MPVMetalSampleBufferRenderer {
         return ((rowBytes + alignment - 1) / alignment) * alignment
     }
 
-    private func makeMetalPresentationBuffer(from sourceBuffer: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
-        guard options.prefersMetalPresentation,
-              let cache = metalTextureCache,
-              let commandQueue = metalCommandQueue else {
-            presentationBackend = .softwareIOSurface
-            return nil
-        }
-
-        if shouldUseHDRPresentation,
-           let hdrBuffer = makeHDRMetalPresentationBuffer(
-            from: sourceBuffer,
-            width: width,
-            height: height,
-            cache: cache,
-            commandQueue: commandQueue
-           ) {
-            presentationBackend = .metalHDRIOSurface
-            metalPresentationFrameCount += 1
-            return hdrBuffer
-        }
-
-        guard let destinationBuffer = makePixelBuffer(width: width, height: height) else {
-            presentationBackend = .softwareIOSurface
-            return nil
-        }
-
-        var sourceTextureRef: CVMetalTexture?
-        var destinationTextureRef: CVMetalTexture?
-        let sourceStatus = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault,
-            cache,
-            sourceBuffer,
-            nil,
-            .bgra8Unorm,
-            width,
-            height,
-            0,
-            &sourceTextureRef
-        )
-        let destinationStatus = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault,
-            cache,
-            destinationBuffer,
-            nil,
-            .bgra8Unorm,
-            width,
-            height,
-            0,
-            &destinationTextureRef
-        )
-        guard sourceStatus == kCVReturnSuccess,
-              destinationStatus == kCVReturnSuccess,
-              let sourceTextureRef,
-              let destinationTextureRef,
-              let sourceTexture = CVMetalTextureGetTexture(sourceTextureRef),
-              let destinationTexture = CVMetalTextureGetTexture(destinationTextureRef),
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
-            metalPresentationFailureCount += 1
-            presentationBackend = .softwareIOSurface
-            CVMetalTextureCacheFlush(cache, 0)
-            return nil
-        }
-
-        blitEncoder.copy(
-            from: sourceTexture,
-            sourceSlice: 0,
-            sourceLevel: 0,
-            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(width: width, height: height, depth: 1),
-            to: destinationTexture,
-            destinationSlice: 0,
-            destinationLevel: 0,
-            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-        )
-        blitEncoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        CVMetalTextureCacheFlush(cache, 0)
-
-        guard commandBuffer.status == .completed else {
-            metalPresentationFailureCount += 1
-            presentationBackend = .softwareIOSurface
-            reportError("Metal presentation blit failed status=\(commandBuffer.status.rawValue)")
-            return nil
-        }
-
-        presentationBackend = .metalIOSurface
-        metalPresentationFrameCount += 1
-        return destinationBuffer
-    }
-
     private var shouldUseHDRPresentation: Bool {
-        options.prefersHDRPresentation && !hdrPresentationDisabled && streamLooksHDR
+        renderOptions.prefersHDRPresentation && !hdrPresentationDisabled && streamLooksHDR
     }
 
     private var shouldUseHighBitDepthRendering: Bool {
         shouldUseHDRPresentation
-            && options.prefersHighBitDepthRendering
+            && renderOptions.prefersHighBitDepthRendering
             && !highBitDepthRenderingDisabled
-            && options.prefersMetalPresentation
+            && renderOptions.prefersMetalPresentation
             && metalTextureCache != nil
             && metalCommandQueue != nil
     }
 
     private var streamLooksHDR: Bool {
         let transfer = videoTransferFunction.lowercased()
-        let primaries = videoColorPrimaries.lowercased()
         return videoSignalPeak > 1.0
             || transfer.contains("pq")
             || transfer.contains("hlg")
             || transfer.contains("2084")
-            || primaries.contains("2020")
     }
 
-    private func makeHDRMetalPresentationBuffer(
+    private func beginHDRMetalPresentation(
         from sourceBuffer: CVPixelBuffer,
         width: Int,
         height: Int,
-        cache: CVMetalTextureCache,
-        commandQueue: MTLCommandQueue
-    ) -> CVPixelBuffer? {
+        loadGeneration: UInt64
+    ) -> Bool {
+        guard demandScheduler.inFlightCount == 0,
+              let cache = metalTextureCache,
+              let commandQueue = metalCommandQueue else { return false }
         guard let pipeline = hdrConversionPipeline ?? makeHDRConversionPipeline(),
               let destinationBuffer = makePixelBuffer(
                 width: width,
                 height: height,
-                pixelFormat: kCVPixelFormatType_64RGBAHalf,
-                usesPool: false
+                pixelFormat: kCVPixelFormatType_64RGBAHalf
               ) else {
             metalPresentationFailureCount += 1
             hdrPresentationDisabled = true
-            return nil
+            return false
         }
         hdrConversionPipeline = pipeline
 
@@ -1357,8 +2732,7 @@ public final class MPVMetalSampleBufferRenderer {
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             metalPresentationFailureCount += 1
             hdrPresentationDisabled = true
-            CVMetalTextureCacheFlush(cache, 0)
-            return nil
+            return false
         }
 
         encoder.setComputePipelineState(pipeline)
@@ -1372,42 +2746,65 @@ public final class MPVMetalSampleBufferRenderer {
         )
         encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
         encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        CVMetalTextureCacheFlush(cache, 0)
-
-        guard commandBuffer.status == .completed else {
-            metalPresentationFailureCount += 1
-            hdrPresentationDisabled = true
-            reportError("HDR Metal presentation conversion failed status=\(commandBuffer.status.rawValue)")
-            return nil
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        guard demandScheduler.beginInFlight(generation: loadGeneration) else { return false }
+        let group = gpuConversionGroup
+        let resources = MPVMetalGPUCompletionResources(
+            destinationBuffer: destinationBuffer,
+            fallbackBuffer: sourceBuffer,
+            retainedObjects: [sourceTextureRef, destinationTextureRef]
+        )
+        let finish = MPVMetalSampleBufferValueHandler<MPVMetalGPUCompletionPayload> { [weak self] payload in
+            self?.finishGPUFrame(
+                commandBuffer: payload.commandBuffer,
+                destinationBuffer: payload.resources.destinationBuffer,
+                fallbackBuffer: payload.resources.fallbackBuffer,
+                loadGeneration: loadGeneration,
+                startedAt: startedAt,
+                highBitDepth: false
+            )
+            group.leave()
         }
-
-        return destinationBuffer
+        group.enter()
+        commandBuffer.addCompletedHandler { [weak self, resources] completed in
+            let payload = MPVMetalGPUCompletionPayload(
+                commandBuffer: completed,
+                resources: resources
+            )
+            guard let queue = self?.renderQueue else {
+                group.leave()
+                return
+            }
+            queue.async { finish(payload) }
+        }
+        commandBuffer.commit()
+        return true
     }
 
-    private func makeHighBitDepthHDRPresentationBuffer(
-        sourceBaseAddress: UnsafeRawPointer,
+    private func beginHighBitDepthHDRPresentation(
+        stagingLease: MPVHighBitDepthStagingPool.Lease,
         sourceStride: Int,
         width: Int,
         height: Int,
         cache: CVMetalTextureCache,
-        commandQueue: MTLCommandQueue
-    ) -> CVPixelBuffer? {
-        guard let pipeline = highBitDepthConversionPipeline ?? makeHighBitDepthConversionPipeline(),
+        commandQueue: MTLCommandQueue,
+        loadGeneration: UInt64
+    ) -> Bool {
+        guard demandScheduler.inFlightCount == 0,
+              let pipeline = highBitDepthConversionPipeline ?? makeHighBitDepthConversionPipeline(),
               let sourceBuffer = metalDevice?.makeBuffer(
-                bytes: sourceBaseAddress,
-                length: sourceStride * height,
-                options: .storageModeShared
+                bytesNoCopy: stagingLease.pointer,
+                length: stagingLease.length,
+                options: .storageModeShared,
+                deallocator: nil
               ),
               let destinationBuffer = makePixelBuffer(
                 width: width,
                 height: height,
-                pixelFormat: kCVPixelFormatType_64RGBAHalf,
-                usesPool: false
+                pixelFormat: kCVPixelFormatType_64RGBAHalf
               ) else {
             metalPresentationFailureCount += 1
-            return nil
+            return false
         }
         highBitDepthConversionPipeline = pipeline
 
@@ -1430,8 +2827,7 @@ public final class MPVMetalSampleBufferRenderer {
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             metalPresentationFailureCount += 1
-            CVMetalTextureCacheFlush(cache, 0)
-            return nil
+            return false
         }
 
         encoder.setComputePipelineState(pipeline)
@@ -1446,17 +2842,95 @@ public final class MPVMetalSampleBufferRenderer {
         )
         encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
         encoder.endEncoding()
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        guard demandScheduler.beginInFlight(generation: loadGeneration) else { return false }
+        let group = gpuConversionGroup
+        let resources = MPVMetalGPUCompletionResources(
+            destinationBuffer: destinationBuffer,
+            fallbackBuffer: nil,
+            retainedObjects: [sourceBuffer as AnyObject, destinationTextureRef]
+        )
+        let finish = MPVMetalSampleBufferValueHandler<MPVMetalGPUCompletionPayload> { [weak self, stagingLease] payload in
+            self?.finishGPUFrame(
+                commandBuffer: payload.commandBuffer,
+                destinationBuffer: payload.resources.destinationBuffer,
+                fallbackBuffer: nil,
+                loadGeneration: loadGeneration,
+                startedAt: startedAt,
+                highBitDepth: true
+            )
+            stagingLease.release()
+            group.leave()
+        }
+        group.enter()
+        commandBuffer.addCompletedHandler { [weak self, resources, stagingLease] completed in
+            let payload = MPVMetalGPUCompletionPayload(
+                commandBuffer: completed,
+                resources: resources
+            )
+            guard let queue = self?.renderQueue else {
+                stagingLease.release()
+                group.leave()
+                return
+            }
+            queue.async { finish(payload) }
+        }
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        CVMetalTextureCacheFlush(cache, 0)
+        return true
+    }
 
-        guard commandBuffer.status == .completed else {
-            metalPresentationFailureCount += 1
-            reportError("High-bit-depth HDR Metal presentation conversion failed status=\(commandBuffer.status.rawValue)")
-            return nil
+    private func finishGPUFrame(
+        commandBuffer: MTLCommandBuffer,
+        destinationBuffer: CVPixelBuffer,
+        fallbackBuffer: CVPixelBuffer?,
+        loadGeneration: UInt64,
+        startedAt: TimeInterval,
+        highBitDepth: Bool
+    ) {
+        let shouldScheduleCurrentGeneration = demandScheduler.finishInFlight(generation: loadGeneration)
+        lastGPULatencyMilliseconds = max(0, (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000)
+        let lifecycle = renderLifecycleFence.snapshot()
+        guard lifecycle.isRunning,
+              !lifecycle.isStopping,
+              lifecycle.loadGeneration == loadGeneration else {
+            staleGenerationDropCount += 1
+            if shouldScheduleCurrentGeneration,
+               lifecycle.isRunning,
+               !lifecycle.isStopping {
+                schedulePendingRenderIfNeeded(
+                    engineGeneration: lifecycle.engineGeneration,
+                    loadGeneration: lifecycle.loadGeneration
+                )
+            }
+            return
         }
 
-        return destinationBuffer
+        if commandBuffer.status == .completed {
+            presentationBackend = highBitDepth ? .metalHighBitDepthHDRIOSurface : .metalHDRIOSurface
+            metalPresentationFrameCount += 1
+            _ = enqueue(buffer: destinationBuffer, loadGeneration: loadGeneration)
+        } else {
+            metalPresentationFailureCount += 1
+            hdrPresentationDisabled = true
+            if highBitDepth {
+                highBitDepthRenderingDisabled = true
+                highBitDepthRenderingActive = false
+                highBitDepthRenderingFailureCount += 1
+            }
+            reportError("Metal HDR conversion failed status=\(commandBuffer.status.rawValue)")
+            if let fallbackBuffer {
+                presentationBackend = .softwareIOSurface
+                _ = enqueue(buffer: fallbackBuffer, forceSDR: true, loadGeneration: loadGeneration)
+            }
+        }
+        schedulePendingRenderIfNeeded(
+            engineGeneration: lifecycle.engineGeneration,
+            loadGeneration: loadGeneration
+        )
+        publishRenderDiagnostics(
+            engineGeneration: lifecycle.engineGeneration,
+            loadGeneration: loadGeneration
+        )
     }
 
     private func makeHDRConversionPipeline() -> MTLComputePipelineState? {
@@ -1535,21 +3009,56 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     @discardableResult
-    private func enqueue(buffer: CVPixelBuffer) -> Bool {
-        if displayRenderingStatus == .failed {
-            if lastPixelFormatType == kCVPixelFormatType_64RGBAHalf {
-                hdrPresentationDisabled = true
-            }
-            resetDisplayLayer(removingDisplayedImage: true)
+    private func enqueue(
+        buffer: CVPixelBuffer,
+        forceSDR: Bool = false,
+        loadGeneration: UInt64
+    ) -> Bool {
+        let lifecycle = renderLifecycleFence.snapshot()
+        guard lifecycle.isRunning,
+              !lifecycle.isStopping,
+              lifecycle.loadGeneration == loadGeneration else {
+            staleGenerationDropCount += 1
+            return false
         }
-
-        applyColorAttachments(to: buffer)
-        let needsFlush = updateFormatDescriptionIfNeeded(for: buffer)
+        let recoveryFrame = MPVMetalSampleBufferPendingRecoveryFrame(
+            pixelBuffer: buffer,
+            forceSDR: forceSDR,
+            loadGeneration: loadGeneration,
+            timelineEpoch: sampleTimeline.epoch
+        )
+        if recoverDisplayRendererIfNeeded(
+            loadGeneration: loadGeneration,
+            retaining: recoveryFrame
+        ) {
+            return true
+        }
+        guard displayRendererReadyForMoreMediaData else {
+            if displayRecoveryProbeGeneration == loadGeneration {
+                retainLatestDisplayRecoveryFrame(recoveryFrame)
+            }
+            demandScheduler.waitForReadiness(generation: loadGeneration)
+            armDisplayReadinessCallback(
+                engineGeneration: lifecycle.engineGeneration,
+                loadGeneration: loadGeneration
+            )
+            return false
+        }
+        applyColorAttachments(to: buffer, forceSDR: forceSDR)
+        let formatChanged = updateFormatDescriptionIfNeeded(for: buffer, forceSDR: forceSDR)
         guard let description = formatDescription else { return false }
-        let mediaSeconds = cachedPosition.isFinite ? max(0, cachedPosition) : 0
+        let timelineDecision = sampleTimeline.evaluate(
+            pts: renderVideoPTS,
+            fallbackPTS: renderPosition,
+            allowsPausedRefresh: allowsPausedDuplicateFrame
+        )
+        guard case .enqueue(let mediaSeconds, let timelineEpoch, let timelineFlush, _) = timelineDecision else {
+            return false
+        }
+        allowsPausedDuplicateFrame = false
         lastPresentationTime = mediaSeconds
         let presentationTime = CMTime(seconds: mediaSeconds, preferredTimescale: 1000)
-        let frameDuration = CMTime(seconds: 1.0 / Double(max(1, options.preferredPiPFramesPerSecond)), preferredTimescale: 1000)
+        let frameDuration = CMTime(seconds: 1.0 / Double(max(1, renderOptions.preferredPiPFramesPerSecond)), preferredTimescale: 1000)
         var timing = CMSampleTimingInfo(duration: frameDuration, presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
         var sampleBuffer: CMSampleBuffer?
         let result = CMSampleBufferCreateForImageBuffer(
@@ -1572,32 +3081,314 @@ public final class MPVMetalSampleBufferRenderer {
             return false
         }
 
-        if needsFlush {
-            resetDisplayLayer(removingDisplayedImage: true)
+        if formatChanged || timelineFlush {
+            timelineIsAnchored = false
+            requestDisplayFlush(
+                removingDisplayedImage: true,
+                loadGeneration: loadGeneration,
+                pendingSample: MPVMetalSampleBufferPendingDisplaySample(
+                    sampleBuffer: sampleBuffer,
+                    pixelBuffer: buffer,
+                    description: description,
+                    presentationTime: presentationTime,
+                    mediaSeconds: mediaSeconds,
+                    timelineEpoch: timelineEpoch,
+                    forceSDR: forceSDR
+                )
+            )
+            return true
+        }
+        enqueuePrepared(
+            sampleBuffer: sampleBuffer,
+            pixelBuffer: buffer,
+            description: description,
+            presentationTime: presentationTime,
+            mediaSeconds: mediaSeconds,
+            timelineEpoch: timelineEpoch,
+            forceSDR: forceSDR,
+            loadGeneration: loadGeneration
+        )
+        return true
+    }
+
+    /// Serializes the physical AVSampleBufferDisplayLayer flush. A newer load/epoch replaces any
+    /// queued request, while an already-running AVFoundation completion is allowed to finish before
+    /// the replacement starts. No sample can be enqueued between those completions.
+    private func requestDisplayFlush(
+        removingDisplayedImage: Bool,
+        loadGeneration: UInt64,
+        pendingSample: MPVMetalSampleBufferPendingDisplaySample?,
+        recoversDisplayRenderer: Bool = false
+    ) {
+        var request = MPVMetalSampleBufferDisplayFlushRequest(
+            loadGeneration: loadGeneration,
+            removingDisplayedImage: recoversDisplayRenderer ? false : removingDisplayedImage,
+            pendingSample: recoversDisplayRenderer ? nil : pendingSample,
+            recoversDisplayRenderer: recoversDisplayRenderer,
+            recoveryTimelineEpoch: recoversDisplayRenderer ? sampleTimeline.epoch : nil
+        )
+        if flushInFlight {
+            if let pending = pendingDisplayFlush,
+               pending.loadGeneration == request.loadGeneration,
+               (pending.recoversDisplayRenderer || request.recoversDisplayRenderer) {
+                if pending.pendingSample != nil || request.pendingSample != nil {
+                    staleGenerationDropCount += 1
+                }
+                request = MPVMetalSampleBufferDisplayFlushRequest(
+                    loadGeneration: request.loadGeneration,
+                    removingDisplayedImage: false,
+                    pendingSample: nil,
+                    recoversDisplayRenderer: true,
+                    recoveryTimelineEpoch: request.recoveryTimelineEpoch
+                        ?? pending.recoveryTimelineEpoch
+                )
+            } else if pendingDisplayFlush?.pendingSample != nil {
+                staleGenerationDropCount += 1
+            }
+            pendingDisplayFlush = request
+            return
+        }
+        startDisplayFlush(request)
+    }
+
+    private func startDisplayFlush(_ request: MPVMetalSampleBufferDisplayFlushRequest) {
+        flushInFlight = true
+        displayLayer.controlTimebase = nil
+        let token = flushCoordinator.beginFlush()
+        let renderQueue = self.renderQueue
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
+            let finish = MPVMetalSampleBufferReadinessHandler { [weak self] in
+                self?.finishDisplayFlush(request, token: token)
+            }
+            displayLayer.sampleBufferRenderer.flush(
+                removingDisplayedImage: request.removingDisplayedImage
+            ) {
+                renderQueue.async { finish() }
+            }
+            return
+        }
+        if request.removingDisplayedImage {
+            displayLayer.flushAndRemoveImage()
+        } else {
+            displayLayer.flush()
+        }
+        finishDisplayFlush(request, token: token)
+    }
+
+    private func finishDisplayFlush(
+        _ request: MPVMetalSampleBufferDisplayFlushRequest,
+        token: MPVFlushEpochCoordinator.Token
+    ) {
+        let isCurrentEpoch = flushCoordinator.complete(token)
+        if let failure = completeDisplayRendererRecoveryIfNeeded(request: request) {
+            pendingDisplayFlush = nil
+            pendingDisplayRecoveryFrame = nil
+            displayRecoveryProbeGeneration = nil
+            flushInFlight = false
+            reportError(failure)
+            return
+        }
+        if let replacement = pendingDisplayFlush {
+            pendingDisplayFlush = nil
+            if request.pendingSample != nil {
+                staleGenerationDropCount += 1
+            }
+            startDisplayFlush(replacement)
+            return
+        }
+
+        flushInFlight = false
+        let lifecycle = renderLifecycleFence.snapshot()
+        if isCurrentEpoch,
+           request.loadGeneration == lifecycle.loadGeneration,
+           let pendingSample = request.pendingSample,
+           sampleTimeline.epoch == pendingSample.timelineEpoch,
+           lifecycle.isRunning,
+           !lifecycle.isStopping {
+            enqueuePrepared(
+                sampleBuffer: pendingSample.sampleBuffer,
+                pixelBuffer: pendingSample.pixelBuffer,
+                description: pendingSample.description,
+                presentationTime: pendingSample.presentationTime,
+                mediaSeconds: pendingSample.mediaSeconds,
+                timelineEpoch: pendingSample.timelineEpoch,
+                forceSDR: pendingSample.forceSDR,
+                loadGeneration: request.loadGeneration
+            )
+        } else if request.pendingSample != nil {
+            staleGenerationDropCount += 1
+        }
+
+        if finishesStopAfterDisplayFlush {
+            finishesStopAfterDisplayFlush = false
+            let renderDiagnostics = resetRenderStateAfterStop()
+            DispatchQueue.main.async { @MainActor [weak self] in
+                self?.finishStopping(renderDiagnostics: renderDiagnostics)
+            }
+            return
+        }
+        guard lifecycle.isRunning, !lifecycle.isStopping else { return }
+        if let recoveryFrame = pendingDisplayRecoveryFrame {
+            pendingDisplayRecoveryFrame = nil
+            if recoveryFrame.loadGeneration == lifecycle.loadGeneration,
+               recoveryFrame.timelineEpoch == sampleTimeline.epoch {
+                _ = enqueue(
+                    buffer: recoveryFrame.pixelBuffer,
+                    forceSDR: recoveryFrame.forceSDR,
+                    loadGeneration: recoveryFrame.loadGeneration
+                )
+            } else {
+                staleGenerationDropCount += 1
+            }
+        }
+        schedulePendingRenderIfNeeded(
+            engineGeneration: lifecycle.engineGeneration,
+            loadGeneration: lifecycle.loadGeneration
+        )
+    }
+
+    /// Clears render-queue-owned resources only after event, render, GPU, and display work have
+    /// drained. The immutable result is the sole state handed back to the main actor.
+    private func resetRenderStateAfterStop() -> MPVMetalSampleBufferRenderDiagnosticsSnapshot {
+        scheduledRenderWorkItem?.cancel()
+        scheduledRenderWorkItem = nil
+        _ = demandScheduler.beginGeneration()
+        stopRequestingDisplayData()
+        flushMetalTextureCache()
+        pixelBufferPool = nil
+        pixelBufferPoolAuxAttributes = nil
+        hdrPixelBufferPool = nil
+        hdrPixelBufferPoolAuxAttributes = nil
+        formatDescription = nil
+        poolWidth = 0
+        poolHeight = 0
+        hasReceivedVideoFrameUpdate = false
+        frameCount = 0
+        renderAttemptCount = 0
+        renderFailureCount = 0
+        allocationFailureCount = 0
+        enqueueFailureCount = 0
+        metalPresentationFrameCount = 0
+        metalPresentationFailureCount = 0
+        highBitDepthRenderingFailureCount = 0
+        hdrPresentationDisabled = false
+        formatDescriptionMetadataSignature = ""
+        lastPixelFormatDescription = "BGRA8"
+        lastSourcePixelFormatDescription = "bgr0/BGRA8"
+        lastPixelFormatType = kCVPixelFormatType_32BGRA
+        hdrMetadataApplied = false
+        highBitDepthRenderingDisabled = false
+        highBitDepthRenderingActive = false
+        highBitDepthStagingPool = nil
+        renderVideoPTS = nil
+        renderSourceFPS = nil
+        renderIsFileLoaded = false
+        sampleTimeline = MPVSampleTimeline()
+        cancelTimelineWaiters()
+        _ = flushCoordinator.beginEpoch()
+        timelineIsAnchored = false
+        allowsPausedDuplicateFrame = false
+        flushInFlight = false
+        pendingDisplayFlush = nil
+        pendingDisplayRecoveryFrame = nil
+        displayRecoveryProbeGeneration = nil
+        displayRecoveryGate.cancel()
+        finishesStopAfterDisplayFlush = false
+        return makeRenderDiagnosticsSnapshot()
+    }
+
+    private func enqueuePrepared(
+        sampleBuffer: CMSampleBuffer,
+        pixelBuffer: CVPixelBuffer,
+        description: CMVideoFormatDescription,
+        presentationTime: CMTime,
+        mediaSeconds: Double,
+        timelineEpoch: UInt64,
+        forceSDR: Bool,
+        loadGeneration: UInt64
+    ) {
+        let lifecycle = renderLifecycleFence.snapshot()
+        guard lifecycle.isRunning,
+              !lifecycle.isStopping,
+              lifecycle.loadGeneration == loadGeneration else {
+            staleGenerationDropCount += 1
+            return
+        }
+        let recoveryFrame = MPVMetalSampleBufferPendingRecoveryFrame(
+            pixelBuffer: pixelBuffer,
+            forceSDR: forceSDR,
+            loadGeneration: loadGeneration,
+            timelineEpoch: timelineEpoch
+        )
+        if recoverDisplayRendererIfNeeded(
+            loadGeneration: loadGeneration,
+            retaining: recoveryFrame
+        ) {
+            return
+        }
+        guard displayRendererReadyForMoreMediaData else {
+            if displayRecoveryProbeGeneration == loadGeneration {
+                retainLatestDisplayRecoveryFrame(recoveryFrame)
+            }
+            demandScheduler.waitForReadiness(generation: loadGeneration)
+            armDisplayReadinessCallback(
+                engineGeneration: lifecycle.engineGeneration,
+                loadGeneration: loadGeneration
+            )
+            return
         }
         // Use timestamped presentation with a control timebase. AVFoundation explicitly
         // discourages combining that model with kCMSampleAttachmentKey_DisplayImmediately.
         ensureTimebase(at: presentationTime)
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
             displayLayer.sampleBufferRenderer.enqueue(sampleBuffer)
         } else {
             displayLayer.enqueue(sampleBuffer)
         }
+        if displayRendererIsFailed {
+            _ = recoverDisplayRendererIfNeeded(
+                loadGeneration: loadGeneration,
+                retaining: recoveryFrame
+            )
+            return
+        }
+        if displayRecoveryProbeGeneration == loadGeneration {
+            displayRecoveryGate.finishRenderingProbeSubmission(generation: loadGeneration)
+            displayRecoveryProbeGeneration = nil
+        }
+        if displayRenderingStatus == .rendering {
+            displayRecoveryGate.markRenderingSucceeded(generation: loadGeneration)
+        }
+        sampleTimeline.didEnqueue(pts: mediaSeconds, epoch: timelineEpoch)
+        completeTimelineWaiters(
+            engineGeneration: lifecycle.engineGeneration,
+            loadGeneration: loadGeneration,
+            timelineEpoch: timelineEpoch
+        )
         frameCount += 1
         let dimensions = CMVideoFormatDescriptionGetDimensions(description)
         let frame = MPVMetalSampleBufferFrame(
             sampleBuffer: sampleBuffer,
-            pixelBuffer: buffer,
+            pixelBuffer: pixelBuffer,
             presentationTime: presentationTime,
             dimensions: dimensions,
             frameIndex: frameCount
         )
-        onFrame?(frame)
-        emitFrameDiagnosticsIfNeeded()
-        return true
+        let renderDiagnostics = makeRenderDiagnosticsSnapshot()
+        let engineGeneration = lifecycle.engineGeneration
+        DispatchQueue.main.async { @MainActor [weak self, frame] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(
+                    engineGeneration: engineGeneration,
+                    loadGeneration: loadGeneration
+                  ) else { return }
+            self.publishedRenderDiagnostics = renderDiagnostics
+            self.onFrame?(frame)
+            self.emitFrameDiagnosticsIfNeeded(frameCount: renderDiagnostics.frameCount)
+        }
     }
 
-    private func emitFrameDiagnosticsIfNeeded() {
+    private func emitFrameDiagnosticsIfNeeded(frameCount: Int) {
         guard let onDiagnostics else { return }
         let now = CACurrentMediaTime()
         if frameCount != 1,
@@ -1609,11 +3400,11 @@ public final class MPVMetalSampleBufferRenderer {
         onDiagnostics(diagnosticsSnapshot())
     }
 
-    private func updateFormatDescriptionIfNeeded(for buffer: CVPixelBuffer) -> Bool {
+    private func updateFormatDescriptionIfNeeded(for buffer: CVPixelBuffer, forceSDR: Bool) -> Bool {
         let width = Int32(CVPixelBufferGetWidth(buffer))
         let height = Int32(CVPixelBufferGetHeight(buffer))
         let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
-        let metadataSignature = currentColorMetadataSignature(pixelFormat: pixelFormat)
+        let metadataSignature = currentColorMetadataSignature(pixelFormat: pixelFormat, forceSDR: forceSDR)
         if let description = formatDescription {
             let dimensions = CMVideoFormatDescriptionGetDimensions(description)
             if dimensions.width == width,
@@ -1624,6 +3415,7 @@ public final class MPVMetalSampleBufferRenderer {
             }
         }
 
+        flushMetalTextureCache()
         var newDescription: CMVideoFormatDescription?
         let status = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
@@ -1641,8 +3433,8 @@ public final class MPVMetalSampleBufferRenderer {
         return false
     }
 
-    private func applyColorAttachments(to buffer: CVPixelBuffer) {
-        let isHDR = streamLooksHDR
+    private func applyColorAttachments(to buffer: CVPixelBuffer, forceSDR: Bool) {
+        let isHDR = streamLooksHDR && !forceSDR
         hdrMetadataApplied = isHDR
         CVBufferSetAttachment(
             buffer,
@@ -1653,22 +3445,22 @@ public final class MPVMetalSampleBufferRenderer {
         CVBufferSetAttachment(
             buffer,
             kCVImageBufferColorPrimariesKey,
-            colorPrimariesAttachmentValue() as CFTypeRef,
+            (forceSDR ? kCVImageBufferColorPrimaries_ITU_R_709_2 : colorPrimariesAttachmentValue()) as CFTypeRef,
             .shouldPropagate
         )
         CVBufferSetAttachment(
             buffer,
             kCVImageBufferTransferFunctionKey,
-            transferFunctionAttachmentValue() as CFTypeRef,
+            (forceSDR ? kCVImageBufferTransferFunction_ITU_R_709_2 : transferFunctionAttachmentValue()) as CFTypeRef,
             .shouldPropagate
         )
         CVBufferSetAttachment(
             buffer,
             kCVImageBufferYCbCrMatrixKey,
-            ycbcrMatrixAttachmentValue() as CFTypeRef,
+            (forceSDR ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 : ycbcrMatrixAttachmentValue()) as CFTypeRef,
             .shouldPropagate
         )
-        if let colorSpace = colorSpaceAttachmentValue() {
+        if let colorSpace = forceSDR ? CGColorSpace(name: CGColorSpace.sRGB) : colorSpaceAttachmentValue() {
             CVBufferSetAttachment(
                 buffer,
                 kCVImageBufferCGColorSpaceKey,
@@ -1678,8 +3470,11 @@ public final class MPVMetalSampleBufferRenderer {
         }
     }
 
-    private func currentColorMetadataSignature(pixelFormat: OSType) -> String {
-        [
+    private func currentColorMetadataSignature(pixelFormat: OSType, forceSDR: Bool) -> String {
+        if forceSDR {
+            return "\(pixelFormatDescription(pixelFormat))|bt709|bt709|bt709|sdr"
+        }
+        return [
             pixelFormatDescription(pixelFormat),
             colorPrimariesAttachmentValue() as String,
             transferFunctionAttachmentValue() as String,
@@ -1737,30 +3532,18 @@ public final class MPVMetalSampleBufferRenderer {
                 timebaseOut: &timebase
             ) == noErr, let timebase {
                 CMTimebaseSetTime(timebase, time: presentationTime)
-                CMTimebaseSetRate(timebase, rate: isPaused ? 0 : 1)
+                CMTimebaseSetRate(timebase, rate: sampleTimeline.effectiveRate)
                 displayLayer.controlTimebase = timebase
+                timelineIsAnchored = true
             }
         } else if let timebase = displayLayer.controlTimebase {
-            CMTimebaseSetTime(timebase, time: presentationTime)
-            CMTimebaseSetRate(timebase, rate: isPaused ? 0 : 1)
-        }
-    }
-
-    private func resetDisplayLayer(removingDisplayedImage: Bool) {
-        displayLayer.controlTimebase = nil
-        if #available(iOS 17.0, *) {
-            if removingDisplayedImage {
-                displayLayer.sampleBufferRenderer.flush(
-                    removingDisplayedImage: true,
-                    completionHandler: nil
-                )
-            } else {
-                displayLayer.sampleBufferRenderer.flush()
+            let current = CMTimebaseGetTime(timebase)
+            let drift = abs(CMTimeGetSeconds(current) - CMTimeGetSeconds(presentationTime))
+            if !timelineIsAnchored || !drift.isFinite || drift > 1.0 {
+                CMTimebaseSetTime(timebase, time: presentationTime)
+                timelineIsAnchored = true
             }
-        } else if removingDisplayedImage {
-            displayLayer.flushAndRemoveImage()
-        } else {
-            displayLayer.flush()
+            CMTimebaseSetRate(timebase, rate: sampleTimeline.effectiveRate)
         }
     }
 
@@ -1786,7 +3569,22 @@ public final class MPVMetalSampleBufferRenderer {
         onStateChange?(newState)
     }
 
+    private func updateRenderLifecycleFence() {
+        renderLifecycleFence.update(
+            engineGeneration: engineGeneration,
+            loadGeneration: loadGeneration,
+            isRunning: isRunning,
+            isStopping: isStopping
+        )
+    }
+
     private func reportError(_ message: String) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { @MainActor [weak self] in
+                self?.reportError(message)
+            }
+            return
+        }
         onError?(message)
         onDiagnostics?(diagnosticsSnapshot())
     }
@@ -1850,6 +3648,21 @@ public final class MPVMetalSampleBufferRenderer {
         var data: Int64 = 0
         let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_INT64, &data) }
         return status >= 0 ? Int(data) : nil
+    }
+
+    private func getInt64Property(_ name: String) -> Int64? {
+        guard let handle = mpv else { return nil }
+        var data: Int64 = 0
+        let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_INT64, &data) }
+        return status >= 0 ? data : nil
+    }
+
+    private func currentPlaylistEntryID() -> Int64? {
+        if let position = getInt64Property("playlist-pos"), position >= 0,
+           let playlistEntryID = getInt64Property("playlist/\(position)/id") {
+            return playlistEntryID
+        }
+        return getInt64Property("playlist/0/id")
     }
 
     private func fetchTrackList() -> [MPVMetalSampleBufferTrack] {
@@ -1926,17 +3739,20 @@ public final class MPVMetalSampleBufferRenderer {
         )
     }
 
-    private func performOnMain(_ block: @escaping () -> Void) {
-        if Thread.isMainThread {
-            block()
-        } else {
-            DispatchQueue.main.async(execute: block)
-        }
+    private func performOnMain(_ block: () -> Void) { block() }
+
+    /// Bridges actor-owned scheduling to the renderer's separately audited serial queue. The
+    /// handler itself is unchecked-Sendable because every captured mutable value is either owned
+    /// by `renderQueue` or guarded by `renderLifecycleFence`.
+    private func enqueueRenderWork(_ block: @escaping () -> Void) {
+        let handler = MPVMetalSampleBufferReadinessHandler(block)
+        renderQueue.async { handler() }
     }
 }
 
 #else
 
+@preconcurrency @MainActor
 public final class MPVMetalSampleBufferRenderer {
     public static let isSupported = false
     public let displayLayer: AVSampleBufferDisplayLayer
@@ -1960,12 +3776,28 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     public func stop() {}
+    public func waitUntilStopped() async {}
+    public func waitForTimelineUpdate(requiringCurrentFrame: Bool = false) async -> Bool {
+        _ = requiringCurrentFrame
+        return false
+    }
     public func load(_ url: URL, headers: [String: String]? = nil) { _ = url; _ = headers }
+    func load(
+        _ url: URL,
+        headers: [String: String]? = nil,
+        preservingDisplayedImage: Bool
+    ) {
+        _ = url
+        _ = headers
+        _ = preservingDisplayedImage
+    }
     public func play() {}
     public func pause() {}
     public func seek(to seconds: Double) { _ = seconds }
     public func seek(by seconds: Double) { _ = seconds }
+    @available(*, deprecated, message: "Use MPVGPUPlayerRenderer.preparePictureInPicture() async throws")
     public func primeFrames(reason: String = "manual", count: Int = 6) { _ = reason; _ = count }
+    func primeCompatibilityFrames(reason: String, count: Int) { _ = reason; _ = count }
     public func updateOptions(_ newOptions: MPVMetalSampleBufferRendererOptions) { _ = newOptions }
     public func setSpeed(_ speed: Double) { _ = speed }
     public func getSpeed() -> Double { 1.0 }
@@ -2009,7 +3841,15 @@ public final class MPVMetalSampleBufferRenderer {
             videoTransferFunction: "",
             videoSignalPeak: 0,
             renderAPI: "unsupported",
-            backendDescription: "unsupported"
+            backendDescription: "unsupported",
+            coalescedRenderRequestCount: 0,
+            backpressureDropCount: 0,
+            poolExhaustionDropCount: 0,
+            staleGenerationDropCount: 0,
+            inFlightGPUFrameCount: 0,
+            lastGPULatencyMilliseconds: 0,
+            timelineEpoch: 0,
+            timelineRate: 0
         )
     }
 }

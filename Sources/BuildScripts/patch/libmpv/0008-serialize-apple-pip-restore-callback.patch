@@ -1,0 +1,194 @@
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 873c194..9c9c941 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -152,6 +152,10 @@ struct apple_pip_state {
+     bool shutting_down;
+     bool force_redraw_armed;
+     bool inline_probe_armed;
++    bool inline_callback_pending;
++    bool inline_callback_in_progress;
++    uint64_t inline_callback_generation;
++    double inline_callback_pts;
+     uint32_t mode;
+     uint64_t generation;
+     mpv_apple_pip_frame_callback callback;
+@@ -293,6 +297,14 @@ static bool apple_pip_has_slots_locked(struct apple_pip_state *state)
+     return false;
+ }
+ 
++static bool apple_pip_has_completion_work_locked(
++    struct apple_pip_state *state)
++{
++    return apple_pip_has_slots_locked(state) ||
++           state->inline_callback_pending ||
++           state->inline_callback_in_progress;
++}
++
+ static bool apple_pip_claim_forced_redraw_locked(
+     struct apple_pip_state *state)
+ {
+@@ -358,30 +370,22 @@ static void apple_pip_metal_blit_complete(void *opaque, bool success)
+ static void apple_pip_signal_inline_presented(struct priv *p)
+ {
+     struct apple_pip_state *state = &p->apple_pip;
+-    mpv_apple_pip_frame_callback callback = NULL;
+-    void *callback_ctx = NULL;
+-    struct mpv_apple_pip_frame frame = {0};
+-
+     mp_mutex_lock(&state->lock);
+-    if (!state->inline_probe_armed || !state->callback) {
++    if (!state->inline_probe_armed || !state->callback ||
++        state->shutting_down) {
+         mp_mutex_unlock(&state->lock);
+         return;
+     }
+-    callback = state->callback;
+-    callback_ctx = state->callback_ctx;
+-    frame = (struct mpv_apple_pip_frame) {
+-        .struct_size = sizeof(frame),
+-        .status = MPV_APPLE_PIP_FRAME_READY,
+-        .token = 0,
+-        .generation = state->generation,
+-        .pts = p->last_pts,
+-    };
++
++    // Queue targetless restore readiness on the same completion worker used by
++    // IOSurface fences. This keeps callbacks off the VO thread and makes the
++    // disable/uninit drain barriers cover every callback kind.
++    state->inline_callback_pending = true;
++    state->inline_callback_generation = state->generation;
++    state->inline_callback_pts = p->last_pts;
+     state->inline_probe_armed = false;
++    mp_cond_broadcast(&state->wakeup);
+     mp_mutex_unlock(&state->lock);
+-
+-    // Token zero is a presentation notification, not an IOSurface fence. Invoke
+-    // it after dropping the native lock so callback code may safely change mode.
+-    callback(callback_ctx, &frame);
+ }
+ 
+ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+@@ -395,9 +399,39 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+         struct apple_pip_slot *slot = NULL;
+         pl_tex tex = NULL;
+         bool needs_poll = false;
++        bool deliver_inline = false;
++        struct mpv_apple_pip_frame inline_frame = {0};
++        mpv_apple_pip_frame_callback inline_callback = NULL;
++        void *inline_callback_ctx = NULL;
+ 
+         mp_mutex_lock(&state->lock);
+         for (;;) {
++            if (state->inline_callback_pending) {
++                if (!state->shutting_down && state->callback &&
++                    state->inline_callback_generation == state->generation) {
++                    inline_frame = (struct mpv_apple_pip_frame) {
++                        .struct_size = sizeof(inline_frame),
++                        .status = MPV_APPLE_PIP_FRAME_READY,
++                        .token = 0,
++                        .generation = state->inline_callback_generation,
++                        .pts = state->inline_callback_pts,
++                    };
++                    inline_callback = state->callback;
++                    inline_callback_ctx = state->callback_ctx;
++                    state->inline_callback_pending = false;
++                    state->inline_callback_in_progress = true;
++                    deliver_inline = true;
++                } else {
++                    // A cleared callback or generation change invalidates a
++                    // notification that has not yet been claimed.
++                    state->inline_callback_pending = false;
++                    mp_cond_broadcast(&state->wakeup);
++                }
++            }
++
++            if (deliver_inline)
++                break;
++
+             for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
+                 struct apple_pip_slot *candidate = &state->slots[i];
+                 enum apple_pip_slot_state s = candidate->state;
+@@ -416,11 +450,21 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+             }
+ 
+             if (slot || (state->shutting_down &&
+-                         !apple_pip_has_slots_locked(state)))
++                         !apple_pip_has_completion_work_locked(state)))
+                 break;
+             mp_cond_wait(&state->wakeup, &state->lock);
+         }
+ 
++        if (deliver_inline) {
++            mp_mutex_unlock(&state->lock);
++            inline_callback(inline_callback_ctx, &inline_frame);
++            mp_mutex_lock(&state->lock);
++            state->inline_callback_in_progress = false;
++            mp_cond_broadcast(&state->wakeup);
++            mp_mutex_unlock(&state->lock);
++            continue;
++        }
++
+         if (!slot) {
+             mp_mutex_unlock(&state->lock);
+             break;
+@@ -546,6 +590,7 @@ static void apple_pip_uninit(struct vo *vo)
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+     state->force_redraw_armed = false;
+     state->inline_probe_armed = false;
++    state->inline_callback_pending = false;
+     state->callback = NULL;
+     state->callback_ctx = NULL;
+     state->shutting_down = true;
+@@ -732,10 +777,15 @@ static int apple_pip_set_callback(struct priv *p,
+         return MPV_APPLE_PIP_UNSUPPORTED;
+ 
+     mp_mutex_lock(&state->lock);
++    bool callback_changed = state->callback != config->callback ||
++                            state->callback_ctx != config->callback_ctx;
++    if (callback_changed)
++        state->inline_callback_pending = false;
+     state->callback = config->callback;
+     state->callback_ctx = config->callback_ctx;
+     if (!config->callback)
+         state->inline_probe_armed = false;
++    mp_cond_broadcast(&state->wakeup);
+     mp_mutex_unlock(&state->lock);
+     return MPV_APPLE_PIP_OK;
+ }
+@@ -761,8 +811,11 @@ static int apple_pip_set_mode(struct vo *vo,
+                       state->mode != MPV_APPLE_PIP_MODE_DUAL_OUTPUT_WARMUP;
+     bool new_restore = config->mode == MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE &&
+                        state->mode != MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE;
+-    if (new_generation)
++    if (new_generation) {
+         apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_STALE);
++        state->inline_callback_pending = false;
++        mp_cond_broadcast(&state->wakeup);
++    }
+     state->generation = config->generation;
+     state->mode = config->mode;
+     if (config->mode == MPV_APPLE_PIP_MODE_INLINE_ONLY) {
+@@ -941,10 +994,11 @@ static int apple_pip_disable_and_drain(struct priv *p)
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+     state->force_redraw_armed = false;
+     state->inline_probe_armed = false;
++    state->inline_callback_pending = false;
+     state->callback = NULL;
+     state->callback_ctx = NULL;
+     apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
+-    while (apple_pip_has_slots_locked(state))
++    while (apple_pip_has_completion_work_locked(state))
+         mp_cond_wait(&state->wakeup, &state->lock);
+     mp_mutex_unlock(&state->lock);
+     return MPV_APPLE_PIP_OK;
+@@ -2327,7 +2381,8 @@ done:
+ #endif
+     p->frame_pending = have_inline;
+ #if HAVE_APPLE_GPU_PIP
+-    p->apple_pip_inline_frame_valid = have_inline && valid && frame->current;
++    p->apple_pip_inline_frame_valid = have_inline && valid && frame->current &&
++                                      mix.num_frames > 0;
+ #endif
+     return VO_TRUE;
+ }

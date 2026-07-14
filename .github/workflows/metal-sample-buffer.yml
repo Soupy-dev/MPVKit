@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       run_native_build:
-        description: "Build iOS and iOS simulator xcframework artifacts"
+        description: "Build iOS, tvOS, and arm64 macOS xcframework artifacts"
         required: false
         default: "false"
       luna_repository:
@@ -44,6 +44,38 @@ jobs:
           test -d Demo/Demo-iOS/Demo-iOS/Player/OpenGL
           grep -R -n 'ios-sample-buffer' Sources/BuildScripts/patch/libmpv Sources/BuildScripts/XCFrameworkBuild/main.swift
 
+      - name: Verify native patch chain
+        run: |
+          bash Scripts/check-native-patches.sh
+          bash Scripts/check-apple-pip-native.sh
+
+      - name: Verify wrapper parity
+        run: bash Scripts/check-sample-buffer-parity.sh
+
+      - name: Validate package manifests and core state tests
+        run: |
+          set -euo pipefail
+          swift package dump-package >/dev/null
+          swift test --filter MPVKitSampleBufferCoreTests
+          swift build --triple arm64-apple-macosx11.0 --target MPVKitSampleBufferGPL
+
+      - name: Validate local binary-artifact routing
+        run: |
+          set -euo pipefail
+          direct_root=dist/local-artifact-direct-test
+          nested_root=dist/local-artifact-nested-test
+          mkdir -p "$direct_root/Libmpv.xcframework"
+          MPVKIT_LOCAL_ARTIFACTS_DIR="$direct_root" swift package dump-package \
+            | grep -F 'dist/local-artifact-direct-test/Libmpv.xcframework'
+          mkdir -p "$nested_root/xcframework/Libmpv.xcframework"
+          touch "$nested_root/Libmpv-GPL.xcframework.zip"
+          MPVKIT_LOCAL_ARTIFACTS_DIR="$nested_root" swift package dump-package \
+            | grep -F 'dist/local-artifact-nested-test/xcframework/Libmpv.xcframework'
+          rmdir "$direct_root/Libmpv.xcframework" "$direct_root"
+          unlink "$nested_root/Libmpv-GPL.xcframework.zip"
+          rmdir "$nested_root/xcframework/Libmpv.xcframework"
+          rmdir "$nested_root/xcframework" "$nested_root"
+
       - name: Resolve demo packages
         run: |
           xcodebuild -resolvePackageDependencies \
@@ -63,39 +95,153 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      - name: Build Demo-tvOS for simulator
+        run: |
+          xcodebuild \
+            -project Demo/Demo-tvOS/Demo-tvOS.xcodeproj \
+            -scheme Demo-tvOS \
+            -configuration Debug \
+            -sdk appletvsimulator \
+            -destination 'generic/platform=tvOS Simulator' \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build Demo-macOS for Apple Silicon
+        run: |
+          xcodebuild \
+            -project Demo/Demo-macOS/Demo-macOS.xcodeproj \
+            -scheme Demo-macOS \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
   native-artifacts:
     if: github.event_name == 'workflow_dispatch' && inputs.run_native_build == 'true'
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [gpl, lgpl]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
-          brew install autoconf automake libtool ninja
+          brew install autoconf automake cmake libtool nasm ninja pkg-config
           python -m pip install meson==1.4.2
 
-      - name: Build GPL iOS artifacts
+      - name: Build ${{ matrix.flavor }} Apple-platform artifacts
         run: |
-          make build enable-gpl platform=ios
-          mkdir -p artifacts/gpl
+          build_args=()
+          if [[ "${{ matrix.flavor }}" == "gpl" ]]; then
+            build_args+=(enable-gpl)
+          fi
+          make build "${build_args[@]}" platform=ios,tvos,macos
+          bash Scripts/check-built-apple-symbols.sh
+          mkdir -p "artifacts/${{ matrix.flavor }}"
           cd dist/release
-          for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter Libavutil Libswresample Libswscale; do
-            mv "${name}.xcframework.zip" "${name}-GPL.xcframework.zip"
-            mv "${name}.xcframework.checksum.txt" "${name}-GPL.xcframework.checksum.txt"
-          done
-          for name in libmpv FFmpeg; do
-            if [ -f "${name}-all.zip" ]; then
-              mv "${name}-all.zip" "${name}-GPL-all.zip"
-            fi
-          done
+          if [[ "${{ matrix.flavor }}" == "gpl" ]]; then
+            for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter Libavutil Libswresample Libswscale; do
+              mv "${name}.xcframework.zip" "${name}-GPL.xcframework.zip"
+              mv "${name}.xcframework.checksum.txt" "${name}-GPL.xcframework.checksum.txt"
+            done
+            for name in libmpv FFmpeg; do
+              if [ -f "${name}-all.zip" ]; then
+                mv "${name}-all.zip" "${name}-GPL-all.zip"
+              fi
+            done
+          fi
           cd ../..
-          cp dist/release/*.zip dist/release/Package.swift artifacts/gpl/
-          shasum -a 256 artifacts/gpl/*.zip artifacts/gpl/Package.swift > artifacts/gpl/checksums.sha256
+          cp dist/release/*.zip dist/release/Package.swift "artifacts/${{ matrix.flavor }}/"
+          shasum -a 256 "artifacts/${{ matrix.flavor }}"/*.zip \
+            "artifacts/${{ matrix.flavor }}/Package.swift" \
+            > "artifacts/${{ matrix.flavor }}/checksums.sha256"
+
+      - name: Validate ${{ matrix.flavor }} wrappers and demos against fresh artifacts
+        env:
+          MPVKIT_LOCAL_ARTIFACTS_DIR: ${{ github.workspace }}/dist/release
+        run: |
+          set -euo pipefail
+
+          # Exercise the manifest generated by this exact native build. The LGPL matrix uses the
+          # non-GPL wrapper/product; the GPL matrix uses the release GPL wrapper/product.
+          cp dist/release/Package.swift Package.swift
+          if [[ "${{ matrix.flavor }}" == "gpl" ]]; then
+            wrapper_target=MPVKitSampleBufferGPL
+          else
+            wrapper_target=MPVKitSampleBuffer
+            for project in \
+              Demo/Demo-iOS/Demo-iOS.xcodeproj/project.pbxproj \
+              Demo/Demo-tvOS/Demo-tvOS.xcodeproj/project.pbxproj \
+              Demo/Demo-macOS/Demo-macOS.xcodeproj/project.pbxproj; do
+              sed -i '' 's/productName = "MPVKit-GPL";/productName = MPVKit;/' "$project"
+            done
+            for source in \
+              Demo/Demo-iOS/Demo-iOS/ContentView.swift \
+              Demo/Demo-tvOS/Demo-tvOS/ContentView.swift \
+              Demo/Demo-macOS/Demo-macOS/ContentView.swift; do
+              sed -i '' 's/import MPVKitSampleBufferGPL/import MPVKitSampleBuffer/' "$source"
+            done
+          fi
+
+          swift package dump-package \
+            | grep -E 'dist/release/(xcframework/)?Libmpv(-GPL)?\.xcframework(\.zip)?'
+          swift build --triple arm64-apple-macosx11.0 --target "$wrapper_target"
+
+          build_demo() {
+            local project="$1"
+            local scheme="$2"
+            local sdk="$3"
+            local destination="$4"
+            local derived_data="$5"
+            xcodebuild \
+              -project "$project" \
+              -scheme "$scheme" \
+              -configuration Debug \
+              -sdk "$sdk" \
+              -destination "$destination" \
+              -derivedDataPath "$RUNNER_TEMP/$derived_data" \
+              CODE_SIGN_IDENTITY="-" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              build
+          }
+
+          build_demo Demo/Demo-iOS/Demo-iOS.xcodeproj Demo-iOS \
+            iphonesimulator 'generic/platform=iOS Simulator' "demo-ios-simulator-${{ matrix.flavor }}"
+          build_demo Demo/Demo-iOS/Demo-iOS.xcodeproj Demo-iOS \
+            iphoneos 'generic/platform=iOS' "demo-ios-device-${{ matrix.flavor }}"
+          build_demo Demo/Demo-tvOS/Demo-tvOS.xcodeproj Demo-tvOS \
+            appletvsimulator 'generic/platform=tvOS Simulator' "demo-tvos-simulator-${{ matrix.flavor }}"
+          build_demo Demo/Demo-tvOS/Demo-tvOS.xcodeproj Demo-tvOS \
+            appletvos 'generic/platform=tvOS' "demo-tvos-device-${{ matrix.flavor }}"
+          ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build_demo \
+            Demo/Demo-macOS/Demo-macOS.xcodeproj Demo-macOS \
+            macosx 'generic/platform=macOS' "demo-macos-arm64-${{ matrix.flavor }}"
+
+      - name: Exercise the native gpu-next PiP runtime
+        if: runner.arch == 'ARM64'
+        env:
+          MPVKIT_LOCAL_ARTIFACTS_DIR: ${{ github.workspace }}/dist/release
+          MPVKIT_NATIVE_RUNTIME_REQUIRED: "1"
+        run: bash Scripts/check-apple-pip-runtime.sh
+
+      - name: Report unavailable native runtime gate
+        if: runner.arch != 'ARM64'
+        run: |
+          echo "::notice::Native gpu-next PiP runtime validation requires an Apple Silicon runner; artifact, ABI, wrapper, and demo checks still ran."
 
       - name: Upload sample-buffer artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mpvkit-ios-sample-buffer-artifacts
+          name: mpvkit-apple-sample-buffer-artifacts-${{ matrix.flavor }}
           path: |
             artifacts/**
           if-no-files-found: error
