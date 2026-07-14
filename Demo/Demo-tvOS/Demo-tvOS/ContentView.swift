@@ -52,7 +52,7 @@ struct ContentView: View {
 
             if player.isLoading {
                 ProgressView()
-                    .controlSize(.large)
+                    .scaleEffect(1.5)
             }
         }
         // Remote commands use the same ordered renderer -> timebase -> AVKit path as PiP controls.
