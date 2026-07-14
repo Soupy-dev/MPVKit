@@ -119,7 +119,7 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer {
     #endif
 }
 
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import Libmpv
 import Metal
 import UIKit
@@ -158,10 +158,11 @@ public final class MPVGPUPlayerRenderer {
     public var onStateChange: ((MPVGPUPlayerRendererState) -> Void)?
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
-    /// Fired on the main thread when the decoded video parameters may have changed (file loaded or
-    /// VIDEO_RECONFIG). The token is the generation submitted with `load`, allowing hosts to reject
-    /// late events from a replaced item.
-    public var onVideoReconfigure: ((UInt64) -> Void)?
+    /// Fired on the main thread when decoded video parameters may have changed.
+    public var onVideoReconfigure: (() -> Void)?
+    /// Generation-aware counterpart for hosts that replace loads rapidly and must reject late
+    /// FILE_LOADED / VIDEO_RECONFIG events from an older item.
+    public var onVideoReconfigureForGeneration: ((UInt64) -> Void)?
 
     private var options: MPVGPUPlayerRendererOptions
     /// The active mpv audio-filter chain (`af`), kept so it can be re-applied to the PiP renderer
@@ -228,7 +229,7 @@ public final class MPVGPUPlayerRenderer {
         stop()
     }
 
-    public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat = UIScreen.main.nativeScale) {
+    public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat? = nil) {
         performOnMain {
             // Resize the inline Metal surface with implicit Core Animation actions disabled. The
             // layer is a manually-managed sublayer (not a view's backing layer), so frame /
@@ -237,10 +238,11 @@ public final class MPVGPUPlayerRenderer {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             self.inlineLayer.frame = bounds
-            self.inlineLayer.contentsScale = contentsScale
+            let resolvedScale = contentsScale ?? self.presentationScale
+            self.inlineLayer.contentsScale = resolvedScale
             self.inlineLayer.drawableSize = CGSize(
-                width: max(2, bounds.width * contentsScale),
-                height: max(2, bounds.height * contentsScale)
+                width: max(2, bounds.width * resolvedScale),
+                height: max(2, bounds.height * resolvedScale)
             )
             CATransaction.commit()
         }
@@ -691,10 +693,19 @@ public final class MPVGPUPlayerRenderer {
     private func configureInlineLayer() {
         inlineLayer.framebufferOnly = true
         inlineLayer.backgroundColor = UIColor.black.cgColor
-        inlineLayer.contentsScale = UIScreen.main.nativeScale
+        inlineLayer.contentsScale = presentationScale
+        #if os(iOS)
         if #available(iOS 16.0, macCatalyst 16.0, *) {
             inlineLayer.wantsExtendedDynamicRangeContent = options.enablesTargetColorspaceHint
         }
+        #endif
+    }
+
+    /// Resolve scale from the screen currently hosting the layer. The main-screen fallback keeps
+    /// configuration deterministic before the layer is attached to a view hierarchy.
+    private var presentationScale: CGFloat {
+        inlineLayer.delegate.flatMap { ($0 as? UIView)?.window?.screen.nativeScale }
+            ?? UIScreen.main.nativeScale
     }
 
     private func configurePictureInPictureCallbacks() {
@@ -799,11 +810,11 @@ public final class MPVGPUPlayerRenderer {
                 performOnMain {
                     self.updateState(self.isPaused ? .paused : .playing)
                     self.emitDiagnostics()
-                    self.onVideoReconfigure?(generation)
+                    self.notifyVideoReconfigure(generation: generation)
                 }
             case MPV_EVENT_VIDEO_RECONFIG:
                 let generation = currentEventLoadGeneration()
-                performOnMain { self.onVideoReconfigure?(generation) }
+                performOnMain { self.notifyVideoReconfigure(generation: generation) }
             case MPV_EVENT_END_FILE:
                 // Surface decode/IO failures the host's onError can act on (the log-message scan
                 // alone misses some). Only report genuine error terminations, not normal EOF/stop.
@@ -860,7 +871,7 @@ public final class MPVGPUPlayerRenderer {
         case "video-params/gamma", "video-params/primaries", "video-params/sig-peak":
             // Colorspace/HDR characteristics resolved or changed — let the host re-evaluate HDR.
             emitDiagnostics()
-            onVideoReconfigure?(generation)
+            notifyVideoReconfigure(generation: generation)
         default:
             break
         }
@@ -903,6 +914,11 @@ public final class MPVGPUPlayerRenderer {
         pendingLoadGenerations.removeAll(keepingCapacity: false)
         activeEventLoadGeneration = 0
         loadGenerationLock.unlock()
+    }
+
+    private func notifyVideoReconfigure(generation: UInt64) {
+        onVideoReconfigure?()
+        onVideoReconfigureForGeneration?(generation)
     }
 
     private func updateHTTPHeaders(_ headers: [String: String]?) {
@@ -1118,6 +1134,7 @@ public final class MPVGPUPlayerRenderer {
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
     public var onVideoReconfigure: (() -> Void)?
+    public var onVideoReconfigureForGeneration: ((UInt64) -> Void)?
 
     public convenience init(options: MPVGPUPlayerRendererOptions = MPVGPUPlayerRendererOptions()) {
         self.init(
@@ -1137,7 +1154,7 @@ public final class MPVGPUPlayerRenderer {
         _ = options
     }
 
-    public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat = 1) { _ = bounds; _ = contentsScale }
+    public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat? = nil) { _ = bounds; _ = contentsScale }
     public func updateOptions(_ newOptions: MPVGPUPlayerRendererOptions) { _ = newOptions }
     public func start() throws { throw MPVMetalSampleBufferRendererError.unsupportedPlatform }
     public func stop() {}

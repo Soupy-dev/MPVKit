@@ -1,6 +1,9 @@
 name: Metal Sample Buffer
 
 on:
+  push:
+    branches:
+      - eclipse-mpv-metal
   pull_request:
   workflow_dispatch:
     inputs:

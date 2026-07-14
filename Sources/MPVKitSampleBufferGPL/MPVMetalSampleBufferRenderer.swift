@@ -129,7 +129,7 @@ public enum MPVMetalSampleBufferRendererError: Error, LocalizedError, Equatable 
     public var errorDescription: String? {
         switch self {
         case .unsupportedPlatform:
-            return "MPVMetalSampleBufferRenderer is only available on iOS."
+            return "MPVMetalSampleBufferRenderer is only available on iOS and tvOS."
         case .metalUnavailable:
             return "Metal is unavailable on this device."
         case .mpvCreationFailed:
@@ -144,7 +144,7 @@ public enum MPVMetalSampleBufferRendererError: Error, LocalizedError, Equatable 
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import Darwin
 import Libmpv
 import Metal
@@ -612,23 +612,25 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     private var displayRenderingStatus: AVQueuedSampleBufferRenderingStatus {
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, *) {
             return displayLayer.sampleBufferRenderer.status
         }
         return displayLayer.status
     }
 
     private var displayRendererReadyForMoreMediaData: Bool {
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, *) {
             return displayLayer.sampleBufferRenderer.isReadyForMoreMediaData
         }
         return displayLayer.isReadyForMoreMediaData
     }
 
     private func applyDisplayLayerDynamicRangePreference() {
+        #if os(iOS)
         if #available(iOS 17.0, *) {
             displayLayer.wantsExtendedDynamicRangeContent = options.prefersHDRPresentation
         }
+        #endif
     }
 
     private func createRenderContext(handle: OpaquePointer) -> Int32 {
@@ -791,7 +793,7 @@ public final class MPVMetalSampleBufferRenderer {
     private func applyDisplayLinkFrameRate() {
         guard let link = displayLink else { return }
         let fps = max(1, options.preferredFramesPerSecond)
-        if #available(iOS 15.0, *) {
+        if #available(iOS 15.0, tvOS 15.0, *) {
             link.preferredFrameRateRange = CAFrameRateRange(
                 minimum: Float(min(options.preferredPiPFramesPerSecond, fps)),
                 maximum: Float(fps),
@@ -1047,13 +1049,18 @@ public final class MPVMetalSampleBufferRenderer {
         let source = videoSize.width > 0 && videoSize.height > 0
             ? videoSize
             : CGSize(
-                width: max(1, displayLayer.bounds.width * UIScreen.main.scale),
-                height: max(1, displayLayer.bounds.height * UIScreen.main.scale)
+                width: max(1, displayLayer.bounds.width * presentationScale),
+                height: max(1, displayLayer.bounds.height * presentationScale)
             )
         guard source.width > 0, source.height > 0 else { return nil }
         let maxSize = options.maximumFrameSize
         let scale = min(maxSize.width / source.width, maxSize.height / source.height, 1.0)
         return CGSize(width: max(1, floor(source.width * scale)), height: max(1, floor(source.height * scale)))
+    }
+
+    private var presentationScale: CGFloat {
+        displayLayer.delegate.flatMap { ($0 as? UIView)?.window?.screen.scale }
+            ?? UIScreen.main.scale
     }
 
     private func recreatePixelBufferPool(width: Int, height: Int) {
@@ -1588,7 +1595,7 @@ public final class MPVMetalSampleBufferRenderer {
         // Use timestamped presentation with a control timebase. AVFoundation explicitly
         // discourages combining that model with kCMSampleAttachmentKey_DisplayImmediately.
         ensureTimebase(at: presentationTime)
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, *) {
             displayLayer.sampleBufferRenderer.enqueue(sampleBuffer)
         } else {
             displayLayer.enqueue(sampleBuffer)
@@ -1758,7 +1765,7 @@ public final class MPVMetalSampleBufferRenderer {
 
     private func resetDisplayLayer(removingDisplayedImage: Bool) {
         displayLayer.controlTimebase = nil
-        if #available(iOS 17.0, *) {
+        if #available(iOS 17.0, tvOS 17.0, *) {
             if removingDisplayedImage {
                 displayLayer.sampleBufferRenderer.flush(
                     removingDisplayedImage: true,

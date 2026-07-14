@@ -115,8 +115,9 @@ jobs:
       - name: Upload binary to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ contains(env.RELEASE_VERSION, '-') && env.RELEASE_VERSION || env.BUILD_VERSION }}
+          name: ${{ env.RELEASE_VERSION }}
           tag_name: ${{ env.RELEASE_VERSION }}
+          target_commitish: ${{ github.ref_name }}
           files: |
             ./dist/release/*.txt
             ./dist/release/*.zip
