@@ -167,6 +167,8 @@ public final class MPVGPUPlayerRenderer {
                 maximumFrameSize: options.maximumPiPFrameSize,
                 preferredFramesPerSecond: options.preferredPiPFramesPerSecond,
                 preferredPiPFramesPerSecond: options.preferredPiPFramesPerSecond,
+                createsMetalCompatibilityProbe: false,
+                prefersMetalPresentation: false,
                 prefersHDRPresentation: false,
                 prefersHighBitDepthRendering: false
             )
@@ -200,6 +202,8 @@ public final class MPVGPUPlayerRenderer {
                     maximumFrameSize: newOptions.maximumPiPFrameSize,
                     preferredFramesPerSecond: newOptions.preferredPiPFramesPerSecond,
                     preferredPiPFramesPerSecond: newOptions.preferredPiPFramesPerSecond,
+                    createsMetalCompatibilityProbe: false,
+                    prefersMetalPresentation: false,
                     prefersHDRPresentation: false,
                     prefersHighBitDepthRendering: false
                 )
@@ -308,12 +312,17 @@ public final class MPVGPUPlayerRenderer {
         performOnMain {
             self.currentURL = url
             self.currentHeaders = headers
+            if self.isPictureInPictureActive {
+                self.setStringProperty("vid", "auto")
+            }
             if self.isPictureInPicturePrepared || self.isPictureInPictureActive {
                 self.pictureInPictureRenderer.pause()
                 self.pictureInPictureRenderer.stop()
             }
             self.isPictureInPicturePrepared = false
             self.isPictureInPictureActive = false
+            self.cachedPosition = 0
+            self.cachedDuration = 0
             guard self.mpv != nil else { return }
             self.updateState(.loading)
             self.updateHTTPHeaders(headers)
@@ -392,7 +401,9 @@ public final class MPVGPUPlayerRenderer {
                 return
             }
             if self.isPictureInPicturePrepared {
-                self.pictureInPictureRenderer.seek(to: self.cachedPosition)
+                if abs(self.cachedPosition - self.pictureInPictureRenderer.currentTime) > 0.25 {
+                    self.pictureInPictureRenderer.seek(to: self.cachedPosition)
+                }
                 self.pictureInPictureRenderer.primeFrames(reason: "gpu-player-pip-prepare", count: primeFrameCount)
                 result = true
                 self.emitDiagnostics()
@@ -416,8 +427,12 @@ public final class MPVGPUPlayerRenderer {
         performOnMain {
             guard self.prepareForPictureInPictureStart() else { return }
             self.wasPausedBeforePictureInPicture = self.isPaused
+            // Sync the PiP renderer to the live inline position only when it drifted while priming.
+            // Avoiding a redundant same-position seek prevents unnecessary re-decode at PiP start.
             let handoffPosition = self.cachedPosition
-            self.pictureInPictureRenderer.seek(to: handoffPosition)
+            if abs(handoffPosition - self.pictureInPictureRenderer.currentTime) > 0.25 {
+                self.pictureInPictureRenderer.seek(to: handoffPosition)
+            }
             self.pictureInPictureRenderer.setSpeed(self.getSpeed())
             if self.options.pausesInlineRendererDuringPictureInPicture {
                 self.setFlagProperty("pause", true)

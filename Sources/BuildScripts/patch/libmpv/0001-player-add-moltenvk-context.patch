@@ -61,7 +61,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe24b51708
 --- /dev/null
 +++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,175 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -91,52 +91,57 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +struct priv {
 +    struct mpvk_ctx vk;
 +    CAMetalLayer *layer;
-+    CGSize last_drawable_size;
++    int last_width;
++    int last_height;
++    bool has_reconfigured;
 +};
 +
-+static bool drawable_size_valid(CGSize size)
++static bool moltenvk_drawable_size(struct priv *p, int *width, int *height)
 +{
-+    return isfinite(size.width) && isfinite(size.height) &&
-+           size.width > 1.0 && size.height > 1.0;
-+}
-+
-+static bool drawable_size_changed(CGSize current, CGSize previous)
-+{
-+    return fabs(current.width - previous.width) >= 1.0 ||
-+           fabs(current.height - previous.height) >= 1.0;
-+}
-+
-+static bool moltenvk_resize_to_size(struct ra_ctx *ctx, CGSize size,
-+                                    const char *reason)
-+{
-+    struct priv *p = ctx->priv;
-+    if (!drawable_size_valid(size))
++    if (!p->layer)
 +        return false;
 +
-+    int width = MPMAX(1, (int)llround(size.width));
-+    int height = MPMAX(1, (int)llround(size.height));
++    CGSize size = p->layer.drawableSize;
++    if (!isfinite(size.width) || !isfinite(size.height) ||
++        size.width <= 1.0 || size.height <= 1.0)
++        return false;
++
++    *width = MPMAX(2, (int)llround(size.width));
++    *height = MPMAX(2, (int)llround(size.height));
++    return true;
++}
++
++static bool moltenvk_resize(struct ra_ctx *ctx, int width, int height,
++                            const char *reason)
++{
++    struct priv *p = ctx->priv;
 +    CGColorSpaceRef previous_color_space = p->layer.colorspace;
 +    if (previous_color_space)
 +        CFRetain(previous_color_space);
 +
++    // `ra_vk_ctx_resize` writes vo->dwidth/dheight from the actual extent
++    // returned by pl_swapchain_resize. Do not overwrite those values with
++    // the requested drawable size: the Vulkan surface may clamp its extent.
 +    bool ok = ra_vk_ctx_resize(ctx, width, height);
 +    if (previous_color_space) {
 +        p->layer.colorspace = previous_color_space;
 +        CFRelease(previous_color_space);
 +    }
 +    if (!ok) {
-+        MP_WARN(ctx, "surface resize to %dx%d failed reason=%s; will retry\n",
++        MP_WARN(ctx, "surface resize requested=%dx%d failed reason=%s; will retry\n",
 +                width, height, reason ? reason : "unknown");
 +        return false;
 +    }
 +
-+    ctx->vo->dwidth = width;
-+    ctx->vo->dheight = height;
-+    p->last_drawable_size = size;
-+
-+    MP_VERBOSE(ctx, "surface resized to %dx%d reason=%s\n", width, height,
++    // Cache the requested CAMetalLayer extent, not vo->dwidth/dheight, so
++    // an implementation-selected swapchain extent does not cause every
++    // VOCTRL_CHECK_EVENTS poll to request the same resize again.
++    p->last_width = width;
++    p->last_height = height;
++    MP_VERBOSE(ctx, "surface resize requested=%dx%d applied=%dx%d reason=%s\n",
++               width, height, ctx->vo->dwidth, ctx->vo->dheight,
 +               reason ? reason : "unknown");
-+    return ok;
++    return true;
 +}
 +
 +static void moltenvk_uninit(struct ra_ctx *ctx)
@@ -187,16 +192,18 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +static bool moltenvk_reconfig(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv;
-+    if (!p->layer)
-+        return false;
++    int width, height;
 +
-+    CGSize size = p->layer.drawableSize;
-+    if (!drawable_size_valid(size)) {
-+        MP_VERBOSE(ctx, "deferring surface resize for invalid drawable %.2fx%.2f\n",
-+                   size.width, size.height);
++    // VOCTRL_CHECK_EVENTS can run after context initialization but before
++    // the first video reconfig. Mark that boundary so event polling cannot
++    // create a swapchain and then have this path immediately recreate it.
++    p->has_reconfigured = true;
++    if (!moltenvk_drawable_size(p, &width, &height)) {
++        MP_VERBOSE(ctx, "deferring surface resize until drawable is valid\n");
 +        return true;
 +    }
-+    return moltenvk_resize_to_size(ctx, size, "reconfig");
++
++    return moltenvk_resize(ctx, width, height, "reconfig");
 +}
 +
 +static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
@@ -206,15 +213,17 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +    if (request == VOCTRL_CHECK_EVENTS && p->layer) {
 +        // The vulkan swapchain does not auto-track the CAMetalLayer's
 +        // drawableSize; mpv only learns about a surface size change when we
-+        // report it here. gpu-next's generic Vulkan resize hook is a no-op,
-+        // so resize the Vulkan RA context directly before exposing the new
-+        // geometry to the VO. This keeps the swapchain and CAMetalLayer in
-+        // agreement through iPad rotation and Stage Manager resizing.
-+        CGSize s = p->layer.drawableSize;
-+        if (drawable_size_valid(s) &&
-+            drawable_size_changed(s, p->last_drawable_size)) {
-+            if (moltenvk_resize_to_size(ctx, s, "size-changed"))
-+                *events |= VO_EVENT_RESIZE | VO_EVENT_EXPOSE;
++        // report it here. gpu-next deliberately makes gpu_ctx_resize() a
++        // no-op for Vulkan because the platform RA context owns resizing, so
++        // emitting VO_EVENT_RESIZE alone leaves the swapchain at its old
++        // extent. Resize directly once, then emit the event so gpu-next
++        // recomputes its source/destination rectangles and redraws.
++        int width, height;
++        if (p->has_reconfigured &&
++            moltenvk_drawable_size(p, &width, &height) &&
++            (width != p->last_width || height != p->last_height) &&
++            moltenvk_resize(ctx, width, height, "drawable-change")) {
++            *events |= VO_EVENT_RESIZE | VO_EVENT_EXPOSE;
 +        }
 +        return VO_TRUE;
 +    }

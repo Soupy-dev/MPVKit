@@ -110,7 +110,7 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer {
             if Thread.isMainThread {
                 super.wantsExtendedDynamicRangeContent = newValue
             } else {
-                DispatchQueue.main.sync {
+                DispatchQueue.main.async {
                     super.wantsExtendedDynamicRangeContent = newValue
                 }
             }
@@ -159,8 +159,9 @@ public final class MPVGPUPlayerRenderer {
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
     /// Fired on the main thread when the decoded video parameters may have changed (file loaded or
-    /// VIDEO_RECONFIG), so the host can re-evaluate HDR/colorspace configuration per content.
-    public var onVideoReconfigure: (() -> Void)?
+    /// VIDEO_RECONFIG). The token is the generation submitted with `load`, allowing hosts to reject
+    /// late events from a replaced item.
+    public var onVideoReconfigure: ((UInt64) -> Void)?
 
     private var options: MPVGPUPlayerRendererOptions
     /// The active mpv audio-filter chain (`af`), kept so it can be re-applied to the PiP renderer
@@ -169,6 +170,9 @@ public final class MPVGPUPlayerRenderer {
     private let pictureInPictureRenderer: MPVMetalSampleBufferRenderer
     private let eventQueue = DispatchQueue(label: "mpvkit.gpu-player.events", qos: .userInitiated)
     private let eventQueueGroup = DispatchGroup()
+    private let loadGenerationLock = NSLock()
+    private var pendingLoadGenerations: [UInt64] = []
+    private var activeEventLoadGeneration: UInt64 = 0
     private var mpv: OpaquePointer?
     private var currentURL: URL?
     private var currentHeaders: [String: String]?
@@ -210,6 +214,8 @@ public final class MPVGPUPlayerRenderer {
                 maximumFrameSize: options.maximumPiPFrameSize,
                 preferredFramesPerSecond: options.preferredPiPFramesPerSecond,
                 preferredPiPFramesPerSecond: options.preferredPiPFramesPerSecond,
+                createsMetalCompatibilityProbe: false,
+                prefersMetalPresentation: false,
                 prefersHDRPresentation: false,
                 prefersHighBitDepthRendering: false
             )
@@ -250,6 +256,8 @@ public final class MPVGPUPlayerRenderer {
                     maximumFrameSize: newOptions.maximumPiPFrameSize,
                     preferredFramesPerSecond: newOptions.preferredPiPFramesPerSecond,
                     preferredPiPFramesPerSecond: newOptions.preferredPiPFramesPerSecond,
+                    createsMetalCompatibilityProbe: false,
+                    prefersMetalPresentation: false,
                     prefersHDRPresentation: false,
                     prefersHighBitDepthRendering: false
                 )
@@ -344,6 +352,7 @@ public final class MPVGPUPlayerRenderer {
         }
 
         isStopping = true
+        resetLoadGenerations()
         pictureInPictureRenderer.stop()
         isPictureInPicturePrepared = false
         isPictureInPictureActive = false
@@ -363,21 +372,35 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func load(_ url: URL, headers: [String: String]? = nil) {
+        load(url, headers: headers, generation: 0)
+    }
+
+    /// Loads an item with a caller-owned identity token. MPV's START_FILE events are matched to
+    /// submitted tokens in command order, so FILE_LOADED/VIDEO_RECONFIG cannot make a newer host
+    /// load ready using an event left over from the item it replaced.
+    public func load(_ url: URL, headers: [String: String]? = nil, generation: UInt64) {
         performOnMain {
             self.currentURL = url
             self.currentHeaders = headers
+            if self.isPictureInPictureActive {
+                self.setStringProperty("vid", "auto")
+            }
             if self.isPictureInPicturePrepared || self.isPictureInPictureActive {
                 self.pictureInPictureRenderer.pause()
                 self.pictureInPictureRenderer.stop()
             }
             self.isPictureInPicturePrepared = false
             self.isPictureInPictureActive = false
+            self.cachedPosition = 0
+            self.cachedDuration = 0
             guard self.mpv != nil else { return }
             self.updateState(.loading)
             self.updateHTTPHeaders(headers)
+            self.enqueueLoadGeneration(generation)
             let target = url.isFileURL ? url.path : url.absoluteString
             let status = self.command(["loadfile", target, "replace"])
             if status < 0 {
+                self.removePendingLoadGeneration(generation)
                 self.reportError("gpu-next loadfile failed status=\(status)")
             }
         }
@@ -450,7 +473,9 @@ public final class MPVGPUPlayerRenderer {
                 return
             }
             if self.isPictureInPicturePrepared {
-                self.pictureInPictureRenderer.seek(to: self.cachedPosition)
+                if abs(self.cachedPosition - self.pictureInPictureRenderer.currentTime) > 0.25 {
+                    self.pictureInPictureRenderer.seek(to: self.cachedPosition)
+                }
                 self.pictureInPictureRenderer.primeFrames(reason: "gpu-player-pip-prepare", count: primeFrameCount)
                 result = true
                 self.emitDiagnostics()
@@ -767,15 +792,18 @@ public final class MPVGPUPlayerRenderer {
 
             switch event.event_id {
             case MPV_EVENT_START_FILE:
+                _ = beginNextLoadGeneration()
                 performOnMain { self.updateState(.loading) }
             case MPV_EVENT_FILE_LOADED:
+                let generation = currentEventLoadGeneration()
                 performOnMain {
                     self.updateState(self.isPaused ? .paused : .playing)
                     self.emitDiagnostics()
-                    self.onVideoReconfigure?()
+                    self.onVideoReconfigure?(generation)
                 }
             case MPV_EVENT_VIDEO_RECONFIG:
-                performOnMain { self.onVideoReconfigure?() }
+                let generation = currentEventLoadGeneration()
+                performOnMain { self.onVideoReconfigure?(generation) }
             case MPV_EVENT_END_FILE:
                 // Surface decode/IO failures the host's onError can act on (the log-message scan
                 // alone misses some). Only report genuine error terminations, not normal EOF/stop.
@@ -791,7 +819,8 @@ public final class MPVGPUPlayerRenderer {
                     let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
                     guard let namePointer = property.name else { break }
                     let name = String(cString: namePointer)
-                    performOnMain { self.refreshProperty(named: name) }
+                    let generation = currentEventLoadGeneration()
+                    performOnMain { self.refreshProperty(named: name, generation: generation) }
                 }
             case MPV_EVENT_LOG_MESSAGE:
                 if let logPointer = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) {
@@ -809,7 +838,7 @@ public final class MPVGPUPlayerRenderer {
         }
     }
 
-    private func refreshProperty(named name: String) {
+    private func refreshProperty(named name: String, generation: UInt64) {
         switch name {
         case "duration":
             cachedDuration = getDoubleProperty("duration") ?? cachedDuration
@@ -831,10 +860,49 @@ public final class MPVGPUPlayerRenderer {
         case "video-params/gamma", "video-params/primaries", "video-params/sig-peak":
             // Colorspace/HDR characteristics resolved or changed — let the host re-evaluate HDR.
             emitDiagnostics()
-            onVideoReconfigure?()
+            onVideoReconfigure?(generation)
         default:
             break
         }
+    }
+
+    private func enqueueLoadGeneration(_ generation: UInt64) {
+        loadGenerationLock.lock()
+        pendingLoadGenerations.append(generation)
+        loadGenerationLock.unlock()
+    }
+
+    private func removePendingLoadGeneration(_ generation: UInt64) {
+        loadGenerationLock.lock()
+        if let index = pendingLoadGenerations.lastIndex(of: generation) {
+            pendingLoadGenerations.remove(at: index)
+        }
+        loadGenerationLock.unlock()
+    }
+
+    @discardableResult
+    private func beginNextLoadGeneration() -> UInt64 {
+        loadGenerationLock.lock()
+        if !pendingLoadGenerations.isEmpty {
+            activeEventLoadGeneration = pendingLoadGenerations.removeFirst()
+        }
+        let generation = activeEventLoadGeneration
+        loadGenerationLock.unlock()
+        return generation
+    }
+
+    private func currentEventLoadGeneration() -> UInt64 {
+        loadGenerationLock.lock()
+        let generation = activeEventLoadGeneration
+        loadGenerationLock.unlock()
+        return generation
+    }
+
+    private func resetLoadGenerations() {
+        loadGenerationLock.lock()
+        pendingLoadGenerations.removeAll(keepingCapacity: false)
+        activeEventLoadGeneration = 0
+        loadGenerationLock.unlock()
     }
 
     private func updateHTTPHeaders(_ headers: [String: String]?) {
@@ -1074,6 +1142,11 @@ public final class MPVGPUPlayerRenderer {
     public func start() throws { throw MPVMetalSampleBufferRendererError.unsupportedPlatform }
     public func stop() {}
     public func load(_ url: URL, headers: [String: String]? = nil) { _ = url; _ = headers }
+    public func load(_ url: URL, headers: [String: String]? = nil, generation: UInt64) {
+        _ = url
+        _ = headers
+        _ = generation
+    }
     public func play() {}
     public func pause() {}
     public func seek(to seconds: Double) { _ = seconds }
