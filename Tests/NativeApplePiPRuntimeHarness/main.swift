@@ -32,32 +32,95 @@ private struct FrameSnapshot {
     let duration: Double
 }
 
+private struct FrameIdentity: Hashable {
+    let token: UInt64
+    let generation: UInt64
+}
+
 private final class CallbackRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var frames: [FrameSnapshot] = []
+    private var frames: [FrameIdentity: FrameSnapshot] = [:]
+    private var frameCounts: [FrameIdentity: Int] = [:]
+    private var totalCount = 0
 
     func append(_ frame: FrameSnapshot) {
+        let identity = FrameIdentity(token: frame.token, generation: frame.generation)
         lock.lock()
-        frames.append(frame)
+        frames[identity] = frame
+        frameCounts[identity, default: 0] += 1
+        totalCount += 1
         lock.unlock()
     }
 
     func first(token: UInt64, generation: UInt64) -> FrameSnapshot? {
         lock.lock()
         defer { lock.unlock() }
-        return frames.first { $0.token == token && $0.generation == generation }
+        return frames[FrameIdentity(token: token, generation: generation)]
     }
 
     func count(token: UInt64, generation: UInt64) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        return frames.filter { $0.token == token && $0.generation == generation }.count
+        return frameCounts[FrameIdentity(token: token, generation: generation), default: 0]
     }
 
     var count: Int {
         lock.lock()
         defer { lock.unlock() }
-        return frames.count
+        return totalCount
+    }
+}
+
+private struct SustainedTargetBenchmarkConfiguration {
+    let targetCount: Int
+    let surfaceCount: Int
+    let width: UInt32
+    let height: UInt32
+
+    static func fromEnvironment() throws -> SustainedTargetBenchmarkConfiguration? {
+        let environment = ProcessInfo.processInfo.environment
+        guard let rawTargetCount = environment["MPVKIT_NATIVE_BENCHMARK_TARGETS"] else {
+            return nil
+        }
+        guard let targetCount = Int(rawTargetCount), (0...10_000).contains(targetCount) else {
+            throw RuntimeHarnessError.failed(
+                "MPVKIT_NATIVE_BENCHMARK_TARGETS must be an integer from 0 through 10000"
+            )
+        }
+        guard targetCount > 0 else { return nil }
+
+        func boundedInteger(
+            _ name: String,
+            default defaultValue: Int,
+            range: ClosedRange<Int>
+        ) throws -> Int {
+            guard let rawValue = environment[name] else { return defaultValue }
+            guard let value = Int(rawValue), range.contains(value) else {
+                throw RuntimeHarnessError.failed(
+                    "\(name) must be an integer from \(range.lowerBound) through \(range.upperBound)"
+                )
+            }
+            return value
+        }
+
+        return SustainedTargetBenchmarkConfiguration(
+            targetCount: targetCount,
+            surfaceCount: try boundedInteger(
+                "MPVKIT_NATIVE_BENCHMARK_SURFACES",
+                default: 3,
+                range: 2...9
+            ),
+            width: UInt32(try boundedInteger(
+                "MPVKIT_NATIVE_BENCHMARK_WIDTH",
+                default: 1_280,
+                range: 2...4_096
+            )),
+            height: UInt32(try boundedInteger(
+                "MPVKIT_NATIVE_BENCHMARK_HEIGHT",
+                default: 720,
+                range: 2...4_096
+            ))
+        )
     }
 }
 
@@ -88,12 +151,14 @@ private let modeInlineOnly: UInt32 = 0
 private let modeDualOutputWarmup: UInt32 = 1
 private let modeOffscreenOnly: UInt32 = 2
 private let modeDualOutputRestore: UInt32 = 3
+private let modeInlineFreshFrame: UInt32 = 4
 private let capabilityDirectIOSurface: UInt64 = 1 << 0
 private let capabilitySDRBGRA8: UInt64 = 1 << 1
 private let capabilityOffscreenWithoutDrawable: UInt64 = 1 << 2
 private let capabilityAsyncCompletion: UInt64 = 1 << 3
 private let capabilityAsyncMetalBlit: UInt64 = 1 << 4
 private let capabilityInlineRestore: UInt64 = 1 << 5
+private let capabilityInlineFreshFrame: UInt64 = 1 << 6
 private let backendDirectIOSurface: UInt32 = 1
 private let backendAsyncMetalBlit: UInt32 = 2
 private let frameReady: UInt32 = 0
@@ -313,7 +378,111 @@ private func validateSurfaceFrame(
     try require(frame.duration.isFinite, "callback returned non-finite duration")
 }
 
+private func validateOpaqueBGRAAlpha(
+    surface: IOSurface,
+    width: UInt32,
+    height: UInt32
+) throws {
+    let lockStatus = IOSurfaceLock(surface, .readOnly, nil)
+    try require(lockStatus == KERN_SUCCESS, "locking benchmark IOSurface failed: \(lockStatus)")
+    defer { _ = IOSurfaceUnlock(surface, .readOnly, nil) }
+
+    let baseAddress = IOSurfaceGetBaseAddress(surface)
+    let bytesPerRow = IOSurfaceGetBytesPerRow(surface)
+    let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<Int(height) {
+        let row = bytes.advanced(by: y * bytesPerRow)
+        for x in 0..<Int(width) where row[x * 4 + 3] != 255 {
+            throw RuntimeHarnessError.failed(
+                "benchmark IOSurface contains non-opaque alpha at (\(x), \(y)): \(row[x * 4 + 3])"
+            )
+        }
+    }
+}
+
+private func runSustainedTargetBenchmark(
+    handle: OpaquePointer,
+    recorder: CallbackRecorder,
+    generation: UInt64,
+    configuration: SustainedTargetBenchmarkConfiguration
+) throws {
+    let surfaces = try (0..<configuration.surfaceCount).map { _ in
+        try makeSurface(
+            width: Int(configuration.width),
+            height: Int(configuration.height)
+        )
+    }
+    let callbacksBeforeBenchmark = recorder.count
+    let firstToken: UInt64 = 10_000
+    let startedAt = CACurrentMediaTime()
+    var backendCounts: [UInt32: Int] = [:]
+
+    for targetIndex in 0..<configuration.targetCount {
+        let token = firstToken + UInt64(targetIndex)
+        let surface = surfaces[targetIndex % surfaces.count]
+        var target = makeTarget(
+            surface: surface,
+            width: configuration.width,
+            height: configuration.height,
+            token: token,
+            generation: generation
+        )
+        try require(
+            mpv_apple_pip_submit_target(handle, &target) == resultOK,
+            "sustained target submission \(targetIndex + 1) failed"
+        )
+        try waitUntil(
+            handle,
+            timeout: 5,
+            description: "sustained target \(targetIndex + 1) GPU completion"
+        ) {
+            recorder.first(token: token, generation: generation) != nil
+        }
+        guard let frame = recorder.first(token: token, generation: generation) else {
+            throw RuntimeHarnessError.failed(
+                "sustained target \(targetIndex + 1) callback disappeared after completion"
+            )
+        }
+        try validateSurfaceFrame(
+            frame,
+            token: token,
+            generation: generation,
+            width: configuration.width,
+            height: configuration.height
+        )
+        backendCounts[frame.backend, default: 0] += 1
+    }
+
+    let elapsed = CACurrentMediaTime() - startedAt
+    let benchmarkCallbackCount = recorder.count - callbacksBeforeBenchmark
+    try require(
+        benchmarkCallbackCount >= configuration.targetCount,
+        "sustained target loop lost callbacks: expected at least \(configuration.targetCount), "
+            + "received \(benchmarkCallbackCount)"
+    )
+    for surface in surfaces.prefix(min(configuration.targetCount, surfaces.count)) {
+        try validateOpaqueBGRAAlpha(
+            surface: surface,
+            width: configuration.width,
+            height: configuration.height
+        )
+    }
+
+    let directCount = backendCounts[backendDirectIOSurface, default: 0]
+    let blitCount = backendCounts[backendAsyncMetalBlit, default: 0]
+    let targetsPerSecond = Double(configuration.targetCount) / max(elapsed, 0.000_001)
+    print(
+        "BENCHMARK: native gpu-next target loop completed; "
+            + "targets=\(configuration.targetCount); surfaces=\(configuration.surfaceCount); "
+            + "size=\(configuration.width)x\(configuration.height); "
+            + "elapsed=\(String(format: "%.6f", elapsed)); "
+            + "targets_per_second=\(String(format: "%.3f", targetsPerSecond)); "
+            + "direct_callbacks=\(directCount); blit_callbacks=\(blitCount); alpha=opaque"
+    )
+}
+
 private func runHarness() throws {
+    let sustainedBenchmarkConfiguration = try SustainedTargetBenchmarkConfiguration.fromEnvironment()
     guard let device = MTLCreateSystemDefaultDevice() else {
         throw RuntimeHarnessError.failed("no Metal device is available on this Apple Silicon Mac")
     }
@@ -363,7 +532,16 @@ private func runHarness() throws {
     try checkMPV(mpv_set_option_string(handle, "keep-open", "yes"), "keep fixture open")
     try checkMPV(mpv_set_option_string(handle, "idle", "yes"), "keep mpv alive")
     try checkMPV(mpv_set_option_string(handle, "pause", "no"), "start unpaused")
-    try checkMPV(mpv_request_log_messages(handle, "warn"), "request warning logs")
+    let requestedLogLevel = ProcessInfo.processInfo.environment[
+        "MPVKIT_NATIVE_BENCHMARK_LOG_LEVEL"
+    ] ?? "warn"
+    let requestLogStatus = requestedLogLevel.withCString {
+        mpv_request_log_messages(handle, $0)
+    }
+    try checkMPV(
+        requestLogStatus,
+        "request \(requestedLogLevel) logs"
+    )
     var windowID = Int64(bitPattern: UInt64(UInt(bitPattern: Unmanaged.passUnretained(layer).toOpaque())))
     try checkMPV(
         mpv_set_option(handle, "wid", MPV_FORMAT_INT64, &windowID),
@@ -394,6 +572,7 @@ private func runHarness() throws {
         | capabilityOffscreenWithoutDrawable
         | capabilityAsyncCompletion
         | capabilityInlineRestore
+        | capabilityInlineFreshFrame
     try require(
         capabilities.flags & requiredCapabilities == requiredCapabilities,
         "missing required capabilities: flags=0x\(String(capabilities.flags, radix: 16))"
@@ -424,6 +603,46 @@ private func runHarness() throws {
         recorder.count(token: 0, generation: generation) >= 1
     }
     trace("inline-only presentation completed")
+
+    try checkMPV(mpv_command_string(handle, "set pause yes"), "pause fresh-frame probe")
+    let pauseSettleDeadline = Date().addingTimeInterval(0.25)
+    while Date() < pauseSettleDeadline {
+        _ = pumpEvent(handle, timeout: 0.01)
+    }
+
+    let freshFrameGeneration = generation &+ 1
+    try require(
+        mpv_apple_pip_set_mode(handle, modeInlineFreshFrame, freshFrameGeneration) == resultOK,
+        "fresh-frame inline mode failed"
+    )
+    try checkMPV(
+        mpv_command_string(handle, "set video-zoom 0.01"),
+        "request paused same-frame redraw"
+    )
+    let pausedProbeDeadline = Date().addingTimeInterval(0.25)
+    while Date() < pausedProbeDeadline {
+        _ = pumpEvent(handle, timeout: 0.01)
+    }
+    try require(
+        recorder.count(token: 0, generation: freshFrameGeneration) == 0,
+        "fresh-frame mode accepted a cached/forced redraw while playback was paused"
+    )
+    try checkMPV(
+        mpv_command_string(handle, "set video-zoom 0"),
+        "restore video zoom after fresh-frame probe"
+    )
+    trace("fresh-frame probe stayed armed without a paused redraw callback")
+
+    try checkMPV(mpv_command_string(handle, "set pause no"), "resume fresh-frame probe")
+    try waitUntil(handle, timeout: 4, description: "fresh inline presentation callback") {
+        recorder.count(token: 0, generation: freshFrameGeneration) >= 1
+    }
+    guard let freshFrame = recorder.first(token: 0, generation: freshFrameGeneration) else {
+        throw RuntimeHarnessError.failed("fresh-frame callback disappeared after it was counted")
+    }
+    try require(freshFrame.status == frameReady, "fresh-frame callback was not READY")
+    try require(freshFrame.pts.isFinite, "fresh-frame callback returned non-finite PTS")
+    trace("fresh-frame probe completed only after playback advanced")
 
     let width: UInt32 = 320
     let height: UInt32 = 180
@@ -502,6 +721,24 @@ private func runHarness() throws {
     )
     trace("drawable-independent GPU completion validated")
 
+    if let sustainedBenchmarkConfiguration {
+        trace(
+            "starting sustained target benchmark with "
+                + "\(sustainedBenchmarkConfiguration.targetCount) targets"
+        )
+        try runSustainedTargetBenchmark(
+            handle: handle,
+            recorder: recorder,
+            generation: generation,
+            configuration: sustainedBenchmarkConfiguration
+        )
+        try require(
+            layer.device == nil,
+            "sustained target benchmark unexpectedly restored the CAMetalLayer device"
+        )
+        trace("sustained target benchmark validated")
+    }
+
     layer.device = device
     layer.drawableSize = CGSize(width: 320, height: 180)
     let inlineCallbacksBeforeRestore = recorder.count(token: 0, generation: generation)
@@ -567,7 +804,12 @@ private func runHarness() throws {
     trace("disable_and_drain returned")
     let callbackCountAfterDrain = recorder.count
     let drainDeadline = Date().addingTimeInterval(0.35)
-    while Date() < drainDeadline { _ = pumpEvent(handle, timeout: 0.02) }
+    while Date() < drainDeadline {
+        if let event = pumpEvent(handle, timeout: 0.02),
+           event.contains("Apple PiP target cache") {
+            trace(event)
+        }
+    }
     try require(
         recorder.count == callbackCountAfterDrain,
         "a native callback arrived after disable_and_drain returned"

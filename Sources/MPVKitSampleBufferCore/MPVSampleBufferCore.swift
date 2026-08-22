@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// A lock-backed handoff between a renderer's main-actor lifecycle and its serial render queue.
@@ -71,6 +72,231 @@ public enum MPVDrawablePixelLimit {
     }
 }
 
+/// Resolves AVKit's PiP render-size callback into a high-quality, bounded pixel-buffer size.
+///
+/// AVKit's callback is useful for selecting the current aspect-ratio variant, but on iPhone it
+/// can describe a tiny on-screen PiP window (for example 251x141). Treating that value as the
+/// producer resolution permanently downsizes every IOSurface and makes GPU PiP visibly pixelated.
+/// This policy preserves the requested aspect ratio while filling the configured maximum box.
+public enum MPVPictureInPictureRenderSizePolicy {
+    public static func resolved(
+        requested: CGSize,
+        maximum: CGSize,
+        fallback: CGSize = CGSize(width: 1280, height: 720),
+        textureDimensionLimit: CGFloat,
+        pixelLimit: Double
+    ) -> CGSize {
+        let validFallback = validatedSize(fallback) ?? CGSize(width: 1280, height: 720)
+        let validMaximum = validatedSize(maximum) ?? validFallback
+        let source = validatedSize(requested) ?? validFallback
+        let validTextureLimit = textureDimensionLimit.isFinite && textureDimensionLimit > 1
+            ? textureDimensionLimit
+            : max(validMaximum.width, validMaximum.height)
+
+        let maximumWidth = min(validMaximum.width, validTextureLimit)
+        let maximumHeight = min(validMaximum.height, validTextureLimit)
+        let aspectRatio = source.width / source.height
+
+        var width = maximumWidth
+        var height = width / aspectRatio
+        if height > maximumHeight {
+            height = maximumHeight
+            width = height * aspectRatio
+        }
+
+        if pixelLimit.isFinite, pixelLimit > 0 {
+            let pixels = Double(width) * Double(height)
+            if pixels > pixelLimit {
+                let scale = sqrt(pixelLimit / pixels)
+                width *= scale
+                height *= scale
+            }
+        }
+
+        return CGSize(
+            width: max(2, floor(width)),
+            height: max(2, floor(height))
+        )
+    }
+
+    private static func validatedSize(_ size: CGSize) -> CGSize? {
+        guard size.width.isFinite,
+              size.height.isFinite,
+              size.width > 1,
+              size.height > 1 else { return nil }
+        return size
+    }
+
+    /// Suppresses tiny AVKit aspect/rounding jitter while still rebuilding for a real quality or
+    /// aspect-ratio transition. A rebuild retires an IOSurface pool and drains native GPU work, so
+    /// treating one-pixel window noise as a new producer format is disproportionately expensive.
+    public static func shouldReplacePool(
+        current: CGSize,
+        proposed: CGSize,
+        aspectTolerance: Double = 0.005,
+        areaTolerance: Double = 0.02
+    ) -> Bool {
+        guard let current = validatedSize(current) else { return validatedSize(proposed) != nil }
+        guard let proposed = validatedSize(proposed) else { return false }
+        if abs(current.width - proposed.width) < 2,
+           abs(current.height - proposed.height) < 2 {
+            return false
+        }
+
+        let currentArea = Double(current.width * current.height)
+        let proposedArea = Double(proposed.width * proposed.height)
+        let relativeAreaChange = abs(proposedArea - currentArea) / max(currentArea, proposedArea)
+        if relativeAreaChange > max(0, areaTolerance) { return true }
+
+        let currentAspect = Double(current.width / current.height)
+        let proposedAspect = Double(proposed.width / proposed.height)
+        let relativeAspectChange = abs(proposedAspect - currentAspect) / max(currentAspect, proposedAspect)
+        return relativeAspectChange > max(0, aspectTolerance)
+    }
+}
+
+/// Normalizes the Apple hardware-decoder names exposed by mpv. Keeping this policy in the
+/// platform-neutral core lets hosts verify a foreground recovery without mistaking mpv's
+/// transient empty value for software decoding.
+public enum MPVVideoToolboxDecodePolicy {
+    public enum RecoveryStrategy: Equatable, Sendable {
+        /// Retry the host's ordered list, preserving direct VideoToolbox as the first choice.
+        case configuredOrder
+        /// Retry only the hardware copy path after the ordered retry produced no decoded-frame proof.
+        case copyOnly
+    }
+
+    public static func isConfigured(_ configuredDecoders: String) -> Bool {
+        !configuredHardwarePaths(configuredDecoders).isEmpty
+    }
+
+    public static func isEngaged(_ currentDecoder: String) -> Bool {
+        let normalized = currentDecoder.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "videotoolbox" || normalized == "videotoolbox-copy"
+    }
+
+    public static func recoverySetting(
+        configuredDecoders: String,
+        strategy: RecoveryStrategy
+    ) -> String? {
+        let hardwarePaths = configuredHardwarePaths(configuredDecoders)
+        guard !hardwarePaths.isEmpty else { return nil }
+        switch strategy {
+        case .configuredOrder:
+            return hardwarePaths.joined(separator: ",")
+        case .copyOnly:
+            guard hardwarePaths.contains("videotoolbox-copy") else { return nil }
+            return "videotoolbox-copy"
+        }
+    }
+
+    private static func configuredHardwarePaths(_ configuredDecoders: String) -> [String] {
+        var result: [String] = []
+        for entry in configuredDecoders.split(separator: ",") {
+            let decoder = entry.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard decoder == "videotoolbox" || decoder == "videotoolbox-copy" else { continue }
+            if !result.contains(decoder) {
+                result.append(decoder)
+            }
+        }
+        return result
+    }
+}
+
+/// Joins the two asynchronous signals required to prove that a foreground decoder rebuild really
+/// produced hardware-decoded output. mpv may deliver VIDEO_RECONFIG before or after the dependent
+/// `hwdec-current` property notification, so neither signal is sufficient by itself.
+public enum MPVHardwareDecoderRecoveryObservation: Equatable, Sendable {
+    /// A causally fresh `hwdec-current` value paired with post-epoch video output. `nil` means mpv
+    /// reported the property as unavailable; it is still a completed negative observation.
+    case decoder(String?)
+}
+
+public struct MPVHardwareDecoderRecoveryProof: Equatable, Sendable {
+    private var observedVideoReconfiguration = false
+    private var observedHardwareDecoder = false
+    private var currentDecoder: String?
+    private var currentDecoderIsVideoToolbox = false
+    private var published = false
+
+    public init() {}
+
+    /// Records output reconfiguration and returns true exactly once when both proof signals exist.
+    public mutating func observeVideoReconfiguration() -> Bool {
+        observedVideoReconfiguration = true
+        return consumeProofIfReady()
+    }
+
+    /// Records the latest decoder property. A later non-VideoToolbox value invalidates an earlier
+    /// hardware value until a fresh engaged value arrives.
+    public mutating func observeHardwareDecoder(_ decoder: String?) -> Bool {
+        observedHardwareDecoder = true
+        currentDecoder = decoder
+        currentDecoderIsVideoToolbox = decoder.map(MPVVideoToolboxDecodePolicy.isEngaged) ?? false
+        return consumeProofIfReady()
+    }
+
+    /// Returns a causally complete decoder observation once both post-epoch signals have arrived.
+    /// This deliberately includes non-VideoToolbox values so strict hosts can try their next
+    /// hardware-only path after the full direct-decoder proof window expires.
+    public var completedDecoderObservation: MPVHardwareDecoderRecoveryObservation? {
+        guard observedVideoReconfiguration, observedHardwareDecoder else { return nil }
+        return .decoder(currentDecoder)
+    }
+
+    public mutating func reset() {
+        observedVideoReconfiguration = false
+        observedHardwareDecoder = false
+        currentDecoder = nil
+        currentDecoderIsVideoToolbox = false
+        published = false
+    }
+
+    private mutating func consumeProofIfReady() -> Bool {
+        guard !published, observedVideoReconfiguration, currentDecoderIsVideoToolbox else {
+            return false
+        }
+        published = true
+        return true
+    }
+}
+
+/// Device-scoped MoltenVK compatibility decisions that can be tested without a Metal device.
+///
+/// MoltenVK 1.4 enables Metal argument buffers by default. Current upstream reports show both an
+/// Apple-5 GPU regression and a device-loss bug when an externally created Metal texture is
+/// imported into Vulkan. The latter is directly exercised by MPVKit's asynchronous PiP blit and
+/// was fixed upstream after the currently distributed MoltenVK 1.4.1 artifact.
+public enum MPVMoltenVKDevicePolicy {
+    public static func shouldDisableMetalArgumentBuffers(
+        supportsApple5: Bool,
+        supportsApple6: Bool,
+        hasImportedMetalTextureResidencyFix: Bool = false
+    ) -> Bool {
+        !hasImportedMetalTextureResidencyFix || (supportsApple5 && !supportsApple6)
+    }
+
+    /// Rejects the reported external-MTLTexture fault at capability selection too. The bundled
+    /// runtime currently disables argument buffers before Vulkan starts because a direct backend
+    /// may still fall back to this import path; this remains defense-in-depth for other embedders.
+    public static func allowsAsynchronousMetalTextureImport(
+        metalArgumentBuffersEnabled: Bool,
+        hasImportedMetalTextureResidencyFix: Bool = false
+    ) -> Bool {
+        !metalArgumentBuffersEnabled || hasImportedMetalTextureResidencyFix
+    }
+
+    /// MoltenVK 1.4.1 still has an open device-loss regression on A12-class iPads. Prefer the
+    /// bounded sample-buffer renderer on that exact hardware class until upstream closes it.
+    public static func shouldAvoidInlineGPUOnIPad(
+        isPad: Bool,
+        supportsApple5: Bool,
+        supportsApple6: Bool
+    ) -> Bool {
+        isPad && supportsApple5 && !supportsApple6
+    }
+}
+
 /// Classifies callbacks from the optional native gpu-next PiP sink before the platform wrapper
 /// touches its IOSurface ownership table. Token zero is reserved for the inline-restoration
 /// notification and therefore deliberately has no matching in-flight pixel buffer.
@@ -129,6 +355,78 @@ public enum MPVNativePiPTargetDemand {
     }
 }
 
+/// Defers the load-scoped native PiP capability probe until mpv has both loaded the matching
+/// playlist entry and configured its video output. The gate consumes at most one probe per load;
+/// events copied from a replaced load cannot release a newer preparation.
+public struct MPVNativePiPProbeGate: Equatable, Sendable {
+    public private(set) var loadSequence: UInt64?
+    public private(set) var didConsumeProbe = false
+
+    private var pendingPreparationGeneration: UInt64?
+    private var didReceiveFileLoaded = false
+    private var didReceiveVideoReconfigure = false
+
+    public init() {}
+
+    public mutating func beginLoad(sequence: UInt64) {
+        loadSequence = sequence
+        didConsumeProbe = false
+        pendingPreparationGeneration = nil
+        didReceiveFileLoaded = false
+        didReceiveVideoReconfigure = false
+    }
+
+    /// Returns the preparation generation only when this request may perform the native probe
+    /// immediately. Otherwise the request remains pending until both matching readiness events
+    /// have arrived.
+    public mutating func requestProbe(
+        loadSequence: UInt64,
+        preparationGeneration: UInt64
+    ) -> UInt64? {
+        guard self.loadSequence == loadSequence,
+              !didConsumeProbe,
+              pendingPreparationGeneration == nil
+                || pendingPreparationGeneration == preparationGeneration else { return nil }
+        pendingPreparationGeneration = preparationGeneration
+        return consumeProbeIfReady()
+    }
+
+    public mutating func markFileLoaded(loadSequence: UInt64) -> UInt64? {
+        guard self.loadSequence == loadSequence else { return nil }
+        didReceiveFileLoaded = true
+        return consumeProbeIfReady()
+    }
+
+    public mutating func markVideoReconfigured(loadSequence: UInt64) -> UInt64? {
+        guard self.loadSequence == loadSequence else { return nil }
+        didReceiveVideoReconfigure = true
+        return consumeProbeIfReady()
+    }
+
+    public mutating func cancelPreparation(generation: UInt64) {
+        guard pendingPreparationGeneration == generation else { return }
+        pendingPreparationGeneration = nil
+    }
+
+    public mutating func reset() {
+        loadSequence = nil
+        didConsumeProbe = false
+        pendingPreparationGeneration = nil
+        didReceiveFileLoaded = false
+        didReceiveVideoReconfigure = false
+    }
+
+    private mutating func consumeProbeIfReady() -> UInt64? {
+        guard !didConsumeProbe,
+              didReceiveFileLoaded,
+              didReceiveVideoReconfigure,
+              let preparationGeneration = pendingPreparationGeneration else { return nil }
+        didConsumeProbe = true
+        pendingPreparationGeneration = nil
+        return preparationGeneration
+    }
+}
+
 /// Associates host load generations with mpv's process-lifetime-unique playlist entry IDs.
 ///
 /// A synchronous `loadfile` command can be followed immediately by another replacement before
@@ -156,12 +454,32 @@ public struct MPVLoadIdentityTracker: Sendable {
 
     public init() {}
 
+    /// Reserves a newest logical identity without making it eligible to consume `START_FILE`.
+    /// Use this when a load must wait for another asynchronous ownership transition before its
+    /// physical `loadfile` command can be issued.
     @discardableResult
-    public mutating func submit(clientGeneration: UInt64) -> Identity {
+    public mutating func reserve(clientGeneration: UInt64) -> Identity {
         nextSequence &+= 1
         let identity = Identity(sequence: nextSequence, clientGeneration: clientGeneration)
         latestIdentity = identity
+        return identity
+    }
+
+    /// Makes a reserved identity eligible for the next unbound `START_FILE`. Returns false when a
+    /// newer logical load superseded it before its physical command could be submitted.
+    @discardableResult
+    public mutating func submit(_ identity: Identity) -> Bool {
+        guard latestIdentity == identity else { return false }
+        guard !pendingIdentities.contains(identity),
+              !identitiesByPlaylistEntryID.values.contains(identity) else { return true }
         pendingIdentities.append(identity)
+        return true
+    }
+
+    @discardableResult
+    public mutating func submit(clientGeneration: UInt64) -> Identity {
+        let identity = reserve(clientGeneration: clientGeneration)
+        _ = submit(identity)
         return identity
     }
 

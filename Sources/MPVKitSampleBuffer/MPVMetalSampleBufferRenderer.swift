@@ -7,6 +7,12 @@ import CoreMedia
 import Foundation
 import MPVKitSampleBufferCore
 
+// Immutable CoreGraphics objects are safe to reuse for every frame. Constructing them in the
+// sample-buffer hot path needlessly consults ColorSync and allocates wrapper objects at PiP rate.
+private let mpvMetalSampleBufferSRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+private let mpvMetalSampleBufferExtendedP3ColorSpace =
+    CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+
 public enum MPVMetalSampleBufferRendererState: Equatable, Sendable {
     case idle
     case starting
@@ -34,6 +40,9 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable, Sendable {
     public var prefersMetalPresentation: Bool
     public var prefersHDRPresentation: Bool
     public var prefersHighBitDepthRendering: Bool
+    /// Whether the compatibility PiP decoder may fall back to CPU decoding when
+    /// `videotoolbox-copy` cannot attach. Defaults to true for source compatibility.
+    public var allowsSoftwareDecoderFallback: Bool
     /// Maximum number of IOSurface-backed buffers that the display path may have outstanding.
     /// Keeping this small is especially important on iPad while PiP and Stage Manager are active.
     public var maximumInFlightFrameCount: Int
@@ -46,6 +55,7 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable, Sendable {
         prefersMetalPresentation: Bool = true,
         prefersHDRPresentation: Bool = true,
         prefersHighBitDepthRendering: Bool = true,
+        allowsSoftwareDecoderFallback: Bool = true,
         maximumInFlightFrameCount: Int = 3
     ) {
         self.maximumFrameSize = maximumFrameSize
@@ -55,6 +65,7 @@ public struct MPVMetalSampleBufferRendererOptions: Equatable, Sendable {
         self.prefersMetalPresentation = prefersMetalPresentation
         self.prefersHDRPresentation = prefersHDRPresentation
         self.prefersHighBitDepthRendering = prefersHighBitDepthRendering
+        self.allowsSoftwareDecoderFallback = allowsSoftwareDecoderFallback
         self.maximumInFlightFrameCount = min(3, max(1, maximumInFlightFrameCount))
     }
 }
@@ -250,9 +261,38 @@ private enum MPVMetalSampleBufferEvent: Sendable {
     case fileLoaded(playlistEntryID: Int64?)
     case videoReconfigure(playlistEntryID: Int64?)
     case endFile(playlistEntryID: Int64)
-    case propertyChange(String, playlistEntryID: Int64?)
+    case propertyChange(String, value: MPVMetalObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
     case shutdown
+}
+
+private enum MPVMetalObservedPropertyValue: Sendable {
+    case unavailable
+    case string(String)
+    case flag(Bool)
+    case int64(Int64)
+    case double(Double)
+}
+
+private func copyMPVMetalObservedPropertyValue(
+    _ property: mpv_event_property
+) -> MPVMetalObservedPropertyValue {
+    guard let data = property.data else { return .unavailable }
+    switch property.format {
+    case MPV_FORMAT_STRING:
+        guard let value = data
+            .assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self)
+            .pointee else { return .unavailable }
+        return .string(String(cString: value))
+    case MPV_FORMAT_FLAG:
+        return .flag(data.assumingMemoryBound(to: Int32.self).pointee != 0)
+    case MPV_FORMAT_INT64:
+        return .int64(data.assumingMemoryBound(to: Int64.self).pointee)
+    case MPV_FORMAT_DOUBLE:
+        return .double(data.assumingMemoryBound(to: Double.self).pointee)
+    default:
+        return .unavailable
+    }
 }
 
 private func copyMPVMetalSampleBufferEvent(
@@ -281,16 +321,20 @@ private func copyMPVMetalSampleBufferEvent(
         guard let data = event.data else { return nil }
         let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
         guard let name = property.name else { return nil }
-        return .propertyChange(String(cString: name), playlistEntryID: activePlaylistEntryID)
+        return .propertyChange(
+            String(cString: name),
+            value: copyMPVMetalObservedPropertyValue(property),
+            playlistEntryID: activePlaylistEntryID
+        )
     case MPV_EVENT_LOG_MESSAGE:
         guard let log = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) else {
             return nil
         }
         let text = log.pointee.text.map { String(cString: $0) } ?? ""
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.localizedCaseInsensitiveContains("error")
-            ? .logError(trimmed, playlistEntryID: activePlaylistEntryID)
-            : nil
+        return trimmed.isEmpty
+            ? nil
+            : .logError(trimmed, playlistEntryID: activePlaylistEntryID)
     case MPV_EVENT_SHUTDOWN:
         return .shutdown
     default:
@@ -700,6 +744,11 @@ public final class MPVMetalSampleBufferRenderer {
     private var cachedVideoPTS: Double?
     private var cachedSourceFPS: Double?
     private var cachedSpeed: Double = 1
+    private var observedVideoColorPrimaries = ""
+    private var observedVideoTransferFunction = ""
+    private var observedVideoYCbCrMatrix = ""
+    private var observedVideoSignalPeak: Double = 0
+    private var videoColorMetadataPublishWorkItem: DispatchWorkItem?
     private var isPausedForCache = false
     private var renderPosition: Double = 0
     private var renderVideoPTS: Double?
@@ -709,6 +758,8 @@ public final class MPVMetalSampleBufferRenderer {
     private var renderIsBuffering = false
     private var sampleTimeline = MPVSampleTimeline()
     private var timelineIsAnchored = false
+    private var lastTimebaseDriftCheckTime: CFTimeInterval = 0
+    private var lastAppliedTimebaseRate: Double?
     private var allowsPausedDuplicateFrame = false
     private var flushInFlight = false
     private var flushCoordinator = MPVFlushEpochCoordinator()
@@ -766,6 +817,10 @@ public final class MPVMetalSampleBufferRenderer {
     private var videoTransferFunction = ""
     private var videoYCbCrMatrix = ""
     private var videoSignalPeak: Double = 0
+    private var resolvedStreamLooksHDR = false
+    private var cachedSourceColorAttachments: CFDictionary?
+    private var cachedSDRColorAttachments: CFDictionary?
+    private var cachedSourceColorMetadataSignature = "bt709|bt709|bt709|0.000"
     private var swFormat = Array("bgr0".utf8CString)
     private var highBitDepthSwFormat = Array("rgba64".utf8CString)
     private var stopContinuations: [CheckedContinuation<Void, Never>] = []
@@ -825,15 +880,24 @@ public final class MPVMetalSampleBufferRenderer {
         mpv = handle
 
         setOption("terminal", "no")
-        setOption("msg-level", "all=warn,cplayer=v,ffmpeg=v")
+        // Avoid paying mpv's formatting and root-log-lock cost for verbose messages that are not
+        // displayed. MPV_EVENT_LOG_MESSAGE remains at libmpv's default disabled request level;
+        // recoverable log lines must not be promoted into fatal playback errors.
+        setOption("msg-level", "all=error")
         setOption("idle", "yes")
         setOption("keep-open", "yes")
         setOption("vo", "libmpv")
         setOption("profile", options.prefersHighBitDepthRendering ? "high-quality" : "fast")
         setOption("hwdec", "videotoolbox-copy")
+        setOption("hwdec-software-fallback", options.allowsSoftwareDecoderFallback ? "yes" : "no")
         setOption("vd-lavc-dr", "no")
         setOption("video-sync", "audio")
         setOption("framedrop", "vo")
+        #if os(tvOS)
+        // Prefer the AVFoundation output on tvOS because recent Dolby/Atmos HDMI routes can leave
+        // AudioUnit open but silent. AudioUnit remains the fallback for older route combinations.
+        setOption("ao", "avfoundation,audiounit")
+        #endif
         setOption("dither-depth", "auto")
         setOption("target-colorspace-hint", "yes")
         setOption("sub-auto", "fuzzy")
@@ -885,6 +949,8 @@ public final class MPVMetalSampleBufferRenderer {
     public func stop() {
         guard !isStopping else { return }
         guard state != .stopped else { return }
+        videoColorMetadataPublishWorkItem?.cancel()
+        videoColorMetadataPublishWorkItem = nil
         guard mpv != nil || renderContext != nil else {
             isStopping = true
             isRunning = false
@@ -1197,6 +1263,13 @@ public final class MPVMetalSampleBufferRenderer {
             guard self.options != newOptions else { return }
             let previousOptions = self.options
             self.options = newOptions
+            if previousOptions.allowsSoftwareDecoderFallback
+                != newOptions.allowsSoftwareDecoderFallback {
+                self.setStringProperty(
+                    "hwdec-software-fallback",
+                    newOptions.allowsSoftwareDecoderFallback ? "yes" : "no"
+                )
+            }
             self.enqueueRenderWork { [weak self] in
                 guard let self else { return }
                 self.renderOptions = newOptions
@@ -1738,6 +1811,7 @@ public final class MPVMetalSampleBufferRenderer {
             isFileLoaded = true
             let loadedGeneration = loadGeneration
             isAwaitingCurrentFileLoaded = false
+            refreshVideoColorMetadataCoherently()
             applyDeferredLoadActions(generation: loadGeneration)
             if let pending = pendingSeek {
                 self.pendingSeek = nil
@@ -1759,10 +1833,11 @@ public final class MPVMetalSampleBufferRenderer {
                 return
             }
             refreshVideoSize()
+            refreshVideoColorMetadataCoherently()
             requestForcedFrames(count: 2)
         case .endFile(let playlistEntryID):
             _ = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
-        case .propertyChange(let name, let playlistEntryID):
+        case .propertyChange(let name, let value, let playlistEntryID):
             if !MPVLoadPropertyFence.shouldAccept(
                 property: name,
                 hasPlaylistEntryID: playlistEntryID != nil,
@@ -1775,7 +1850,7 @@ public final class MPVMetalSampleBufferRenderer {
                 eventStaleGenerationDropCount += 1
                 return
             }
-            refreshProperty(named: name)
+            refreshProperty(named: name, value: value)
         case .logError(let message, let playlistEntryID):
             if let playlistEntryID {
                 guard eventBelongsToCurrentLoad(playlistEntryID) else {
@@ -1803,14 +1878,24 @@ public final class MPVMetalSampleBufferRenderer {
         return loadIdentityTracker.isLatest(identity) && identity.clientGeneration == loadGeneration
     }
 
-    private func refreshProperty(named name: String) {
+    private func refreshProperty(named name: String, value: MPVMetalObservedPropertyValue) {
         switch name {
-        case "dwidth", "dheight":
-            refreshVideoSize()
+        case "dwidth":
+            if case .int64(let width) = value, width > 0 {
+                videoSize.width = CGFloat(width)
+                publishVideoSizeToRenderQueue()
+            }
+        case "dheight":
+            if case .int64(let height) = value, height > 0 {
+                videoSize.height = CGFloat(height)
+                publishVideoSizeToRenderQueue()
+            }
         case "duration":
-            cachedDuration = getDoubleProperty("duration") ?? 0
+            if case .double(let duration) = value {
+                cachedDuration = duration
+            }
         case "time-pos":
-            let position = getDoubleProperty("time-pos") ?? cachedPosition
+            guard case .double(let position) = value else { return }
             cachedPosition = position
             let generation = loadGeneration
             enqueueRenderWork { [weak self] in
@@ -1819,23 +1904,25 @@ public final class MPVMetalSampleBufferRenderer {
                 self.renderPosition = position
             }
         case "video-pts":
-            if let value = getDoubleProperty("video-pts"), value.isFinite {
-                cachedVideoPTS = value
+            if case .double(let videoPTS) = value, videoPTS.isFinite {
+                cachedVideoPTS = videoPTS
                 let generation = loadGeneration
                 enqueueRenderWork { [weak self] in
                     guard let self,
                           self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
-                    self.renderVideoPTS = value
+                    self.renderVideoPTS = videoPTS
                 }
+            } else if case .unavailable = value {
+                cachedVideoPTS = nil
             }
         case "estimated-vf-fps":
             let generation = loadGeneration
-            if let value = getDoubleProperty("estimated-vf-fps"), value.isFinite, value > 0 {
-                cachedSourceFPS = value
+            if case .double(let sourceFPS) = value, sourceFPS.isFinite, sourceFPS > 0 {
+                cachedSourceFPS = sourceFPS
                 enqueueRenderWork { [weak self] in
                     guard let self,
                           self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
-                    self.renderSourceFPS = value
+                    self.renderSourceFPS = sourceFPS
                 }
             } else {
                 cachedSourceFPS = nil
@@ -1846,16 +1933,22 @@ public final class MPVMetalSampleBufferRenderer {
                 }
             }
         case "speed":
-            cachedSpeed = max(0.1, getDoubleProperty("speed") ?? cachedSpeed)
+            if case .double(let speed) = value, speed.isFinite {
+                cachedSpeed = max(0.1, speed)
+            }
             updateTimelineRate()
         case "pause":
-            isPaused = getFlagProperty("pause")
+            if case .flag(let paused) = value {
+                isPaused = paused
+            }
             if !isAwaitingCurrentFileLoaded {
                 updateState(isPaused ? .paused : .playing)
             }
             updateTimelineRate()
         case "paused-for-cache":
-            isPausedForCache = getFlagProperty("paused-for-cache")
+            if case .flag(let buffering) = value {
+                isPausedForCache = buffering
+            }
             if isPausedForCache {
                 updateState(.loading)
             } else if !isAwaitingCurrentFileLoaded {
@@ -1865,9 +1958,38 @@ public final class MPVMetalSampleBufferRenderer {
         case "track-list", "sid", "aid":
             requestForcedFrames(count: 1)
         case "video-params/primaries", "video-params/gamma", "video-params/colormatrix", "video-params/sig-peak":
-            refreshVideoColorMetadata()
-            requestTimelineDiscontinuity(removingDisplayedImage: false)
-            requestForcedFrames(count: 1)
+            var didChange = false
+            switch (name, value) {
+            case ("video-params/primaries", .string(let primaries)):
+                didChange = observedVideoColorPrimaries != primaries
+                observedVideoColorPrimaries = primaries
+            case ("video-params/gamma", .string(let transfer)):
+                didChange = observedVideoTransferFunction != transfer
+                observedVideoTransferFunction = transfer
+            case ("video-params/colormatrix", .string(let matrix)):
+                didChange = observedVideoYCbCrMatrix != matrix
+                observedVideoYCbCrMatrix = matrix
+            case ("video-params/sig-peak", .double(let signalPeak)):
+                didChange = observedVideoSignalPeak != signalPeak
+                observedVideoSignalPeak = signalPeak
+            case ("video-params/primaries", .unavailable):
+                didChange = !observedVideoColorPrimaries.isEmpty
+                observedVideoColorPrimaries = ""
+            case ("video-params/gamma", .unavailable):
+                didChange = !observedVideoTransferFunction.isEmpty
+                observedVideoTransferFunction = ""
+            case ("video-params/colormatrix", .unavailable):
+                didChange = !observedVideoYCbCrMatrix.isEmpty
+                observedVideoYCbCrMatrix = ""
+            case ("video-params/sig-peak", .unavailable):
+                didChange = observedVideoSignalPeak != 0
+                observedVideoSignalPeak = 0
+            default:
+                break
+            }
+            if didChange {
+                scheduleVideoColorMetadataPublish()
+            }
         default:
             break
         }
@@ -1877,23 +1999,28 @@ public final class MPVMetalSampleBufferRenderer {
         let width = getIntProperty("dwidth") ?? 0
         let height = getIntProperty("dheight") ?? 0
         if width > 0, height > 0 {
-            let size = CGSize(width: width, height: height)
-            videoSize = size
-            let generation = loadGeneration
-            enqueueRenderWork { [weak self] in
-                guard let self,
-                      self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
-                self.renderVideoSize = size
-            }
+            videoSize = CGSize(width: width, height: height)
+            publishVideoSizeToRenderQueue()
         }
     }
 
-    private func refreshVideoColorMetadata() {
+    private func publishVideoSizeToRenderQueue() {
+        let size = videoSize
+        guard size.width > 0, size.height > 0 else { return }
         let generation = loadGeneration
-        let primaries = getStringProperty("video-params/primaries") ?? ""
-        let transfer = getStringProperty("video-params/gamma") ?? ""
-        let matrix = getStringProperty("video-params/colormatrix") ?? ""
-        let signalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
+        enqueueRenderWork { [weak self] in
+            guard let self,
+                  self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
+            self.renderVideoSize = size
+        }
+    }
+
+    private func publishVideoColorMetadataToRenderQueue() {
+        let generation = loadGeneration
+        let primaries = observedVideoColorPrimaries
+        let transfer = observedVideoTransferFunction
+        let matrix = observedVideoYCbCrMatrix
+        let signalPeak = observedVideoSignalPeak
         enqueueRenderWork { [weak self] in
             guard let self,
                   self.renderLifecycleFence.accepts(loadGeneration: generation) else { return }
@@ -1901,14 +2028,61 @@ public final class MPVMetalSampleBufferRenderer {
             self.videoTransferFunction = transfer
             self.videoYCbCrMatrix = matrix
             self.videoSignalPeak = signalPeak
+            self.rebuildColorMetadataCache()
             self.formatDescription = nil
             self.formatDescriptionMetadataSignature = ""
             self.flushMetalTextureCache()
             let extendedRangeEnabled = self.renderOptions.prefersHDRPresentation && self.streamLooksHDR
             DispatchQueue.main.async { @MainActor [weak self] in
-                self?.setDisplayLayerExtendedDynamicRange(enabled: extendedRangeEnabled)
+                guard let self,
+                      !self.isStopping,
+                      self.loadGeneration == generation else { return }
+                self.setDisplayLayerExtendedDynamicRange(enabled: extendedRangeEnabled)
             }
         }
+    }
+
+    /// Property notifications for primaries, transfer, matrix, and signal peak are independent.
+    /// Read a coherent snapshot at the two rare load/reconfigure boundaries, then coalesce any
+    /// later dynamic metadata burst so the render queue never rebuilds a transient partial format.
+    private func refreshVideoColorMetadataCoherently() {
+        let hadPendingPublish = videoColorMetadataPublishWorkItem != nil
+        videoColorMetadataPublishWorkItem?.cancel()
+        videoColorMetadataPublishWorkItem = nil
+        let primaries = getStringProperty("video-params/primaries") ?? ""
+        let transfer = getStringProperty("video-params/gamma") ?? ""
+        let matrix = getStringProperty("video-params/colormatrix") ?? ""
+        let signalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
+        let didChange = observedVideoColorPrimaries != primaries
+            || observedVideoTransferFunction != transfer
+            || observedVideoYCbCrMatrix != matrix
+            || observedVideoSignalPeak != signalPeak
+        guard hadPendingPublish || didChange else { return }
+        observedVideoColorPrimaries = primaries
+        observedVideoTransferFunction = transfer
+        observedVideoYCbCrMatrix = matrix
+        observedVideoSignalPeak = signalPeak
+        publishVideoColorMetadataToRenderQueue()
+        requestTimelineDiscontinuity(removingDisplayedImage: false)
+        requestForcedFrames(count: 1)
+    }
+
+    private func scheduleVideoColorMetadataPublish() {
+        videoColorMetadataPublishWorkItem?.cancel()
+        let expectedGeneration = loadGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self,
+                      !self.isStopping,
+                      self.loadGeneration == expectedGeneration else { return }
+                self.videoColorMetadataPublishWorkItem = nil
+                self.publishVideoColorMetadataToRenderQueue()
+                self.requestTimelineDiscontinuity(removingDisplayedImage: false)
+                self.requestForcedFrames(count: 1)
+            }
+        }
+        videoColorMetadataPublishWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(10), execute: workItem)
     }
 
     fileprivate func scheduleRender(force: Bool, engineGeneration: UInt64) {
@@ -2065,10 +2239,16 @@ public final class MPVMetalSampleBufferRenderer {
 
     private func beginNewLoadGeneration(removingDisplayedImage: Bool = true) {
         loadGeneration &+= 1
+        videoColorMetadataPublishWorkItem?.cancel()
+        videoColorMetadataPublishWorkItem = nil
         updateRenderLifecycleFence()
         legacyPrimeBudget.reset()
         cachedVideoPTS = nil
         cachedSourceFPS = nil
+        observedVideoColorPrimaries = ""
+        observedVideoTransferFunction = ""
+        observedVideoYCbCrMatrix = ""
+        observedVideoSignalPeak = 0
         let generation = loadGeneration
         let engineGeneration = self.engineGeneration
         let initialSpeed = cachedSpeed
@@ -2114,10 +2294,13 @@ public final class MPVMetalSampleBufferRenderer {
             self.videoTransferFunction = ""
             self.videoYCbCrMatrix = ""
             self.videoSignalPeak = 0
+            self.rebuildColorMetadataCache()
             self.formatDescription = nil
             self.formatDescriptionMetadataSignature = ""
             self.sampleTimeline.beginDiscontinuity()
             self.timelineIsAnchored = false
+            self.lastTimebaseDriftCheckTime = 0
+            self.lastAppliedTimebaseRate = nil
             self.allowsPausedDuplicateFrame = false
             _ = self.flushCoordinator.beginEpoch()
             self.requestDisplayFlush(
@@ -2192,7 +2375,7 @@ public final class MPVMetalSampleBufferRenderer {
                 rate: speed
             )
             if let timebase = self.displayLayer.controlTimebase {
-                CMTimebaseSetRate(timebase, rate: rate)
+                self.applyTimebaseRateIfNeeded(timebase, rate: rate)
             }
         }
     }
@@ -2670,11 +2853,7 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     private var streamLooksHDR: Bool {
-        let transfer = videoTransferFunction.lowercased()
-        return videoSignalPeak > 1.0
-            || transfer.contains("pq")
-            || transfer.contains("hlg")
-            || transfer.contains("2084")
+        resolvedStreamLooksHDR
     }
 
     private func beginHDRMetalPresentation(
@@ -3154,6 +3333,8 @@ public final class MPVMetalSampleBufferRenderer {
     private func startDisplayFlush(_ request: MPVMetalSampleBufferDisplayFlushRequest) {
         flushInFlight = true
         displayLayer.controlTimebase = nil
+        lastAppliedTimebaseRate = nil
+        lastTimebaseDriftCheckTime = 0
         let token = flushCoordinator.beginFlush()
         let renderQueue = self.renderQueue
         if #available(iOS 17.0, tvOS 17.0, macOS 14.0, *) {
@@ -3287,6 +3468,8 @@ public final class MPVMetalSampleBufferRenderer {
         cancelTimelineWaiters()
         _ = flushCoordinator.beginEpoch()
         timelineIsAnchored = false
+        lastAppliedTimebaseRate = nil
+        lastTimebaseDriftCheckTime = 0
         allowsPausedDuplicateFrame = false
         flushInFlight = false
         pendingDisplayFlush = nil
@@ -3436,37 +3619,11 @@ public final class MPVMetalSampleBufferRenderer {
     private func applyColorAttachments(to buffer: CVPixelBuffer, forceSDR: Bool) {
         let isHDR = streamLooksHDR && !forceSDR
         hdrMetadataApplied = isHDR
-        CVBufferSetAttachment(
-            buffer,
-            kCVImageBufferAlphaChannelIsOpaque,
-            kCFBooleanTrue,
-            .shouldPropagate
-        )
-        CVBufferSetAttachment(
-            buffer,
-            kCVImageBufferColorPrimariesKey,
-            (forceSDR ? kCVImageBufferColorPrimaries_ITU_R_709_2 : colorPrimariesAttachmentValue()) as CFTypeRef,
-            .shouldPropagate
-        )
-        CVBufferSetAttachment(
-            buffer,
-            kCVImageBufferTransferFunctionKey,
-            (forceSDR ? kCVImageBufferTransferFunction_ITU_R_709_2 : transferFunctionAttachmentValue()) as CFTypeRef,
-            .shouldPropagate
-        )
-        CVBufferSetAttachment(
-            buffer,
-            kCVImageBufferYCbCrMatrixKey,
-            (forceSDR ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 : ycbcrMatrixAttachmentValue()) as CFTypeRef,
-            .shouldPropagate
-        )
-        if let colorSpace = forceSDR ? CGColorSpace(name: CGColorSpace.sRGB) : colorSpaceAttachmentValue() {
-            CVBufferSetAttachment(
-                buffer,
-                kCVImageBufferCGColorSpaceKey,
-                colorSpace as CFTypeRef,
-                .shouldPropagate
-            )
+        ensureColorMetadataCache()
+        if let attachments = forceSDR
+            ? cachedSDRColorAttachments
+            : cachedSourceColorAttachments {
+            CVBufferSetAttachments(buffer, attachments, .shouldPropagate)
         }
     }
 
@@ -3474,13 +3631,54 @@ public final class MPVMetalSampleBufferRenderer {
         if forceSDR {
             return "\(pixelFormatDescription(pixelFormat))|bt709|bt709|bt709|sdr"
         }
-        return [
-            pixelFormatDescription(pixelFormat),
-            colorPrimariesAttachmentValue() as String,
-            transferFunctionAttachmentValue() as String,
-            ycbcrMatrixAttachmentValue() as String,
-            String(format: "%.3f", videoSignalPeak)
+        ensureColorMetadataCache()
+        return "\(pixelFormatDescription(pixelFormat))|\(cachedSourceColorMetadataSignature)"
+    }
+
+    /// Resolve string metadata and immutable attachment objects only when mpv reports a metadata
+    /// change. The previous path lowercased strings, formatted a signature, allocated a color
+    /// space, and made five CoreVideo attachment calls for every frame.
+    private func rebuildColorMetadataCache() {
+        let transfer = videoTransferFunction.lowercased()
+        resolvedStreamLooksHDR = videoSignalPeak > 1.0
+            || transfer.contains("pq")
+            || transfer.contains("hlg")
+            || transfer.contains("2084")
+
+        let primaries = colorPrimariesAttachmentValue()
+        let transferFunction = transferFunctionAttachmentValue()
+        let matrix = ycbcrMatrixAttachmentValue()
+        let colorSpace = resolvedStreamLooksHDR
+            ? mpvMetalSampleBufferExtendedP3ColorSpace
+            : mpvMetalSampleBufferSRGBColorSpace
+        cachedSourceColorAttachments = [
+            kCVImageBufferAlphaChannelIsOpaque: kCFBooleanTrue!,
+            kCVImageBufferColorPrimariesKey: primaries,
+            kCVImageBufferTransferFunctionKey: transferFunction,
+            kCVImageBufferYCbCrMatrixKey: matrix,
+            kCVImageBufferCGColorSpaceKey: colorSpace,
+        ] as CFDictionary
+        cachedSourceColorMetadataSignature = [
+            primaries as String,
+            transferFunction as String,
+            matrix as String,
+            String(format: "%.3f", videoSignalPeak),
         ].joined(separator: "|")
+    }
+
+    private func ensureColorMetadataCache() {
+        if cachedSourceColorAttachments == nil {
+            rebuildColorMetadataCache()
+        }
+        if cachedSDRColorAttachments == nil {
+            cachedSDRColorAttachments = [
+                kCVImageBufferAlphaChannelIsOpaque: kCFBooleanTrue!,
+                kCVImageBufferColorPrimariesKey: kCVImageBufferColorPrimaries_ITU_R_709_2,
+                kCVImageBufferTransferFunctionKey: kCVImageBufferTransferFunction_ITU_R_709_2,
+                kCVImageBufferYCbCrMatrixKey: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                kCVImageBufferCGColorSpaceKey: mpvMetalSampleBufferSRGBColorSpace,
+            ] as CFDictionary
+        }
     }
 
     private func colorPrimariesAttachmentValue() -> CFString {
@@ -3516,13 +3714,6 @@ public final class MPVMetalSampleBufferRenderer {
         return kCVImageBufferYCbCrMatrix_ITU_R_709_2
     }
 
-    private func colorSpaceAttachmentValue() -> CGColorSpace? {
-        if streamLooksHDR {
-            return CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
-        }
-        return CGColorSpace(name: CGColorSpace.sRGB)
-    }
-
     private func ensureTimebase(at presentationTime: CMTime) {
         if displayLayer.controlTimebase == nil {
             var timebase: CMTimebase?
@@ -3532,19 +3723,31 @@ public final class MPVMetalSampleBufferRenderer {
                 timebaseOut: &timebase
             ) == noErr, let timebase {
                 CMTimebaseSetTime(timebase, time: presentationTime)
-                CMTimebaseSetRate(timebase, rate: sampleTimeline.effectiveRate)
+                lastAppliedTimebaseRate = nil
+                applyTimebaseRateIfNeeded(timebase, rate: sampleTimeline.effectiveRate)
                 displayLayer.controlTimebase = timebase
                 timelineIsAnchored = true
+                lastTimebaseDriftCheckTime = CACurrentMediaTime()
             }
         } else if let timebase = displayLayer.controlTimebase {
-            let current = CMTimebaseGetTime(timebase)
-            let drift = abs(CMTimeGetSeconds(current) - CMTimeGetSeconds(presentationTime))
-            if !timelineIsAnchored || !drift.isFinite || drift > 1.0 {
-                CMTimebaseSetTime(timebase, time: presentationTime)
-                timelineIsAnchored = true
+            let now = CACurrentMediaTime()
+            if !timelineIsAnchored || now - lastTimebaseDriftCheckTime >= 0.25 {
+                let current = CMTimebaseGetTime(timebase)
+                let drift = abs(CMTimeGetSeconds(current) - CMTimeGetSeconds(presentationTime))
+                lastTimebaseDriftCheckTime = now
+                if !timelineIsAnchored || !drift.isFinite || drift > 1.0 {
+                    CMTimebaseSetTime(timebase, time: presentationTime)
+                    timelineIsAnchored = true
+                }
             }
-            CMTimebaseSetRate(timebase, rate: sampleTimeline.effectiveRate)
+            applyTimebaseRateIfNeeded(timebase, rate: sampleTimeline.effectiveRate)
         }
+    }
+
+    private func applyTimebaseRateIfNeeded(_ timebase: CMTimebase, rate: Double) {
+        guard lastAppliedTimebaseRate != rate else { return }
+        CMTimebaseSetRate(timebase, rate: rate)
+        lastAppliedTimebaseRate = rate
     }
 
     private func updateHTTPHeaders(_ headers: [String: String]?) {
@@ -3618,13 +3821,6 @@ public final class MPVMetalSampleBufferRenderer {
         guard let handle = mpv else { return }
         var data: Int32 = value ? 1 : 0
         _ = name.withCString { mpv_set_property(handle, $0, MPV_FORMAT_FLAG, &data) }
-    }
-
-    private func getFlagProperty(_ name: String) -> Bool {
-        guard let handle = mpv else { return false }
-        var data: Int32 = 0
-        _ = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_FLAG, &data) }
-        return data != 0
     }
 
     private func getDoubleProperty(_ name: String) -> Double? {

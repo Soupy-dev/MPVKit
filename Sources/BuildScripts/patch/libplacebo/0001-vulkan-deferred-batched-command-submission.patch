@@ -1,0 +1,618 @@
+diff --git a/src/vulkan/command.c b/src/vulkan/command.c
+index 5f37ee9..4e49bdf 100644
+--- a/src/vulkan/command.c
++++ b/src/vulkan/command.c
+@@ -23,8 +23,11 @@ static VkResult vk_cmd_poll(struct vk_cmd *cmd, uint64_t timeout)
+ {
+     struct vk_ctx *vk = cmd->pool->vk;
+ 
+-    if (cmd->fence)
+-        return vk->WaitForFences(vk->dev, 1, &cmd->fence, VK_TRUE, timeout);
++    if (cmd->retired)
++        return VK_SUCCESS;
++
++    if (cmd->poll_fence)
++        return vk->WaitForFences(vk->dev, 1, &cmd->poll_fence, VK_TRUE, timeout);
+ 
+     return vk->WaitSemaphores(vk->dev, &(VkSemaphoreWaitInfo) {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+@@ -99,7 +102,9 @@ static struct vk_cmd *vk_cmd_create(struct vk_cmdpool *pool)
+         };
+         VK(vk->CreateFence(vk->dev, &finfo, PL_VK_ALLOC, &cmd->fence));
+         PL_VK_NAME(FENCE, cmd->fence, "cmd");
++        cmd->poll_fence = cmd->fence;
+     }
++    cmd->retired = true;
+     return cmd;
+ 
+ error:
+@@ -111,8 +116,16 @@ error:
+ void vk_dev_callback(struct vk_ctx *vk, vk_cb callback,
+                      const void *priv, const void *arg)
+ {
++    // Serialize against an in-flight vk_flush_queued: between its steal of
++    // cmds_queued and the re-publication into cmds_pending the stolen
++    // commands are in neither array, and running the callback in that window
++    // would destroy resources those commands still reference.
++    pl_mutex_lock(&vk->flush_lock);
+     pl_mutex_lock(&vk->lock);
+-    if (vk->cmds_pending.num > 0) {
++    if (vk->cmds_queued.num > 0) {
++        struct vk_cmd *last_cmd = vk->cmds_queued.elem[vk->cmds_queued.num - 1];
++        vk_cmd_callback(last_cmd, callback, priv, arg);
++    } else if (vk->cmds_pending.num > 0) {
+         struct vk_cmd *last_cmd = vk->cmds_pending.elem[vk->cmds_pending.num - 1];
+         vk_cmd_callback(last_cmd, callback, priv, arg);
+     } else {
+@@ -120,6 +133,7 @@ void vk_dev_callback(struct vk_ctx *vk, vk_cb callback,
+         callback((void *) priv, (void *) arg);
+     }
+     pl_mutex_unlock(&vk->lock);
++    pl_mutex_unlock(&vk->flush_lock);
+ }
+ 
+ void vk_cmd_callback(struct vk_cmd *cmd, vk_cb callback,
+@@ -417,6 +431,8 @@ struct vk_cmd *vk_cmd_begin(struct vk_cmdpool *pool, pl_debug_tag debug_tag)
+ 
+     if (cmd->fence)
+         vk->ResetFences(vk->dev, 1, &cmd->fence);
++    cmd->poll_fence = cmd->fence;
++    cmd->retired = false;
+ 
+     pool->sync[cmd->qindex].value++;
+     cmd->sync = pool->sync[cmd->qindex];
+@@ -430,60 +446,211 @@ error:
+     return NULL;
+ }
+ 
+-static VkResult vk_queue_submit2(struct vk_ctx *vk, VkQueue queue,
+-                                 const VkSubmitInfo2 *info2, VkFence fence)
++static VkResult vk_queue_submit2(struct vk_ctx *vk, VkQueue queue, uint32_t count,
++                                 const VkSubmitInfo2 *infos2, VkFence fence)
+ {
+     if (vk->QueueSubmit2KHR)
+-        return vk->QueueSubmit2KHR(queue, 1, info2, fence);
++        return vk->QueueSubmit2KHR(queue, count, infos2, fence);
++
++    void *tmp = pl_tmp(NULL);
++    VkSubmitInfo *infos = pl_calloc_ptr(tmp, count, infos);
++    VkTimelineSemaphoreSubmitInfo *tinfos = pl_calloc_ptr(tmp, count, tinfos);
++
++    for (uint32_t n = 0; n < count; n++) {
++        const VkSubmitInfo2 *info2 = &infos2[n];
++        const uint32_t num_deps = info2->waitSemaphoreInfoCount;
++        const uint32_t num_sigs = info2->signalSemaphoreInfoCount;
++        const uint32_t num_cmds = info2->commandBufferInfoCount;
++
++        VkSemaphore *deps           = pl_calloc_ptr(tmp, num_deps, deps);
++        VkPipelineStageFlags *masks = pl_calloc_ptr(tmp, num_deps, masks);
++        uint64_t *depvals           = pl_calloc_ptr(tmp, num_deps, depvals);
++        VkSemaphore *sigs           = pl_calloc_ptr(tmp, num_sigs, sigs);
++        uint64_t *sigvals           = pl_calloc_ptr(tmp, num_sigs, sigvals);
++        VkCommandBuffer *cmds       = pl_calloc_ptr(tmp, num_cmds, cmds);
++
++        for (int i = 0; i < num_deps; i++) {
++            deps[i] = info2->pWaitSemaphoreInfos[i].semaphore;
++            masks[i] = info2->pWaitSemaphoreInfos[i].stageMask;
++            depvals[i] = info2->pWaitSemaphoreInfos[i].value;
++        }
++        for (int i = 0; i < num_sigs; i++) {
++            sigs[i] = info2->pSignalSemaphoreInfos[i].semaphore;
++            sigvals[i] = info2->pSignalSemaphoreInfos[i].value;
++        }
++        for (int i = 0; i < num_cmds; i++)
++            cmds[i] = info2->pCommandBufferInfos[i].commandBuffer;
++
++        tinfos[n] = (VkTimelineSemaphoreSubmitInfo) {
++            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++            .pNext = info2->pNext,
++            .waitSemaphoreValueCount = num_deps,
++            .pWaitSemaphoreValues = depvals,
++            .signalSemaphoreValueCount = num_sigs,
++            .pSignalSemaphoreValues = sigvals,
++        };
+ 
+-    const uint32_t num_deps = info2->waitSemaphoreInfoCount;
+-    const uint32_t num_sigs = info2->signalSemaphoreInfoCount;
+-    const uint32_t num_cmds = info2->commandBufferInfoCount;
++        infos[n] = (VkSubmitInfo) {
++            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++            .pNext = &tinfos[n],
++            .waitSemaphoreCount = num_deps,
++            .pWaitSemaphores = deps,
++            .pWaitDstStageMask = masks,
++            .commandBufferCount = num_cmds,
++            .pCommandBuffers = cmds,
++            .signalSemaphoreCount = num_sigs,
++            .pSignalSemaphores = sigs,
++        };
++    }
++
++    VkResult res = vk->QueueSubmit(queue, count, infos, fence);
++    pl_free(tmp);
++    return res;
++}
++
++// Whether `cmd` may join a merged submission that begins with `first`. All
++// semaphore waits of a merged submission take effect before its first command
++// buffer, so a command waiting on the batch's own timeline at or past the
++// batch's first value would deadlock against a signal deferred to the end.
++static bool vk_cmd_may_merge(struct vk_cmd *first, struct vk_cmd *cmd)
++{
++    if (cmd->queue != first->queue)
++        return false;
++    for (int n = 0; n < cmd->deps.num; n++) {
++        if (cmd->deps.elem[n].semaphore == first->sync.sem &&
++            cmd->deps.elem[n].value >= first->sync.value)
++            return false;
++    }
++    return true;
++}
++
++static bool vk_cmd_submit_batch(struct vk_ctx *vk, struct vk_cmd **cmds, int num)
++{
++    if (!num)
++        return true;
+ 
+     void *tmp = pl_tmp(NULL);
+-    VkSemaphore *deps           = pl_calloc_ptr(tmp, num_deps, deps);
+-    VkPipelineStageFlags *masks = pl_calloc_ptr(tmp, num_deps, masks);
+-    uint64_t *depvals           = pl_calloc_ptr(tmp, num_deps, depvals);
+-    VkSemaphore *sigs           = pl_calloc_ptr(tmp, num_sigs, sigs);
+-    uint64_t *sigvals           = pl_calloc_ptr(tmp, num_sigs, sigvals);
+-    VkCommandBuffer *cmds       = pl_calloc_ptr(tmp, num_cmds, cmds);
+-
+-    for (int i = 0; i < num_deps; i++) {
+-        deps[i] = info2->pWaitSemaphoreInfos[i].semaphore;
+-        masks[i] = info2->pWaitSemaphoreInfos[i].stageMask;
+-        depvals[i] = info2->pWaitSemaphoreInfos[i].value;
++    VkSubmitInfo2 *sinfos = pl_calloc_ptr(tmp, num, sinfos);
++    VkCommandBufferSubmitInfo *binfos = pl_calloc_ptr(tmp, num, binfos);
++    struct vk_cmdpool *pool = cmds[num - 1]->pool;
++    VkQueue queue = cmds[num - 1]->queue;
++    int qindex = cmds[num - 1]->qindex;
++    VkFence fence = cmds[num - 1]->fence;
++    int num_infos = 0;
++
++    for (int i = 0; i < num; i++) {
++        struct vk_cmd *cmd = cmds[i];
++        pl_assert(cmd->queue == queue);
++        cmd->poll_fence = fence;
++
++        if (pl_msg_test(vk->log, PL_LOG_TRACE)) {
++            PL_TRACE(vk, "Submitting command %p on queue %p (QF %d):",
++                     (void *) cmd->buf, (void *) cmd->queue, pool->qf);
++            for (int n = 0; n < cmd->deps.num; n++) {
++                PL_TRACE(vk, "    waits on semaphore 0x%"PRIx64" = %"PRIu64,
++                         (uint64_t) cmd->deps.elem[n].semaphore, cmd->deps.elem[n].value);
++            }
++            for (int n = 0; n < cmd->sigs.num; n++) {
++                PL_TRACE(vk, "    signals semaphore 0x%"PRIx64" = %"PRIu64,
++                        (uint64_t) cmd->sigs.elem[n].semaphore, cmd->sigs.elem[n].value);
++            }
++            if (cmd->callbacks.num)
++                PL_TRACE(vk, "    signals %d callbacks", cmd->callbacks.num);
++        }
+     }
+-    for (int i = 0; i < num_sigs; i++) {
+-        sigs[i] = info2->pSignalSemaphoreInfos[i].semaphore;
+-        sigvals[i] = info2->pSignalSemaphoreInfos[i].value;
++
++    // Coalesce consecutive commands into as few VkSubmitInfo2 entries as
++    // possible: every entry costs a full submission unit downstream (on
++    // MoltenVK: an MTLCommandBuffer plus commit machinery). Merged waits move
++    // to the entry's start and merged signals to its end; both directions are
++    // conservative for everything except an intra-entry timeline dependency,
++    // which vk_cmd_may_merge splits into a fresh entry. Command buffers within
++    // an entry keep submission order, which is what the pipeline barriers
++    // recorded inside them synchronize against.
++    int i = 0;
++    while (i < num) {
++        struct vk_cmd *first = cmds[i];
++        int group_end = i + 1;
++        while (group_end < num && vk_cmd_may_merge(first, cmds[group_end]))
++            group_end++;
++
++        PL_ARRAY(VkSemaphoreSubmitInfo) deps = {0};
++        PL_ARRAY(VkSemaphoreSubmitInfo) sigs = {0};
++        for (int c = i; c < group_end; c++) {
++            struct vk_cmd *cmd = cmds[c];
++            binfos[c] = (VkCommandBufferSubmitInfo) {
++                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++                .commandBuffer = cmd->buf,
++            };
++            for (int n = 0; n < cmd->deps.num; n++) {
++                const VkSemaphoreSubmitInfo *dep = &cmd->deps.elem[n];
++                bool found = false;
++                for (int m = 0; m < deps.num; m++) {
++                    if (deps.elem[m].semaphore == dep->semaphore) {
++                        found = true;
++                        deps.elem[m].stageMask |= dep->stageMask;
++                        if (dep->value > deps.elem[m].value)
++                            deps.elem[m].value = dep->value;
++                        break;
++                    }
++                }
++                if (!found)
++                    PL_ARRAY_APPEND(tmp, deps, *dep);
++            }
++            for (int n = 0; n < cmd->sigs.num; n++) {
++                const VkSemaphoreSubmitInfo *sig = &cmd->sigs.elem[n];
++                bool found = false;
++                for (int m = 0; m < sigs.num; m++) {
++                    if (sigs.elem[m].semaphore == sig->semaphore) {
++                        found = true;
++                        sigs.elem[m].stageMask |= sig->stageMask;
++                        if (sig->value > sigs.elem[m].value)
++                            sigs.elem[m].value = sig->value;
++                        break;
++                    }
++                }
++                if (!found)
++                    PL_ARRAY_APPEND(tmp, sigs, *sig);
++            }
++        }
++
++        sinfos[num_infos++] = (VkSubmitInfo2) {
++            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
++            .waitSemaphoreInfoCount = deps.num,
++            .pWaitSemaphoreInfos = deps.elem,
++            .signalSemaphoreInfoCount = sigs.num,
++            .pSignalSemaphoreInfos = sigs.elem,
++            .commandBufferInfoCount = group_end - i,
++            .pCommandBufferInfos = &binfos[i],
++        };
++        i = group_end;
+     }
+-    for (int i = 0; i < num_cmds; i++)
+-        cmds[i] = info2->pCommandBufferInfos[i].commandBuffer;
+-
+-    const VkTimelineSemaphoreSubmitInfo tinfo = {
+-        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+-        .pNext = info2->pNext,
+-        .waitSemaphoreValueCount = num_deps,
+-        .pWaitSemaphoreValues = depvals,
+-        .signalSemaphoreValueCount = num_sigs,
+-        .pSignalSemaphoreValues = sigvals,
+-    };
+ 
+-    const VkSubmitInfo info = {
+-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+-        .pNext = &tinfo,
+-        .waitSemaphoreCount = num_deps,
+-        .pWaitSemaphores = deps,
+-        .pWaitDstStageMask = masks,
+-        .commandBufferCount = num_cmds,
+-        .pCommandBuffers = cmds,
+-        .signalSemaphoreCount = num_sigs,
+-        .pSignalSemaphores = sigs,
+-    };
++    vk->lock_queue(vk->queue_ctx, pool->qf, qindex);
++    VkResult res = vk_queue_submit2(vk, queue, num_infos, sinfos, fence);
++    vk->unlock_queue(vk->queue_ctx, pool->qf, qindex);
++    PL_VK_ASSERT(res, "vkQueueSubmit2");
+ 
+-    VkResult res = vk->QueueSubmit(queue, 1, &info, fence);
++    pl_mutex_lock(&vk->lock);
++    for (int n = 0; n < num; n++)
++        PL_ARRAY_APPEND(vk->alloc, vk->cmds_pending, cmds[n]);
++    pl_mutex_unlock(&vk->lock);
+     pl_free(tmp);
+-    return res;
++    return true;
++
++error:
++    for (int n = 0; n < num; n++) {
++        struct vk_cmd *cmd = cmds[n];
++        cmd->poll_fence = cmd->fence;
++        vk_cmd_reset(cmd);
++        cmd->retired = true;
++        pl_mutex_lock(&vk->lock);
++        PL_ARRAY_APPEND(cmd->pool, cmd->pool->cmds, cmd);
++        pl_mutex_unlock(&vk->lock);
++    }
++    vk->failed = true;
++    pl_free(tmp);
++    return false;
+ }
+ 
+ bool vk_cmd_submit(struct vk_cmd **pcmd)
+@@ -498,47 +665,22 @@ bool vk_cmd_submit(struct vk_cmd **pcmd)
+ 
+     VK(vk->EndCommandBuffer(cmd->buf));
+ 
+-    VkSubmitInfo2 sinfo = {
+-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+-        .waitSemaphoreInfoCount = cmd->deps.num,
+-        .pWaitSemaphoreInfos = cmd->deps.elem,
+-        .signalSemaphoreInfoCount = cmd->sigs.num,
+-        .pSignalSemaphoreInfos = cmd->sigs.elem,
+-        .commandBufferInfoCount = 1,
+-        .pCommandBufferInfos = &(VkCommandBufferSubmitInfo) {
+-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+-            .commandBuffer = cmd->buf,
+-        },
+-    };
+-
+-    if (pl_msg_test(vk->log, PL_LOG_TRACE)) {
+-        PL_TRACE(vk, "Submitting command %p on queue %p (QF %d):",
+-                 (void *) cmd->buf, (void *) cmd->queue, pool->qf);
+-        for (int n = 0; n < cmd->deps.num; n++) {
+-            PL_TRACE(vk, "    waits on semaphore 0x%"PRIx64" = %"PRIu64,
+-                     (uint64_t) cmd->deps.elem[n].semaphore, cmd->deps.elem[n].value);
+-        }
+-        for (int n = 0; n < cmd->sigs.num; n++) {
+-            PL_TRACE(vk, "    signals semaphore 0x%"PRIx64" = %"PRIu64,
+-                    (uint64_t) cmd->sigs.elem[n].semaphore, cmd->sigs.elem[n].value);
+-        }
+-        if (cmd->callbacks.num)
+-            PL_TRACE(vk, "    signals %d callbacks", cmd->callbacks.num);
++    if (vk->defer_cmd_submits) {
++        pl_mutex_lock(&vk->lock);
++        PL_ARRAY_APPEND(vk->alloc, vk->cmds_queued, cmd);
++        bool overflow = vk->cmds_queued.num >= 16;
++        pl_mutex_unlock(&vk->lock);
++        if (overflow)
++            vk_flush_queued(vk);
++        return true;
+     }
+ 
+     pl_assert(pool->sync[cmd->qindex].value == cmd->sync.value);
+-    vk->lock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
+-    VkResult res = vk_queue_submit2(vk, cmd->queue, &sinfo, cmd->fence);
+-    vk->unlock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
+-    PL_VK_ASSERT(res, "vkQueueSubmit2");
+-
+-    pl_mutex_lock(&vk->lock);
+-    PL_ARRAY_APPEND(vk->alloc, vk->cmds_pending, cmd);
+-    pl_mutex_unlock(&vk->lock);
+-    return true;
++    return vk_cmd_submit_batch(vk, &cmd, 1);
+ 
+ error:
+     vk_cmd_reset(cmd);
++    cmd->retired = true;
+     pl_mutex_lock(&vk->lock);
+     PL_ARRAY_APPEND(pool, pool->cmds, cmd);
+     pl_mutex_unlock(&vk->lock);
+@@ -546,9 +688,60 @@ error:
+     return false;
+ }
+ 
++bool vk_flush_queued(struct vk_ctx *vk)
++{
++    if (!vk->defer_cmd_submits)
++        return true;
++
++    pl_mutex_lock(&vk->flush_lock);
++    pl_mutex_lock(&vk->lock);
++    int num = vk->cmds_queued.num;
++    if (!num) {
++        pl_mutex_unlock(&vk->lock);
++        pl_mutex_unlock(&vk->flush_lock);
++        return true;
++    }
++
++    void *tmp = pl_tmp(NULL);
++    struct vk_cmd **cmds = pl_calloc_ptr(tmp, num, cmds);
++    memcpy(cmds, vk->cmds_queued.elem, num * sizeof(*cmds));
++    vk->cmds_queued.num = 0;
++    pl_mutex_unlock(&vk->lock);
++
++    bool ok = true;
++    int start = 0;
++    for (int i = 1; i <= num; i++) {
++        if (i == num || cmds[i]->queue != cmds[start]->queue) {
++            ok &= vk_cmd_submit_batch(vk, &cmds[start], i - start);
++            start = i;
++        }
++    }
++
++    pl_free(tmp);
++    pl_mutex_unlock(&vk->flush_lock);
++    return ok;
++}
++
+ bool vk_poll_commands(struct vk_ctx *vk, uint64_t timeout)
+ {
+     bool ret = false;
++
++    // A blocking wait can only make progress on commands that actually
++    // reached the queue, so drain any deferred submissions first. A
++    // non-blocking poll must also flush once nothing is pending, or a
++    // tight `while (pl_buf_poll(..., 0))` loop over queued-only work would
++    // never observe progress.
++    if (vk->defer_cmd_submits) {
++        bool need_flush = timeout;
++        if (!need_flush) {
++            pl_mutex_lock(&vk->lock);
++            need_flush = !vk->cmds_pending.num && vk->cmds_queued.num;
++            pl_mutex_unlock(&vk->lock);
++        }
++        if (need_flush)
++            vk_flush_queued(vk);
++    }
++
+     pl_mutex_lock(&vk->lock);
+ 
+     while (vk->cmds_pending.num) {
+@@ -565,6 +758,7 @@ bool vk_poll_commands(struct vk_ctx *vk, uint64_t timeout)
+                  (uint64_t) cmd->sync.sem, cmd->sync.value);
+         PL_ARRAY_REMOVE_AT(vk->cmds_pending, 0); // remove before callbacks
+         vk_cmd_reset(cmd);
++        cmd->retired = true;
+         PL_ARRAY_APPEND(pool, pool->cmds, cmd);
+         ret = true;
+ 
+diff --git a/src/vulkan/command.h b/src/vulkan/command.h
+index 447bd7b..fa63c82 100644
+--- a/src/vulkan/command.h
++++ b/src/vulkan/command.h
+@@ -51,6 +51,11 @@ struct vk_cmd {
+     int qindex;              // the index of `queue` in `pool`
+     VkCommandBuffer buf;     // the command buffer itself
+     VkFence fence;           // Only used on MoltenVK
++    VkFence poll_fence;      // fence to poll for completion (may be shared
++                             // with a later command in the same batch)
++    bool retired;            // fully completed and returned to the pool; the
++                             // shared poll_fence may be stale, so polls must
++                             // report success without touching it
+     // Command dependencies and signals. Not owned by the vk_cmd.
+     PL_ARRAY(VkSemaphoreSubmitInfo) deps;
+     PL_ARRAY(VkSemaphoreSubmitInfo) sigs;
+@@ -125,8 +130,20 @@ struct vk_cmd *vk_cmd_begin(struct vk_cmdpool *pool, pl_debug_tag debug_tag);
+ 
+ // Finish recording a command buffer and submit it for execution. This function
+ // takes over ownership of **cmd, and sets *cmd to NULL in doing so.
++//
++// When `vk->defer_cmd_submits` is set, the command is only recorded into
++// `vk->cmds_queued`; the actual queue submission happens on the next
++// `vk_flush_queued`, which batches consecutive same-queue commands into a
++// single vkQueueSubmit2 call.
+ bool vk_cmd_submit(struct vk_cmd **cmd);
+ 
++// Submit all commands whose submission was deferred for batching. Called
++// automatically before any blocking wait on command completion; must also be
++// called before operations that wait on queued work outside this abstraction
++// (presentation, externally exported semaphores, direct semaphore waits).
++// Returns false if any queue submission failed (`vk->failed` is also set).
++bool vk_flush_queued(struct vk_ctx *vk);
++
+ // Block until some commands complete executing. This is the only function that
+ // actually processes the callbacks. Will wait at most `timeout` nanoseconds
+ // for the completion of any command. The timeout may also be passed as 0, in
+diff --git a/src/vulkan/common.h b/src/vulkan/common.h
+index 080d800..d628ada 100644
+--- a/src/vulkan/common.h
++++ b/src/vulkan/common.h
+@@ -99,6 +99,14 @@ struct vk_ctx {
+     // submission and callbacks are FIFO
+     PL_ARRAY(struct vk_cmd *) cmds_pending; // submitted but not completed
+ 
++    // Commands that finished recording but whose queue submission is being
++    // deferred, so consecutive same-queue commands can be batched into a
++    // single vkQueueSubmit2 call. Only used when `defer_cmd_submits` is set;
++    // guarded by `lock`, drained in FIFO order under `flush_lock`.
++    PL_ARRAY(struct vk_cmd *) cmds_queued; // recorded but not submitted
++    bool defer_cmd_submits;
++    pl_mutex flush_lock;
++
+     // Pending callbacks that still need to be drained before processing
+     // callbacks for the next command (in case commands are recursively being
+     // polled from another callback)
+diff --git a/src/vulkan/context.c b/src/vulkan/context.c
+index 168b420..23fadeb 100644
+--- a/src/vulkan/context.c
++++ b/src/vulkan/context.c
+@@ -955,6 +955,7 @@ void pl_vulkan_destroy(pl_vulkan *pl_vk)
+     }
+ 
+     pl_vk_inst_destroy(&vk->internal_instance);
++    pl_mutex_destroy(&vk->flush_lock);
+     pl_mutex_destroy(&vk->lock);
+     pl_free_ptr((void **) pl_vk);
+ }
+@@ -1480,6 +1481,7 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
+     };
+ 
+     pl_mutex_init_type(&vk->lock, PL_MUTEX_RECURSIVE);
++    pl_mutex_init_type(&vk->flush_lock, PL_MUTEX_RECURSIVE);
+     if (!vk->GetInstanceProcAddr)
+         goto error;
+ 
+@@ -1542,6 +1544,17 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
+     vk->props = prop.properties;
+     vk->driver_props = driver_props;
+ 
++    // MoltenVK translates every vkQueueSubmit2 into comparatively expensive
++    // MTLCommandBuffer commit machinery, so batching per-pass submissions
++    // into one call per flush point is a large CPU win there. Opt-in only:
++    // hosts enable it explicitly through the environment.
++    if (driver_props.driverID == VK_DRIVER_ID_MOLTENVK) {
++        const char *defer = getenv("PL_VK_DEFER_SUBMITS");
++        vk->defer_cmd_submits = defer && defer[0] == '1' && !defer[1];
++        if (vk->defer_cmd_submits)
++            PL_INFO(vk, "    Deferred command submission: enabled");
++    }
++
+     PL_INFO(vk, "Vulkan device properties:");
+     PL_INFO(vk, "    Device Name: %s", prop.properties.deviceName);
+     PL_INFO(vk, "    Device ID: %"PRIx32":%"PRIx32, prop.properties.vendorID,
+@@ -1610,6 +1623,7 @@ pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *par
+     };
+ 
+     pl_mutex_init_type(&vk->lock, PL_MUTEX_RECURSIVE);
++    pl_mutex_init_type(&vk->flush_lock, PL_MUTEX_RECURSIVE);
+     if (!vk->GetInstanceProcAddr)
+         goto error;
+ 
+diff --git a/src/vulkan/gpu.c b/src/vulkan/gpu.c
+index e541582..67cdb90 100644
+--- a/src/vulkan/gpu.c
++++ b/src/vulkan/gpu.c
+@@ -752,6 +752,7 @@ static void vk_gpu_flush(pl_gpu gpu)
+     struct pl_vk *p = PL_PRIV(gpu);
+     struct vk_ctx *vk = p->vk;
+     CMD_SUBMIT(NULL);
++    vk_flush_queued(vk);
+     vk_rotate_queues(vk);
+     vk_malloc_garbage_collect(vk->ma);
+ }
+@@ -761,6 +762,7 @@ static void vk_gpu_finish(pl_gpu gpu)
+     struct pl_vk *p = PL_PRIV(gpu);
+     struct vk_ctx *vk = p->vk;
+     CMD_SUBMIT(NULL);
++    vk_flush_queued(vk);
+     vk_wait_idle(vk);
+ }
+ 
+diff --git a/src/vulkan/gpu_buf.c b/src/vulkan/gpu_buf.c
+index e291a0a..6ea3693 100644
+--- a/src/vulkan/gpu_buf.c
++++ b/src/vulkan/gpu_buf.c
+@@ -402,6 +402,7 @@ bool vk_buf_read(pl_gpu gpu, pl_buf buf, size_t offset, void *dest, size_t size)
+ 
+     if (vk_buf_poll(gpu, buf, 0) && buf_vk->sem.write.sync.sem) {
+         // ensure no more queued writes
++        vk_flush_queued(vk);
+         VK(vk->WaitSemaphores(vk->dev, &(VkSemaphoreWaitInfo) {
+             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+             .semaphoreCount = 1,
+diff --git a/src/vulkan/gpu_tex.c b/src/vulkan/gpu_tex.c
+index 313f5d7..46bcdc4 100644
+--- a/src/vulkan/gpu_tex.c
++++ b/src/vulkan/gpu_tex.c
+@@ -1445,6 +1445,13 @@ bool pl_vulkan_hold_ex(pl_gpu gpu, const struct pl_vulkan_hold_params *params)
+ 
+     vk_cmd_sig(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, params->semaphore);
+     bool ok = CMD_SUBMIT(&cmd);
++    // The caller waits on `params->semaphore` outside this abstraction, so
++    // deferred submissions must reach the queue before returning; a failed
++    // flush means the semaphore will never signal and the hold must fail
++    if (ok) {
++        struct pl_vk *p = PL_PRIV(gpu);
++        ok = vk_flush_queued(p->vk);
++    }
+ 
+     if (!tex_vk->num_planes) {
+         tex_vk->sem.write.queue = tex_vk->sem.read.queue = NULL;
+diff --git a/src/vulkan/swapchain.c b/src/vulkan/swapchain.c
+index fa38e9c..3a8d45a 100644
+--- a/src/vulkan/swapchain.c
++++ b/src/vulkan/swapchain.c
+@@ -953,6 +953,15 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
+         return false;
+     }
+ 
++    // Presentation waits on `sem_out` at the queue level, so every deferred
++    // submission (including the command signalling it) must be flushed first;
++    // a failed flush leaves `sem_out` with no pending signal, and presenting
++    // against it would wedge the queue instead of surfacing the error
++    if (!vk_flush_queued(vk)) {
++        pl_mutex_unlock(&p->lock);
++        return false;
++    }
++
+     struct vk_cmdpool *pool = vk->pool_graphics;
+     int qidx = pool->idx_queues;
+     VkQueue queue = pool->queues[qidx];

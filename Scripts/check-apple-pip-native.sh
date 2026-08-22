@@ -67,6 +67,10 @@ for invariant in \
     'apple_pip_metal_target_blit' \
     'MPV_APPLE_PIP_CAP_ASYNC_METAL_BLIT' \
     'MPV_APPLE_PIP_CAP_INLINE_RESTORE_NOTIFICATION' \
+    'MPV_APPLE_PIP_CAP_INLINE_FRESH_FRAME_NOTIFICATION' \
+    'MPV_APPLE_PIP_MODE_INLINE_FRESH_FRAME' \
+    'p->apple_pip_highest_seen_frame_id' \
+    'frame_id <= state->inline_probe_baseline_frame_id' \
     'apple_pip_signal_inline_presented'
 do
     if ! grep -Fq "$invariant" "$sink_source"; then
@@ -74,6 +78,17 @@ do
         exit 1
     fi
 done
+
+fresh_probe_block="$(sed -n \
+    '/if (fresh_inline)/,/} else if (effective_mode == MPV_APPLE_PIP_MODE_INLINE_ONLY)/p' \
+    "$sink_source")"
+if [[ -z "$fresh_probe_block" ]] ||
+   grep -Fq 'force_redraw = true' <<<"$fresh_probe_block" ||
+   grep -Fq 'vo->want_redraw = true' <<<"$fresh_probe_block" ||
+   grep -Fq 'p->last_id' <<<"$fresh_probe_block"; then
+    echo "Fresh-frame validation must use the monotonic VO frame fence without forcing redraw." >&2
+    exit 1
+fi
 
 if ! grep -Fq 'if (buffer_count > (UInt32)MP_NUM_CHANNELS)' "$audio_source"; then
     echo "AudioUnit silence recovery must cap the AudioBufferList walk." >&2

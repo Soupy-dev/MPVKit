@@ -7,6 +7,14 @@ enum Build {
             try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: false, attributes: nil)
         }
         try? Utility.removeFiles(extensions: [".swift"], currentDirectoryURL: URL.currentDirectory + ["dist", "release"])
+        // Every full build restores MoltenVK from its pinned upstream archive. Invalidate the
+        // private backport marker before any artifact can be replaced so an interrupted or stock
+        // rebuild can never retain permission to enable the imported-texture residency fast path.
+        try? FileManager.default.removeItem(
+            at: URL.currentDirectory + [
+                "dist", "release", "MoltenVK.imported-mtltexture-residency-fix",
+            ]
+        )
         FileManager.default.changeCurrentDirectoryPath(path.path)
         BaseBuild.options = options
         if !options.platforms.isEmpty {
@@ -394,9 +402,8 @@ class BaseBuild {
     }
 
     func createXCFramework() throws {
-        // clean all old xcframework
-        try? Utility.removeFiles(extensions: [".xcframework"], currentDirectoryURL: self.xcframeworkDirectoryURL)
-
+        // buildXCFramework removes only the output it is about to replace. Preserve unrelated
+        // local runtimes in this shared directory, such as Eclipse's provenance-marked MoltenVK.
         var frameworks: [String] = []
         let libNames = try self.frameworks()
         for libName in libNames {

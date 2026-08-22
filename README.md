@@ -112,6 +112,12 @@ visible layer immediately while coalescing expensive drawable resizes. Invalid
 or non-finite sizes are ignored, and a zero-sized detachment keeps the last
 valid drawable.
 
+Hosts that require hardware-only decoding should pass
+`additionalMPVOptions["hwdec-software-fallback"] = "no"`. MPVKit applies that
+policy to both the primary gpu-next handle and the compatibility dual-session
+PiP handle; the standalone compatibility renderer otherwise keeps its
+source-compatible software-fallback default.
+
 Diagnostics expose the requested and selected PiP backend, fallback reason,
 active mpv instance count, preparation generation/latency, resize requests and
 coalescing, scheduler coalescing, display backpressure, pool exhaustion, stale
@@ -194,19 +200,32 @@ make help
 
 ## Make demo app using the local build version
 
-Set `MPVKIT_LOCAL_ARTIFACTS_DIR` to a relative or absolute directory that
-resolves inside this checkout. The manifest looks both in that directory and
-its `xcframework/` child for locally built `.xcframework` directories or
-`.xcframework.zip` archives. This means the standard `make build` layout can
-be selected by pointing at `dist/release`, while artifacts are discovered in
-`dist/release/xcframework`. Unpacked XCFrameworks are preferred to ZIP archives
-when both are present.
+On a fresh manifest evaluation, `dist/release` is selected automatically only
+when it contains the complete coupled libmpv, MoltenVK, libplacebo, and FFmpeg
+runtime for Eclipse's active iOS, tvOS, and macOS-harness matrix. SwiftPM's
+shared manifest cache does not watch generated artifact contents, however, so
+deterministic build and archive commands should explicitly set
+`MPVKIT_LOCAL_ARTIFACTS_DIR`. Source-only manifest evaluations continue using
+the versioned remote artifacts.
 
-Files must use their Swift package target names, such as
-`Libmpv-GPL.xcframework.zip`. Matching local artifacts are used automatically;
-targets that are not present continue using their versioned remote artifacts.
-GPL targets also recognize the unsuffixed filenames emitted directly by
-`make build enable-gpl`, such as `Libmpv.xcframework.zip`.
+Set `MPVKIT_LOCAL_ARTIFACTS_DIR` to explicitly select a different relative or
+absolute directory inside this checkout. The manifest looks both in that
+directory and its `xcframework/` child for the ten required unpacked
+`.xcframework` directories. ZIP-only roots are rejected. Every required
+artifact must expose the complete active slice/architecture matrix; a missing,
+partial, or ambiguous coupled runtime fails manifest evaluation instead of
+mixing private local binaries with versioned remote binaries.
+
+Local files use the unsuffixed names emitted by `make build enable-gpl`, such as
+`Libmpv.xcframework` and `Libavcodec.xcframework`. GPL binary targets are bound
+to those exact validated paths. Unrelated binary targets not in the coupled
+runtime set continue using their versioned remote artifacts.
+
+A locally backported MoltenVK imported-texture residency fix is recognized only
+when both `MoltenVK.xcframework` and the provenance marker
+`MoltenVK.imported-mtltexture-residency-fix` exist under the selected artifact
+root. Without that marker, MPVKit keeps Metal argument buffers disabled to avoid
+the MoltenVK 1.4.1 asynchronous PiP device-loss path.
 
 ```bash
 export MPVKIT_LOCAL_ARTIFACTS_DIR=dist/release
@@ -216,8 +235,9 @@ xcodebuild -resolvePackageDependencies # or build a demo/Eclipse normally
 The directory must resolve inside this MPVKit checkout because SwiftPM local
 binary target paths are package-relative. The variable affects manifest
 evaluation, so it must be present in the environment that launches
-`xcodebuild` or resolves the package. Unset it to verify the release
-URL/checksum path.
+`xcodebuild` or resolves the package. To verify the release URL/checksum path in
+a checkout that has `dist/release`, temporarily move that runtime out of the
+package directory as well as unsetting the variable.
 
 ## Run default mpv player
 

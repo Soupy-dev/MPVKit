@@ -42,6 +42,15 @@ git -C "$worktree" diff --check
 grep -Fq '*target_ptr = NULL;' "$worktree/video/out/apple_pip_metal.m"
 grep -Fq '.uninit         = moltenvk_uninit,' "$worktree/video/out/vulkan/context_moltenvk.m"
 
+# PiP target reuse must remain bounded by the public queue limit, retain the
+# libplacebo fence poll before reuse, and clear only at the two drain barriers.
+grep -Fq 'target_cache[APPLE_PIP_MAX_TARGETS]' "$worktree/video/out/vo_gpu_next.c"
+grep -Fq 'if (needs_poll && pl_tex_poll' "$worktree/video/out/vo_gpu_next.c"
+grep -Fq 'apple_pip_release_cached_target_locked(state, cache_entry);' \
+    "$worktree/video/out/vo_gpu_next.c"
+[[ "$(grep -Fc 'apple_pip_clear_target_cache_locked(p);' \
+    "$worktree/video/out/vo_gpu_next.c")" -eq 2 ]]
+
 iphone_sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
 xcrun --sdk iphoneos clang \
     -fsyntax-only \

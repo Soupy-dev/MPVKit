@@ -61,7 +61,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe24b51708
 --- /dev/null
 +++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,185 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -118,6 +118,8 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +    CGColorSpaceRef previous_color_space = p->layer.colorspace;
 +    if (previous_color_space)
 +        CFRetain(previous_color_space);
++    int previous_width = ctx->vo->dwidth;
++    int previous_height = ctx->vo->dheight;
 +
 +    // `ra_vk_ctx_resize` writes vo->dwidth/dheight from the actual extent
 +    // returned by pl_swapchain_resize. Do not overwrite those values with
@@ -128,6 +130,8 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +        CFRelease(previous_color_space);
 +    }
 +    if (!ok) {
++        ctx->vo->dwidth = previous_width;
++        ctx->vo->dheight = previous_height;
 +        MP_WARN(ctx, "surface resize requested=%dx%d failed reason=%s; will retry\n",
 +                width, height, reason ? reason : "unknown");
 +        return false;
@@ -203,7 +207,11 @@ index 0000000000000000000000000000000000000000..0f7decdbaaaf5b47265087e43792d3fe
 +        return true;
 +    }
 +
-+    return moltenvk_resize(ctx, width, height, "reconfig");
++    // A transient layer/surface migration failure must not tear down the VO.
++    // moltenvk_resize deliberately leaves the last successful size unchanged,
++    // so VOCTRL_CHECK_EVENTS retries as soon as the surface becomes usable.
++    moltenvk_resize(ctx, width, height, "reconfig");
++    return true;
 +}
 +
 +static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)

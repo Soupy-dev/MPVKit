@@ -13,9 +13,13 @@ _Static_assert(MPV_APPLE_PIP_INTERNAL_ERROR == -8, "unexpected result ABI");
 _Static_assert(MPV_APPLE_PIP_MODE_INLINE_ONLY == 0, "unexpected mode ABI");
 _Static_assert(MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE == 3,
                "unexpected mode ABI");
+_Static_assert(MPV_APPLE_PIP_MODE_INLINE_FRESH_FRAME == 4,
+               "unexpected mode ABI");
 _Static_assert(MPV_APPLE_PIP_CAP_DIRECT_IOSURFACE == (1ull << 0),
                "unexpected capability ABI");
 _Static_assert(MPV_APPLE_PIP_CAP_ASYNC_COMPLETION == (1ull << 3),
+               "unexpected capability ABI");
+_Static_assert(MPV_APPLE_PIP_CAP_INLINE_FRESH_FRAME_NOTIFICATION == (1ull << 6),
                "unexpected capability ABI");
 _Static_assert(MPV_APPLE_PIP_FRAME_READY == 0, "unexpected status ABI");
 _Static_assert(MPV_APPLE_PIP_FRAME_RENDER_FAILED == 3,

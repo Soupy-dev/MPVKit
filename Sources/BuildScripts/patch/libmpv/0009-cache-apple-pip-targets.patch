@@ -1,0 +1,428 @@
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 9c9c941..f79e9e5 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -124,6 +124,18 @@ enum apple_pip_slot_state {
+ 
+ struct apple_pip_state;
+ 
++struct apple_pip_target_cache_entry {
++    bool valid;
++    bool in_use;
++    IOSurfaceRef surface;
++    uint32_t width;
++    uint32_t height;
++    uint32_t backend;
++    pl_tex tex;
++    struct apple_pip_metal_target *metal_target;
++    uint64_t last_used;
++};
++
+ struct apple_pip_slot {
+     enum apple_pip_slot_state state;
+     pl_tex tex;
+@@ -141,6 +153,7 @@ struct apple_pip_slot {
+     bool metal_blit_complete;
+     bool metal_blit_succeeded;
+     struct apple_pip_state *owner;
++    struct apple_pip_target_cache_entry *cache_entry;
+ };
+ 
+ struct apple_pip_state {
+@@ -163,6 +176,11 @@ struct apple_pip_state {
+     uint32_t backend;
+     struct apple_pip_metal_context *metal;
+     struct apple_pip_slot slots[APPLE_PIP_MAX_TARGETS];
++    struct apple_pip_target_cache_entry target_cache[APPLE_PIP_MAX_TARGETS];
++    uint64_t cache_clock;
++    uint64_t cache_hits;
++    uint64_t cache_misses;
++    uint64_t cache_evictions;
+     char diagnostic[160];
+ };
+ #endif
+@@ -288,6 +306,61 @@ static bool apple_pip_select_backend(struct vo *vo)
+     return false;
+ }
+ 
++static bool apple_pip_same_surface(IOSurfaceRef a, IOSurfaceRef b)
++{
++    return a && b && (a == b || IOSurfaceGetID(a) == IOSurfaceGetID(b));
++}
++
++static void apple_pip_destroy_cached_target(
++    struct priv *p, struct apple_pip_target_cache_entry *entry)
++{
++    if (entry->tex)
++        pl_tex_destroy(p->gpu, &entry->tex);
++    if (entry->metal_target)
++        apple_pip_metal_target_destroy(&entry->metal_target);
++    if (entry->surface)
++        CFRelease(entry->surface);
++    memset(entry, 0, sizeof(*entry));
++}
++
++static bool apple_pip_has_cache_work_locked(struct apple_pip_state *state)
++{
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        if (state->target_cache[i].in_use)
++            return true;
++    }
++    return false;
++}
++
++static void apple_pip_release_cached_target_locked(
++    struct apple_pip_state *state,
++    struct apple_pip_target_cache_entry *entry)
++{
++    if (!entry)
++        return;
++    entry->in_use = false;
++    entry->last_used = ++state->cache_clock;
++    mp_cond_broadcast(&state->wakeup);
++}
++
++static void apple_pip_clear_target_cache_locked(struct priv *p)
++{
++    struct apple_pip_state *state = &p->apple_pip;
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        struct apple_pip_target_cache_entry *entry = &state->target_cache[i];
++        // Callers drain slots and setup reservations before clearing. Keep the
++        // guard as a final defense against destroying an active GPU target.
++        if (entry->in_use)
++            continue;
++        apple_pip_destroy_cached_target(p, entry);
++    }
++    MP_VERBOSE(p, "Apple PiP target cache cleared (hits=%llu, misses=%llu, "
++               "evictions=%llu)\n",
++               (unsigned long long)state->cache_hits,
++               (unsigned long long)state->cache_misses,
++               (unsigned long long)state->cache_evictions);
++}
++
+ static bool apple_pip_has_slots_locked(struct apple_pip_state *state)
+ {
+     for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
+@@ -301,6 +374,7 @@ static bool apple_pip_has_completion_work_locked(
+     struct apple_pip_state *state)
+ {
+     return apple_pip_has_slots_locked(state) ||
++           apple_pip_has_cache_work_locked(state) ||
+            state->inline_callback_pending ||
+            state->inline_callback_in_progress;
+ }
+@@ -499,7 +573,7 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+         struct mpv_apple_pip_frame frame = {0};
+         mpv_apple_pip_frame_callback callback = NULL;
+         void *callback_ctx = NULL;
+-        IOSurfaceRef surface = NULL;
++        struct apple_pip_target_cache_entry *cache_entry = NULL;
+ 
+         mp_mutex_lock(&state->lock);
+         if (slot->state != APPLE_PIP_SLOT_CANCELED &&
+@@ -529,20 +603,18 @@ static MP_THREAD_VOID apple_pip_completion_worker(void *opaque)
+         };
+         callback = state->callback;
+         callback_ctx = state->callback_ctx;
+-        surface = slot->surface;
++        cache_entry = slot->cache_entry;
+         slot->state = APPLE_PIP_SLOT_CALLBACK;
+         mp_mutex_unlock(&state->lock);
+ 
+-        if (tex)
+-            pl_tex_destroy(p->gpu, &tex);
+-        if (slot->metal_target)
+-            apple_pip_metal_target_destroy(&slot->metal_target);
+-        if (surface)
+-            CFRelease(surface);
+         if (callback)
+             callback(callback_ctx, &frame);
+ 
+         mp_mutex_lock(&state->lock);
++        // The libplacebo fence and optional Metal command buffer are complete.
++        // Keep their import objects, but do not permit IOSurface reuse until
++        // the host has returned from the frame callback.
++        apple_pip_release_cached_target_locked(state, cache_entry);
+         memset(slot, 0, sizeof(*slot));
+         mp_cond_broadcast(&state->wakeup);
+         mp_mutex_unlock(&state->lock);
+@@ -600,6 +672,9 @@ static void apple_pip_uninit(struct vo *vo)
+     if (state->worker_started)
+         mp_thread_join(state->worker);
+ 
++    mp_mutex_lock(&state->lock);
++    apple_pip_clear_target_cache_locked(p);
++    mp_mutex_unlock(&state->lock);
+     apple_pip_metal_destroy(&state->metal);
+ 
+     mp_cond_destroy(&state->wakeup);
+@@ -879,102 +954,199 @@ static int apple_pip_submit_target(struct vo *vo,
+     for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
+         struct apple_pip_slot *candidate = &state->slots[i];
+         if (candidate->state != APPLE_PIP_SLOT_FREE &&
+-            candidate->surface == surface) {
++            apple_pip_same_surface(candidate->surface, surface)) {
+             mp_mutex_unlock(&state->lock);
+             return MPV_APPLE_PIP_BUSY;
+         }
+         if (!slot && candidate->state == APPLE_PIP_SLOT_FREE)
+             slot = candidate;
+     }
+-    mp_mutex_unlock(&state->lock);
+-    if (!slot)
++    if (!slot) {
++        mp_mutex_unlock(&state->lock);
+         return MPV_APPLE_PIP_BUSY;
++    }
+ 
+-    pl_fmt fmt = pl_find_named_fmt(p->gpu, "bgra8");
+-    uint32_t backend = state->backend;
+-    struct apple_pip_metal_target *metal_target = NULL;
+-    CFRetain(surface);
+-    pl_tex tex = NULL;
+-    if (backend == MPV_APPLE_PIP_BACKEND_DIRECT_IOSURFACE) {
+-        tex = pl_tex_create(p->gpu, pl_tex_params(
+-            .w = target->width,
+-            .h = target->height,
+-            .format = fmt,
+-            .renderable = true,
+-            .blit_dst = true,
+-            .import_handle = PL_HANDLE_IOSURFACE,
+-            .shared_mem = {
+-                .handle.handle = surface,
+-                .size = IOSurfaceGetAllocSize(surface),
+-            },
+-            .debug_tag = "MPVKit PiP IOSurface",
+-        ));
++    struct apple_pip_target_cache_entry *cache_entry = NULL;
++    struct apple_pip_target_cache_entry evicted = {0};
++    bool cache_hit = false;
++    for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++        struct apple_pip_target_cache_entry *candidate =
++            &state->target_cache[i];
++        if (!candidate->valid ||
++            !apple_pip_same_surface(candidate->surface, surface))
++            continue;
++        if (candidate->in_use) {
++            mp_mutex_unlock(&state->lock);
++            return MPV_APPLE_PIP_BUSY;
++        }
++        cache_entry = candidate;
++        cache_hit = true;
++        break;
+     }
+ 
+-    if (!tex && state->metal) {
+-        metal_target = apple_pip_metal_target_create(
+-            state->metal, surface, target->width, target->height,
+-            state->diagnostic, sizeof(state->diagnostic));
+-        void *metal_source =
+-            apple_pip_metal_target_source_texture(metal_target);
+-        if (metal_source) {
++    if (!cache_entry) {
++        for (int i = 0; i < APPLE_PIP_MAX_TARGETS; i++) {
++            struct apple_pip_target_cache_entry *candidate =
++                &state->target_cache[i];
++            if (candidate->in_use)
++                continue;
++            if (!candidate->valid) {
++                cache_entry = candidate;
++                break;
++            }
++            if (!cache_entry || candidate->last_used < cache_entry->last_used)
++                cache_entry = candidate;
++        }
++    }
++    if (!cache_entry) {
++        mp_mutex_unlock(&state->lock);
++        return MPV_APPLE_PIP_BUSY;
++    }
++
++    if (cache_hit) {
++        cache_entry->in_use = true;
++        cache_entry->last_used = ++state->cache_clock;
++        state->cache_hits++;
++    } else {
++        if (cache_entry->valid) {
++            evicted = *cache_entry;
++            state->cache_evictions++;
++        }
++        memset(cache_entry, 0, sizeof(*cache_entry));
++        // Reserve this cache position while import objects are created without
++        // the state lock. Drain/uninit includes reservations in its barrier.
++        cache_entry->in_use = true;
++        state->cache_misses++;
++    }
++
++    uint32_t backend = cache_hit ? cache_entry->backend : state->backend;
++    pl_tex tex = cache_hit ? cache_entry->tex : NULL;
++    struct apple_pip_metal_target *metal_target =
++        cache_hit ? cache_entry->metal_target : NULL;
++    struct apple_pip_metal_context *metal = state->metal;
++    mp_mutex_unlock(&state->lock);
++
++    if (!cache_hit) {
++        apple_pip_destroy_cached_target(p, &evicted);
++        pl_fmt fmt = pl_find_named_fmt(p->gpu, "bgra8");
++        char import_diagnostic[sizeof(state->diagnostic)] = {0};
++        CFRetain(surface);
++        if (backend == MPV_APPLE_PIP_BACKEND_DIRECT_IOSURFACE) {
+             tex = pl_tex_create(p->gpu, pl_tex_params(
+                 .w = target->width,
+                 .h = target->height,
+                 .format = fmt,
+                 .renderable = true,
+-                .blit_src = true,
+                 .blit_dst = true,
+-                .import_handle = PL_HANDLE_MTL_TEX,
++                .import_handle = PL_HANDLE_IOSURFACE,
+                 .shared_mem = {
+-                    .handle.handle = metal_source,
+-                    .size = (size_t)target->width * target->height * 4,
++                    .handle.handle = surface,
++                    .size = IOSurfaceGetAllocSize(surface),
+                 },
+-                .debug_tag = "MPVKit PiP Metal blit source",
++                .debug_tag = "MPVKit PiP IOSurface",
+             ));
+         }
+-        if (tex) {
+-            backend = MPV_APPLE_PIP_BACKEND_ASYNC_METAL_BLIT;
++
++        if (!tex && metal) {
++            metal_target = apple_pip_metal_target_create(
++                metal, surface, target->width, target->height,
++                import_diagnostic, sizeof(import_diagnostic));
++            void *metal_source =
++                apple_pip_metal_target_source_texture(metal_target);
++            if (metal_source) {
++                tex = pl_tex_create(p->gpu, pl_tex_params(
++                    .w = target->width,
++                    .h = target->height,
++                    .format = fmt,
++                    .renderable = true,
++                    .blit_src = true,
++                    .blit_dst = true,
++                    .import_handle = PL_HANDLE_MTL_TEX,
++                    .shared_mem = {
++                        .handle.handle = metal_source,
++                        .size = (size_t)target->width * target->height * 4,
++                    },
++                    .debug_tag = "MPVKit PiP Metal blit source",
++                ));
++            }
++            if (tex)
++                backend = MPV_APPLE_PIP_BACKEND_ASYNC_METAL_BLIT;
++        }
++
++        if (!tex) {
++            apple_pip_metal_target_destroy(&metal_target);
++            CFRelease(surface);
++            char failure[sizeof(state->diagnostic)] = {0};
++            snprintf(failure, sizeof(failure),
++                     "IOSurface import and asynchronous Metal blit setup failed "
++                     "for %ux%u BGRA%s%s",
++                     target->width, target->height,
++                     import_diagnostic[0] ? ": " : "",
++                     import_diagnostic);
++            MP_ERR(vo, "%s\n", failure);
+             mp_mutex_lock(&state->lock);
+-            state->backend = backend;
+-            snprintf(state->diagnostic, sizeof(state->diagnostic),
+-                     "asynchronous Metal blit output active");
++            snprintf(state->diagnostic, sizeof(state->diagnostic), "%s",
++                     failure);
++            apple_pip_release_cached_target_locked(state, cache_entry);
+             mp_mutex_unlock(&state->lock);
++            return MPV_APPLE_PIP_IMPORT_FAILED;
+         }
+     }
+ 
+-    if (!tex) {
+-        apple_pip_metal_target_destroy(&metal_target);
+-        CFRelease(surface);
+-        snprintf(state->diagnostic, sizeof(state->diagnostic),
+-                 "IOSurface import and asynchronous Metal blit setup failed "
+-                 "for %ux%u BGRA",
+-                 target->width, target->height);
+-        MP_ERR(vo, "%s\n", state->diagnostic);
+-        return MPV_APPLE_PIP_IMPORT_FAILED;
+-    }
+-
+     mp_mutex_lock(&state->lock);
+-    if (state->shutting_down || target->generation != state->generation ||
+-        slot->state != APPLE_PIP_SLOT_FREE) {
++    int invalid_result = MPV_APPLE_PIP_OK;
++    if (state->shutting_down ||
++        state->mode == MPV_APPLE_PIP_MODE_INLINE_ONLY)
++        invalid_result = MPV_APPLE_PIP_UNAVAILABLE;
++    else if (target->generation != state->generation)
++        invalid_result = MPV_APPLE_PIP_STALE_GENERATION;
++    else if (slot->state != APPLE_PIP_SLOT_FREE)
++        invalid_result = MPV_APPLE_PIP_BUSY;
++    if (invalid_result != MPV_APPLE_PIP_OK) {
++        if (cache_hit)
++            apple_pip_release_cached_target_locked(state, cache_entry);
+         mp_mutex_unlock(&state->lock);
+-        pl_tex_destroy(p->gpu, &tex);
+-        apple_pip_metal_target_destroy(&metal_target);
+-        CFRelease(surface);
+-        return MPV_APPLE_PIP_STALE_GENERATION;
++        if (!cache_hit) {
++            pl_tex_destroy(p->gpu, &tex);
++            apple_pip_metal_target_destroy(&metal_target);
++            CFRelease(surface);
++            mp_mutex_lock(&state->lock);
++            apple_pip_release_cached_target_locked(state, cache_entry);
++            mp_mutex_unlock(&state->lock);
++        }
++        return invalid_result;
++    }
++    if (!cache_hit) {
++        *cache_entry = (struct apple_pip_target_cache_entry) {
++            .valid = true,
++            .in_use = true,
++            .surface = surface,
++            .width = target->width,
++            .height = target->height,
++            .backend = backend,
++            .tex = tex,
++            .metal_target = metal_target,
++            .last_used = ++state->cache_clock,
++        };
++        if (backend == MPV_APPLE_PIP_BACKEND_ASYNC_METAL_BLIT) {
++            state->backend = backend;
++            snprintf(state->diagnostic, sizeof(state->diagnostic),
++                     "asynchronous Metal blit output active");
++        }
+     }
+     *slot = (struct apple_pip_slot) {
+         .state = APPLE_PIP_SLOT_QUEUED,
+-        .tex = tex,
+-        .surface = surface,
+-        .width = target->width,
+-        .height = target->height,
++        .tex = cache_entry->tex,
++        .surface = cache_entry->surface,
++        .width = cache_entry->width,
++        .height = cache_entry->height,
+         .token = target->token,
+         .generation = target->generation,
+         .completion_status = MPV_APPLE_PIP_FRAME_READY,
+-        .backend = backend,
+-        .metal_target = metal_target,
++        .backend = cache_entry->backend,
++        .metal_target = cache_entry->metal_target,
+         .owner = state,
++        .cache_entry = cache_entry,
+     };
+     force_redraw = apple_pip_claim_forced_redraw_locked(state);
+     mp_mutex_unlock(&state->lock);
+@@ -1000,6 +1172,7 @@ static int apple_pip_disable_and_drain(struct priv *p)
+     apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
+     while (apple_pip_has_completion_work_locked(state))
+         mp_cond_wait(&state->wakeup, &state->lock);
++    apple_pip_clear_target_cache_locked(p);
+     mp_mutex_unlock(&state->lock);
+     return MPV_APPLE_PIP_OK;
+ }

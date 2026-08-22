@@ -1,0 +1,260 @@
+diff --git a/include/mpv/apple_pip.h b/include/mpv/apple_pip.h
+index 1229396..8c74ac0 100644
+--- a/include/mpv/apple_pip.h
++++ b/include/mpv/apple_pip.h
+@@ -58,6 +58,7 @@ enum mpv_apple_pip_mode {
+     MPV_APPLE_PIP_MODE_DUAL_OUTPUT_WARMUP = 1,
+     MPV_APPLE_PIP_MODE_OFFSCREEN_ONLY = 2,
+     MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE = 3,
++    MPV_APPLE_PIP_MODE_INLINE_FRESH_FRAME = 4,
+ };
+ 
+ enum mpv_apple_pip_capability {
+@@ -67,6 +68,7 @@ enum mpv_apple_pip_capability {
+     MPV_APPLE_PIP_CAP_ASYNC_COMPLETION = 1ull << 3,
+     MPV_APPLE_PIP_CAP_ASYNC_METAL_BLIT = 1ull << 4,
+     MPV_APPLE_PIP_CAP_INLINE_RESTORE_NOTIFICATION = 1ull << 5,
++    MPV_APPLE_PIP_CAP_INLINE_FRESH_FRAME_NOTIFICATION = 1ull << 6,
+ };
+ 
+ enum mpv_apple_pip_backend {
+@@ -131,6 +133,11 @@ struct mpv_apple_pip_frame {
+  * one targetless READY notification (token 0, width/height 0) after a valid
+  * current frame has been submitted back to the inline swapchain. This lets a
+  * compatibility renderer remain visible until inline restoration is real.
++ *
++ * INLINE_FRESH_FRAME also emits one targetless READY notification, but never
++ * requests a redraw. It waits until a real current frame newer than every frame
++ * already delivered to the VO at mode selection has been submitted to the
++ * inline swapchain. Paused or stalled playback therefore produces no callback.
+  */
+ typedef void (*mpv_apple_pip_frame_callback)(
+     void *callback_ctx, const struct mpv_apple_pip_frame *frame);
+diff --git a/player/client.c b/player/client.c
+index 2799841..80f0efd 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -2189,7 +2189,7 @@ MPV_APPLE_PIP_EXPORT int mpv_apple_pip_set_callback(
+ MPV_APPLE_PIP_EXPORT int mpv_apple_pip_set_mode(
+     mpv_handle *ctx, uint32_t mode, uint64_t generation)
+ {
+-    if (mode > MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE || !generation)
++    if (mode > MPV_APPLE_PIP_MODE_INLINE_FRESH_FRAME || !generation)
+         return MPV_APPLE_PIP_INVALID_ARGUMENT;
+ 
+     struct voctrl_apple_pip_mode config = {
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index f79e9e5..d5cf1fc 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -165,8 +165,10 @@ struct apple_pip_state {
+     bool shutting_down;
+     bool force_redraw_armed;
+     bool inline_probe_armed;
++    bool inline_probe_requires_fresh_frame;
+     bool inline_callback_pending;
+     bool inline_callback_in_progress;
++    uint64_t inline_probe_baseline_frame_id;
+     uint64_t inline_callback_generation;
+     double inline_callback_pts;
+     uint32_t mode;
+@@ -219,6 +221,8 @@ struct priv {
+     bool frame_pending;
+ #if HAVE_APPLE_GPU_PIP
+     bool apple_pip_inline_frame_valid;
++    uint64_t apple_pip_inline_frame_id;
++    uint64_t apple_pip_highest_seen_frame_id;
+ #endif
+ 
+     pl_options pars;
+@@ -441,7 +445,8 @@ static void apple_pip_metal_blit_complete(void *opaque, bool success)
+     mp_mutex_unlock(&state->lock);
+ }
+ 
+-static void apple_pip_signal_inline_presented(struct priv *p)
++static void apple_pip_signal_inline_presented(struct priv *p,
++                                              uint64_t frame_id)
+ {
+     struct apple_pip_state *state = &p->apple_pip;
+     mp_mutex_lock(&state->lock);
+@@ -451,6 +456,12 @@ static void apple_pip_signal_inline_presented(struct priv *p)
+         return;
+     }
+ 
++    if (state->inline_probe_requires_fresh_frame &&
++        (!frame_id || frame_id <= state->inline_probe_baseline_frame_id)) {
++        mp_mutex_unlock(&state->lock);
++        return;
++    }
++
+     // Queue targetless restore readiness on the same completion worker used by
+     // IOSurface fences. This keeps callbacks off the VO thread and makes the
+     // disable/uninit drain barriers cover every callback kind.
+@@ -458,6 +469,7 @@ static void apple_pip_signal_inline_presented(struct priv *p)
+     state->inline_callback_generation = state->generation;
+     state->inline_callback_pts = p->last_pts;
+     state->inline_probe_armed = false;
++    state->inline_probe_requires_fresh_frame = false;
+     mp_cond_broadcast(&state->wakeup);
+     mp_mutex_unlock(&state->lock);
+ }
+@@ -662,6 +674,7 @@ static void apple_pip_uninit(struct vo *vo)
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+     state->force_redraw_armed = false;
+     state->inline_probe_armed = false;
++    state->inline_probe_requires_fresh_frame = false;
+     state->inline_callback_pending = false;
+     state->callback = NULL;
+     state->callback_ctx = NULL;
+@@ -831,7 +844,8 @@ static int apple_pip_get_capabilities(struct vo *vo,
+     if (!state->worker_started)
+         return MPV_APPLE_PIP_UNSUPPORTED;
+ 
+-    caps->flags = MPV_APPLE_PIP_CAP_INLINE_RESTORE_NOTIFICATION;
++    caps->flags = MPV_APPLE_PIP_CAP_INLINE_RESTORE_NOTIFICATION |
++                  MPV_APPLE_PIP_CAP_INLINE_FRESH_FRAME_NOTIFICATION;
+     if (state->backend) {
+         caps->flags |= MPV_APPLE_PIP_CAP_SDR_BGRA8 |
+                        MPV_APPLE_PIP_CAP_OFFSCREEN_WITHOUT_DRAWABLE |
+@@ -858,8 +872,10 @@ static int apple_pip_set_callback(struct priv *p,
+         state->inline_callback_pending = false;
+     state->callback = config->callback;
+     state->callback_ctx = config->callback_ctx;
+-    if (!config->callback)
++    if (!config->callback) {
+         state->inline_probe_armed = false;
++        state->inline_probe_requires_fresh_frame = false;
++    }
+     mp_cond_broadcast(&state->wakeup);
+     mp_mutex_unlock(&state->lock);
+     return MPV_APPLE_PIP_OK;
+@@ -872,7 +888,10 @@ static int apple_pip_set_mode(struct vo *vo,
+     struct apple_pip_state *state = &p->apple_pip;
+     if (!state->worker_started)
+         return MPV_APPLE_PIP_UNSUPPORTED;
+-    if (!state->backend && config->mode != MPV_APPLE_PIP_MODE_INLINE_ONLY)
++    bool fresh_inline = config->mode == MPV_APPLE_PIP_MODE_INLINE_FRESH_FRAME;
++    uint32_t effective_mode = fresh_inline
++        ? MPV_APPLE_PIP_MODE_INLINE_ONLY : config->mode;
++    if (!state->backend && effective_mode != MPV_APPLE_PIP_MODE_INLINE_ONLY)
+         return MPV_APPLE_PIP_UNSUPPORTED;
+ 
+     bool force_redraw = false;
+@@ -892,25 +911,37 @@ static int apple_pip_set_mode(struct vo *vo,
+         mp_cond_broadcast(&state->wakeup);
+     }
+     state->generation = config->generation;
+-    state->mode = config->mode;
+-    if (config->mode == MPV_APPLE_PIP_MODE_INLINE_ONLY) {
++    state->mode = effective_mode;
++    state->inline_probe_requires_fresh_frame = false;
++    if (fresh_inline) {
++        state->force_redraw_armed = false;
++        apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
++        state->inline_probe_armed = state->callback != NULL;
++        state->inline_probe_requires_fresh_frame = state->inline_probe_armed;
++        state->inline_probe_baseline_frame_id =
++            p->apple_pip_highest_seen_frame_id;
++    } else if (effective_mode == MPV_APPLE_PIP_MODE_INLINE_ONLY) {
+         state->force_redraw_armed = false;
+         apple_pip_cancel_locked(state, MPV_APPLE_PIP_FRAME_CANCELED);
+         state->inline_probe_armed = state->callback != NULL;
+         force_redraw = state->inline_probe_armed;
+-    } else if (new_generation || new_warmup || new_restore) {
+-        bool restoring = config->mode == MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE;
+-        state->inline_probe_armed = restoring && state->callback != NULL;
+-        if (restoring) {
+-            // Restoration waits for an actual CAMetalLayer presentation and
+-            // must not depend on a queued PiP target being available.
+-            state->force_redraw_armed = false;
+-            force_redraw = state->inline_probe_armed;
+-        } else {
+-            // A single forced draw prepares PiP while paused. Thereafter
+-            // surfaces are consumed only by natural VO draws.
+-            state->force_redraw_armed = true;
+-            force_redraw = apple_pip_claim_forced_redraw_locked(state);
++    } else {
++        state->inline_probe_armed = false;
++        if (new_generation || new_warmup || new_restore) {
++            bool restoring =
++                config->mode == MPV_APPLE_PIP_MODE_DUAL_OUTPUT_RESTORE;
++            state->inline_probe_armed = restoring && state->callback != NULL;
++            if (restoring) {
++                // Restoration waits for an actual CAMetalLayer presentation and
++                // must not depend on a queued PiP target being available.
++                state->force_redraw_armed = false;
++                force_redraw = state->inline_probe_armed;
++            } else {
++                // A single forced draw prepares PiP while paused. Thereafter
++                // surfaces are consumed only by natural VO draws.
++                state->force_redraw_armed = true;
++                force_redraw = apple_pip_claim_forced_redraw_locked(state);
++            }
+         }
+     }
+     mp_mutex_unlock(&state->lock);
+@@ -1166,6 +1197,7 @@ static int apple_pip_disable_and_drain(struct priv *p)
+     state->mode = MPV_APPLE_PIP_MODE_INLINE_ONLY;
+     state->force_redraw_armed = false;
+     state->inline_probe_armed = false;
++    state->inline_probe_requires_fresh_frame = false;
+     state->inline_callback_pending = false;
+     state->callback = NULL;
+     state->callback_ctx = NULL;
+@@ -2020,6 +2052,13 @@ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_APPLE_GPU_PIP
++    if (frame->num_frames > 0 && frame->frame_id) {
++        uint64_t highest_frame_id = frame->frame_id + frame->num_frames - 1;
++        if (highest_frame_id > p->apple_pip_highest_seen_frame_id)
++            p->apple_pip_highest_seen_frame_id = highest_frame_id;
++    }
++#endif
+     pl_options pars = p->pars;
+     pl_gpu gpu = p->gpu;
+     update_options(vo);
+@@ -2556,6 +2595,7 @@ done:
+ #if HAVE_APPLE_GPU_PIP
+     p->apple_pip_inline_frame_valid = have_inline && valid && frame->current &&
+                                       mix.num_frames > 0;
++    p->apple_pip_inline_frame_id = frame->num_frames > 0 ? frame->frame_id : 0;
+ #endif
+     return VO_TRUE;
+ }
+@@ -2570,12 +2610,14 @@ static void flip_page(struct vo *vo)
+     if (!apple_pip_inline_enabled(p)) {
+         p->frame_pending = false;
+         p->apple_pip_inline_frame_valid = false;
++        p->apple_pip_inline_frame_id = 0;
+         return;
+     }
+ #endif
+ 
+ #if HAVE_APPLE_GPU_PIP
+     bool inline_presented = false;
++    uint64_t inline_frame_id = 0;
+ #endif
+     if (p->frame_pending) {
+         bool submitted = pl_swapchain_submit_frame(p->sw);
+@@ -2583,7 +2625,10 @@ static void flip_page(struct vo *vo)
+             MP_ERR(vo, "Failed presenting frame!\n");
+ #if HAVE_APPLE_GPU_PIP
+         inline_presented = submitted && p->apple_pip_inline_frame_valid;
++        if (inline_presented)
++            inline_frame_id = p->apple_pip_inline_frame_id;
+         p->apple_pip_inline_frame_valid = false;
++        p->apple_pip_inline_frame_id = 0;
+ #endif
+         p->frame_pending = false;
+     }
+@@ -2591,7 +2636,7 @@ static void flip_page(struct vo *vo)
+     sw->fns->swap_buffers(sw);
+ #if HAVE_APPLE_GPU_PIP
+     if (inline_presented)
+-        apple_pip_signal_inline_presented(p);
++        apple_pip_signal_inline_presented(p, inline_frame_id);
+ #endif
+ }
+ 

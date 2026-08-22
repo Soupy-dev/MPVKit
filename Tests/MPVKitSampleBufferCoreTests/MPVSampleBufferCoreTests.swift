@@ -78,6 +78,104 @@ private struct FakeRendererHarness {
 }
 
 final class MPVSampleBufferCoreTests: XCTestCase {
+    func testMoltenVKArgumentBufferWorkaroundCoversPinnedArtifactAndGuardsUnsafeTextureImport() {
+        XCTAssertTrue(
+            MPVMoltenVKDevicePolicy.shouldDisableMetalArgumentBuffers(
+                supportsApple5: false,
+                supportsApple6: false
+            )
+        )
+        XCTAssertTrue(
+            MPVMoltenVKDevicePolicy.shouldDisableMetalArgumentBuffers(
+                supportsApple5: true,
+                supportsApple6: false
+            )
+        )
+        XCTAssertFalse(
+            MPVMoltenVKDevicePolicy.shouldDisableMetalArgumentBuffers(
+                supportsApple5: true,
+                supportsApple6: true,
+                hasImportedMetalTextureResidencyFix: true
+            )
+        )
+        XCTAssertTrue(
+            MPVMoltenVKDevicePolicy.shouldDisableMetalArgumentBuffers(
+                supportsApple5: true,
+                supportsApple6: false,
+                hasImportedMetalTextureResidencyFix: true
+            )
+        )
+        XCTAssertFalse(
+            MPVMoltenVKDevicePolicy.allowsAsynchronousMetalTextureImport(
+                metalArgumentBuffersEnabled: true
+            )
+        )
+        XCTAssertTrue(
+            MPVMoltenVKDevicePolicy.allowsAsynchronousMetalTextureImport(
+                metalArgumentBuffersEnabled: false
+            )
+        )
+        XCTAssertTrue(
+            MPVMoltenVKDevicePolicy.allowsAsynchronousMetalTextureImport(
+                metalArgumentBuffersEnabled: true,
+                hasImportedMetalTextureResidencyFix: true
+            )
+        )
+        XCTAssertTrue(
+            MPVMoltenVKDevicePolicy.shouldAvoidInlineGPUOnIPad(
+                isPad: true,
+                supportsApple5: true,
+                supportsApple6: false
+            )
+        )
+        XCTAssertFalse(
+            MPVMoltenVKDevicePolicy.shouldAvoidInlineGPUOnIPad(
+                isPad: false,
+                supportsApple5: true,
+                supportsApple6: false
+            )
+        )
+        XCTAssertFalse(
+            MPVMoltenVKDevicePolicy.shouldAvoidInlineGPUOnIPad(
+                isPad: true,
+                supportsApple5: true,
+                supportsApple6: true
+            )
+        )
+    }
+
+    func testNativePiPProbeWaitsForMatchingFileAndVideoReadinessAndRunsOnce() {
+        var gate = MPVNativePiPProbeGate()
+        gate.beginLoad(sequence: 7)
+
+        XCTAssertNil(gate.requestProbe(loadSequence: 7, preparationGeneration: 11))
+        XCTAssertNil(gate.markVideoReconfigured(loadSequence: 7))
+        XCTAssertEqual(gate.markFileLoaded(loadSequence: 7), 11)
+        XCTAssertTrue(gate.didConsumeProbe)
+
+        XCTAssertNil(gate.requestProbe(loadSequence: 7, preparationGeneration: 12))
+        XCTAssertNil(gate.markVideoReconfigured(loadSequence: 7))
+        XCTAssertNil(gate.markFileLoaded(loadSequence: 7))
+    }
+
+    func testNativePiPProbeRejectsStaleLoadEventsAndPreservesLatestLoadCancellation() {
+        var gate = MPVNativePiPProbeGate()
+        gate.beginLoad(sequence: 21)
+        XCTAssertNil(gate.requestProbe(loadSequence: 21, preparationGeneration: 31))
+
+        gate.beginLoad(sequence: 22)
+        XCTAssertNil(gate.markFileLoaded(loadSequence: 21))
+        XCTAssertNil(gate.markVideoReconfigured(loadSequence: 21))
+        XCTAssertNil(gate.requestProbe(loadSequence: 22, preparationGeneration: 32))
+        XCTAssertNil(gate.markFileLoaded(loadSequence: 22))
+        gate.cancelPreparation(generation: 32)
+        XCTAssertNil(gate.markVideoReconfigured(loadSequence: 22))
+        XCTAssertFalse(gate.didConsumeProbe)
+
+        XCTAssertEqual(gate.requestProbe(loadSequence: 22, preparationGeneration: 33), 33)
+        XCTAssertTrue(gate.didConsumeProbe)
+    }
+
     func testRenderLifecycleFenceRejectsOldWorkAcrossLoadAndStop() {
         let fence = MPVRenderLifecycleFence()
         fence.update(engineGeneration: 3, loadGeneration: 7, isRunning: true, isStopping: false)
@@ -107,6 +205,169 @@ final class MPVSampleBufferCoreTests: XCTestCase {
             4_000_000
         )
         XCTAssertEqual(MPVDrawablePixelLimit.resolved(configured: 4, platformMaximum: 3), 3)
+    }
+
+    func testPictureInPictureRenderSizeUsesWindowAspectAtConfiguredQuality() {
+        let maximum = CGSize(width: 1280, height: 720)
+        let common = { (requested: CGSize) in
+            MPVPictureInPictureRenderSizePolicy.resolved(
+                requested: requested,
+                maximum: maximum,
+                textureDimensionLimit: 16_384,
+                pixelLimit: 8_294_400
+            )
+        }
+
+        XCTAssertEqual(common(CGSize(width: 251, height: 141)), CGSize(width: 1280, height: 719))
+        XCTAssertEqual(common(CGSize(width: 4, height: 3)), CGSize(width: 960, height: 720))
+        XCTAssertEqual(common(CGSize(width: 9, height: 16)), CGSize(width: 405, height: 720))
+        XCTAssertEqual(common(maximum), maximum)
+        XCTAssertEqual(common(.zero), maximum)
+    }
+
+    func testPictureInPictureRenderSizeHonorsTextureAndPixelCeilings() {
+        let result = MPVPictureInPictureRenderSizePolicy.resolved(
+            requested: CGSize(width: 16, height: 9),
+            maximum: CGSize(width: 4000, height: 4000),
+            textureDimensionLimit: 2048,
+            pixelLimit: 1_000_000
+        )
+
+        XCTAssertLessThanOrEqual(result.width, 2048)
+        XCTAssertLessThanOrEqual(result.height, 2048)
+        XCTAssertLessThanOrEqual(result.width * result.height, 1_000_000)
+        XCTAssertEqual(result, CGSize(width: 1333, height: 750))
+    }
+
+    func testPictureInPicturePoolHysteresisRejectsJitterButAcceptsRealChanges() {
+        let landscape = CGSize(width: 1280, height: 720)
+        XCTAssertFalse(
+            MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+                current: landscape,
+                proposed: CGSize(width: 1280, height: 719)
+            )
+        )
+        XCTAssertFalse(
+            MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+                current: landscape,
+                proposed: CGSize(width: 1275, height: 720)
+            )
+        )
+        XCTAssertTrue(
+            MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+                current: landscape,
+                proposed: CGSize(width: 960, height: 720)
+            )
+        )
+        XCTAssertTrue(
+            MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+                current: landscape,
+                proposed: CGSize(width: 405, height: 720)
+            )
+        )
+        XCTAssertTrue(
+            MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+                current: landscape,
+                proposed: CGSize(width: 640, height: 360)
+            )
+        )
+    }
+
+    func testVideoToolboxDecodePolicyRecognizesDirectAndCopyPaths() {
+        XCTAssertTrue(MPVVideoToolboxDecodePolicy.isConfigured("videotoolbox"))
+        XCTAssertTrue(MPVVideoToolboxDecodePolicy.isConfigured(" videotoolbox , videotoolbox-copy "))
+        XCTAssertTrue(MPVVideoToolboxDecodePolicy.isConfigured("auto,videotoolbox-copy"))
+        XCTAssertFalse(MPVVideoToolboxDecodePolicy.isConfigured("no"))
+        XCTAssertFalse(MPVVideoToolboxDecodePolicy.isConfigured("auto"))
+
+        XCTAssertTrue(MPVVideoToolboxDecodePolicy.isEngaged("videotoolbox"))
+        XCTAssertTrue(MPVVideoToolboxDecodePolicy.isEngaged(" VideoToolbox-Copy "))
+        XCTAssertFalse(MPVVideoToolboxDecodePolicy.isEngaged(""))
+        XCTAssertFalse(MPVVideoToolboxDecodePolicy.isEngaged("no"))
+
+        XCTAssertEqual(
+            MPVVideoToolboxDecodePolicy.recoverySetting(
+                configuredDecoders: "videotoolbox,videotoolbox-copy",
+                strategy: .configuredOrder
+            ),
+            "videotoolbox,videotoolbox-copy"
+        )
+        XCTAssertEqual(
+            MPVVideoToolboxDecodePolicy.recoverySetting(
+                configuredDecoders: "videotoolbox,videotoolbox-copy",
+                strategy: .copyOnly
+            ),
+            "videotoolbox-copy"
+        )
+        XCTAssertEqual(
+            MPVVideoToolboxDecodePolicy.recoverySetting(
+                configuredDecoders: "no, VideoToolbox, auto, videotoolbox-copy, videotoolbox",
+                strategy: .configuredOrder
+            ),
+            "videotoolbox,videotoolbox-copy"
+        )
+        XCTAssertEqual(
+            MPVVideoToolboxDecodePolicy.recoverySetting(
+                configuredDecoders: "auto,videotoolbox-copy,no",
+                strategy: .configuredOrder
+            ),
+            "videotoolbox-copy"
+        )
+        XCTAssertNil(
+            MPVVideoToolboxDecodePolicy.recoverySetting(
+                configuredDecoders: "no",
+                strategy: .copyOnly
+            )
+        )
+        XCTAssertNil(
+            MPVVideoToolboxDecodePolicy.recoverySetting(
+                configuredDecoders: "videotoolbox",
+                strategy: .copyOnly
+            )
+        )
+    }
+
+    func testHardwareDecoderRecoveryProofRequiresFreshSignalsInEitherOrder() {
+        var reconfigureFirst = MPVHardwareDecoderRecoveryProof()
+        XCTAssertFalse(reconfigureFirst.observeVideoReconfiguration())
+        XCTAssertTrue(reconfigureFirst.observeHardwareDecoder("videotoolbox"))
+        XCTAssertFalse(reconfigureFirst.observeHardwareDecoder("videotoolbox-copy"))
+
+        var decoderFirst = MPVHardwareDecoderRecoveryProof()
+        XCTAssertFalse(decoderFirst.observeHardwareDecoder(" VideoToolbox-Copy "))
+        XCTAssertTrue(decoderFirst.observeVideoReconfiguration())
+        XCTAssertFalse(decoderFirst.observeVideoReconfiguration())
+    }
+
+    func testHardwareDecoderRecoveryProofRejectsStaleOrDisengagedDecoderState() {
+        var proof = MPVHardwareDecoderRecoveryProof()
+
+        // A value cached before the recovery epoch is deliberately absent from a fresh proof.
+        XCTAssertFalse(proof.observeVideoReconfiguration())
+        XCTAssertFalse(proof.observeHardwareDecoder("no"))
+        XCTAssertTrue(proof.observeHardwareDecoder("videotoolbox"))
+
+        proof.reset()
+        XCTAssertFalse(proof.observeHardwareDecoder("videotoolbox"))
+        XCTAssertFalse(proof.observeHardwareDecoder(nil))
+        XCTAssertFalse(proof.observeVideoReconfiguration())
+        XCTAssertTrue(proof.observeHardwareDecoder("videotoolbox-copy"))
+    }
+
+    func testHardwareDecoderRecoveryProofPublishesCausalNegativeObservation() {
+        var proof = MPVHardwareDecoderRecoveryProof()
+
+        XCTAssertNil(proof.completedDecoderObservation)
+        XCTAssertFalse(proof.observeHardwareDecoder("no"))
+        XCTAssertNil(proof.completedDecoderObservation)
+        XCTAssertFalse(proof.observeVideoReconfiguration())
+        XCTAssertEqual(proof.completedDecoderObservation, .decoder("no"))
+
+        XCTAssertTrue(proof.observeHardwareDecoder("videotoolbox-copy"))
+        XCTAssertEqual(proof.completedDecoderObservation, .decoder("videotoolbox-copy"))
+
+        proof.reset()
+        XCTAssertNil(proof.completedDecoderObservation)
     }
 
     func testPlaylistEntryIdentityMakesRapidReplacementLatestWins() throws {
@@ -161,6 +422,35 @@ final class MPVSampleBufferCoreTests: XCTestCase {
 
         XCTAssertEqual(tracker.didStart(playlistEntryID: 77), loadB)
         XCTAssertTrue(tracker.isLatest(loadB))
+    }
+
+    func testReservedLoadCannotConsumeStartBeforePhysicalSubmission() {
+        var tracker = MPVLoadIdentityTracker()
+        let loadA = tracker.submit(clientGeneration: 1)
+        tracker.bind(playlistEntryID: 70, to: loadA)
+        XCTAssertEqual(tracker.didStart(playlistEntryID: 70), loadA)
+
+        let reservedB = tracker.reserve(clientGeneration: 2)
+        XCTAssertEqual(
+            tracker.didStart(playlistEntryID: 71),
+            loadA,
+            "an old item's redirect cannot consume a merely logical replacement"
+        )
+        XCTAssertFalse(tracker.isLatest(loadA))
+
+        XCTAssertTrue(tracker.submit(reservedB))
+        XCTAssertEqual(tracker.didStart(playlistEntryID: 72), reservedB)
+        XCTAssertTrue(tracker.isLatest(reservedB))
+    }
+
+    func testSupersededReservationCannotBeSubmittedLater() {
+        var tracker = MPVLoadIdentityTracker()
+        let reservedA = tracker.reserve(clientGeneration: 1)
+        let reservedB = tracker.reserve(clientGeneration: 2)
+
+        XCTAssertFalse(tracker.submit(reservedA))
+        XCTAssertTrue(tracker.submit(reservedB))
+        XCTAssertEqual(tracker.didStart(playlistEntryID: 90), reservedB)
     }
 
     func testExactReplacementStartDiscardsOlderUnboundFallbackIdentity() {

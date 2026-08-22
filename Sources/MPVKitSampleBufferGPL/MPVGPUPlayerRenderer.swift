@@ -9,6 +9,14 @@ import QuartzCore
 import AppKit
 #endif
 
+private let mpvkitMoltenVKHasImportedTextureResidencyFix: Bool = {
+    #if MPVKIT_MOLTENVK_IMPORTED_TEXTURE_RESIDENCY_FIX
+    true
+    #else
+    false
+    #endif
+}()
+
 public enum MPVGPUPlayerRendererState: Equatable, Sendable {
     case idle
     case starting
@@ -25,6 +33,43 @@ public enum MPVGPUPlayerRendererState: Equatable, Sendable {
 public enum MPVGPUPlayerPresentationMode: String, Equatable, Sendable {
     case inlineGPU
     case pictureInPictureSampleBuffer
+}
+
+/// Selects the VideoToolbox decoder order used when rebuilding a hardware session after system
+/// suspension. This only controls `hwdec`; strict hosts must separately configure
+/// `hwdec-software-fallback=no` when software decoding is forbidden.
+public enum MPVGPUPlayerHardwareDecoderRecoveryStrategy: Equatable, Sendable {
+    /// Reapply the host's configured order, normally direct VideoToolbox followed by its copy path.
+    case configuredOrder
+    /// Use VideoToolbox's copy path only after the configured-order retry produced no decoded frame.
+    case copyOnly
+}
+
+/// Describes whether MPVKit could begin a causally fenced VideoToolbox reconstruction.
+public enum MPVGPUPlayerHardwareDecoderRecoverySubmission: Equatable, Sendable {
+    /// The old video track was fully deselected and the selected track was accepted again.
+    /// A matching recovery-output callback is still required as decoded-frame proof.
+    case accepted(epoch: UInt64)
+    /// Loading or PiP currently owns the video track. The host may retry after it settles.
+    case transitionBusy
+    /// No selected video track or configured VideoToolbox path is available.
+    case unavailable
+    /// mpv rejected a track/property command. Repeating it without a state change is not useful.
+    case commandFailed
+    /// The host cancelled the reconstruction before it could publish a proof epoch.
+    case cancelled
+}
+
+/// Result of a non-destructive foreground health check. The healthy case requires both a fresh
+/// VideoToolbox property read and a current inline CAMetalLayer presentation; it never changes the
+/// selected video track or decoder.
+public enum MPVGPUPlayerForegroundVideoValidation: Equatable, Sendable {
+    case healthy(decoder: String)
+    case playbackDeferred(decoder: String)
+    case decoderUnavailable(current: String)
+    case inlinePresentationTimedOut(decoder: String)
+    case transitionBusy
+    case unavailable
 }
 
 /// Selects how MPVKit should produce frames for AVKit's sample-buffer PiP surface.
@@ -159,6 +204,8 @@ public struct MPVGPUPlayerRendererDiagnostics: Equatable, Sendable {
     public let poolExhaustionDropCount: Int
     public let staleGenerationDropCount: Int
     public let inFlightGPUFrameCount: Int
+    /// Frames successfully enqueued into AVKit for the selected PiP backend and preparation.
+    public let pictureInPictureEnqueuedFrameCount: Int
     public let lastGPULatencyMilliseconds: Double
     public let timelineEpoch: UInt64
     public let timelineRate: Double
@@ -166,6 +213,11 @@ public struct MPVGPUPlayerRendererDiagnostics: Equatable, Sendable {
     public let audioRecoveryCount: Int
     /// Best available decoded/container frame-rate estimate; 0 when mpv has not resolved one yet.
     public let estimatedFramesPerSecond: Double
+    /// Video frames mpv dropped because the video output could not keep up (`frame-drop-count`).
+    public let droppedVideoFrameCount: Int
+    /// mpv's estimated late-presentation count (`vo-delayed-frame-count`). Display-sync only:
+    /// stays 0 under `video-sync=audio`, which is what this player configures.
+    public let delayedVideoFrameCount: Int
     /// Active video codec name (`video-codec`); empty when no video is loaded.
     public let videoCodec: String
     /// Decoded video frame width/height in pixels (`video-params/w`/`h`); 0 when no video.
@@ -246,9 +298,41 @@ private enum MPVGPUPlayerEvent: Sendable {
     case fileLoaded(playlistEntryID: Int64?)
     case videoReconfigure(playlistEntryID: Int64?)
     case endFile(playlistEntryID: Int64, error: String?)
-    case propertyChange(String, playlistEntryID: Int64?)
+    case propertyChange(String, value: MPVGPUObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
+    case commandReply(requestID: UInt64, error: Int32)
     case shutdown
+}
+
+/// Deep-copied observed-property payload. libmpv owns `mpv_event_property.data` only until the
+/// next event wait, so values must be copied before the event pump crosses to the main actor.
+private enum MPVGPUObservedPropertyValue: Sendable {
+    case unavailable
+    case string(String)
+    case flag(Bool)
+    case int64(Int64)
+    case double(Double)
+}
+
+private func copyMPVGPUObservedPropertyValue(
+    _ property: mpv_event_property
+) -> MPVGPUObservedPropertyValue {
+    guard let data = property.data else { return .unavailable }
+    switch property.format {
+    case MPV_FORMAT_STRING:
+        guard let value = data
+            .assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self)
+            .pointee else { return .unavailable }
+        return .string(String(cString: value))
+    case MPV_FORMAT_FLAG:
+        return .flag(data.assumingMemoryBound(to: Int32.self).pointee != 0)
+    case MPV_FORMAT_INT64:
+        return .int64(data.assumingMemoryBound(to: Int64.self).pointee)
+    case MPV_FORMAT_DOUBLE:
+        return .double(data.assumingMemoryBound(to: Double.self).pointee)
+    default:
+        return .unavailable
+    }
 }
 
 private enum MPVGPUPlayerDeferredLoadAction {
@@ -359,14 +443,20 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
             guard let data = event.data else { return nil }
             let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
             guard let name = property.name else { return nil }
-            return .propertyChange(String(cString: name), playlistEntryID: activePlaylistEntryID)
+            return .propertyChange(
+                String(cString: name),
+                value: copyMPVGPUObservedPropertyValue(property),
+                playlistEntryID: activePlaylistEntryID
+            )
         case MPV_EVENT_LOG_MESSAGE:
             guard let log = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) else { return nil }
             let text = log.pointee.text.map { String(cString: $0) } ?? ""
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.localizedCaseInsensitiveContains("error")
-                ? .logError(trimmed, playlistEntryID: activePlaylistEntryID)
-                : nil
+            return trimmed.isEmpty
+                ? nil
+                : .logError(trimmed, playlistEntryID: activePlaylistEntryID)
+        case MPV_EVENT_COMMAND_REPLY:
+            return .commandReply(requestID: event.reply_userdata, error: event.error)
         case MPV_EVENT_SHUTDOWN:
             return .shutdown
         default:
@@ -381,6 +471,7 @@ struct MPVSingleSessionPictureInPictureDiagnostics {
     let poolExhaustionDropCount: Int
     let staleGenerationDropCount: Int
     let inFlightGPUFrameCount: Int
+    let enqueuedFrameCount: Int
     let lastGPULatencyMilliseconds: Double
     let timelineEpoch: UInt64
     let timelineRate: Double
@@ -641,6 +732,31 @@ private enum MPVAppleAudioRecoveryCounter {
     static var current: UInt64 { read?() ?? 0 }
 }
 
+private let mpvApplePictureInPictureSRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+
+private func mpvApplyApplePictureInPictureSDRAttachments(to pixelBuffer: CVPixelBuffer) {
+    CVBufferSetAttachment(
+        pixelBuffer,
+        kCVImageBufferColorPrimariesKey,
+        kCVImageBufferColorPrimaries_ITU_R_709_2,
+        .shouldPropagate
+    )
+    CVBufferSetAttachment(
+        pixelBuffer,
+        kCVImageBufferTransferFunctionKey,
+        kCVImageBufferTransferFunction_sRGB,
+        .shouldPropagate
+    )
+    if let colorSpace = mpvApplePictureInPictureSRGBColorSpace {
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferCGColorSpaceKey,
+            colorSpace,
+            .shouldPropagate
+        )
+    }
+}
+
 /// Weakly binds the optional native ABI so the source package remains compatible with the
 /// currently published Libmpv binary. A locally rebuilt artifact exposes these symbols and gets a
 /// real one-handle gpu-next -> IOSurface path; an older binary simply returns nil from `make`.
@@ -651,11 +767,13 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private static let directIOSurfaceCapability: UInt64 = 1 << 0
     private static let asynchronousMetalBlitCapability: UInt64 = 1 << 4
     static let inlineRestoreNotificationCapability: UInt64 = 1 << 5
+    static let inlineFreshFrameNotificationCapability: UInt64 = 1 << 6
     private static let requiredCapabilities: UInt64 = (1 << 1) | (1 << 2) | (1 << 3)
     private static let modeInline: UInt32 = 0
     private static let modeWarmup: UInt32 = 1
     private static let modeOffscreen: UInt32 = 2
     private static let modeRestore: UInt32 = 3
+    static let modeInlineFreshFrame: UInt32 = 4
     private static let frameReady: UInt32 = 0
     private static let frameStale: UInt32 = 1
     private static let frameCanceled: UInt32 = 2
@@ -672,6 +790,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             poolExhaustionDropCount: poolExhaustionDropCount,
             staleGenerationDropCount: staleGenerationDropCount,
             inFlightGPUFrameCount: inFlightBuffers.count,
+            enqueuedFrameCount: enqueuedFrameCount,
             lastGPULatencyMilliseconds: lastGPULatencyMilliseconds,
             timelineEpoch: timelineEpoch,
             timelineRate: timelineRate
@@ -693,9 +812,13 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private var currentRenderSize = CGSize.zero
     private var pixelBufferPool: CVPixelBufferPool?
     private var pixelBufferAuxAttributes: CFDictionary?
+    private var pixelBufferFormatDescription: CMVideoFormatDescription?
     private var callbackContext: MPVApplePictureInPictureCallbackContext?
-    private var inFlightBuffers: [UInt64: CVPixelBuffer] = [:]
-    private var submissionTimes: [UInt64: CFTimeInterval] = [:]
+    private struct InFlightTarget {
+        let pixelBuffer: CVPixelBuffer
+        let submittedAt: CFTimeInterval
+    }
+    private var inFlightBuffers: [UInt64: InFlightTarget] = [:]
     private var pendingFrames: [UInt64: (CVPixelBuffer, MPVApplePictureInPictureFrameValue)] = [:]
     private var nextToken: UInt64 = 1
     private var preparationContinuation: CheckedContinuation<Void, Error>?
@@ -707,6 +830,8 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private var readinessCallbackArmed = false
     private var timelineRate: Double = 0
     private var timelineNeedsAnchor = true
+    private var lastTimebaseDriftCheckTime: CFTimeInterval = 0
+    private var lastAppliedTimebaseRate: Double?
     private var timelineEpoch: UInt64 = 0
     private var lastEnqueuedPTS: Double?
     private var lastEnqueuedTimelineEpoch: UInt64 = 0
@@ -714,6 +839,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private var backpressureDropCount = 0
     private var poolExhaustionDropCount = 0
     private var staleGenerationDropCount = 0
+    private var enqueuedFrameCount = 0
     private var lastGPULatencyMilliseconds: Double = 0
     private var isStopInProgress = false
     private var stopOperationGeneration: UInt64 = 0
@@ -732,8 +858,9 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private var displayRecoveryFlushGeneration: UInt64?
     private var displayRecoveryProbeGeneration: UInt64?
     private var nextTargetSubmissionTime: CFTimeInterval = 0
-    private var targetRefillTask: Task<Void, Never>?
-    private var targetRefillToken: UInt64 = 0
+    private var targetRefillTimer: DispatchSourceTimer?
+    private var targetRefillTimerScheduled = false
+    private var targetRefillTimerGeneration: UInt64 = 0
     private var forceNextTargetSubmission = false
     private var poolAllocationRetryGate = MPVLatestDemandRetryGate()
     private var displayReadinessDemand = MPVLatestReadinessDemand()
@@ -759,9 +886,24 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         let flags = rawCaps.load(fromByteOffset: 8, as: UInt64.self)
         let pixelFormat = rawCaps.load(fromByteOffset: 16, as: UInt32.self)
         let maximumQueued = rawCaps.load(fromByteOffset: 20, as: UInt32.self)
+        let supportsDirectIOSurface = flags & directIOSurfaceCapability != 0
+        let supportsAsynchronousMetalBlit = flags & asynchronousMetalBlitCapability != 0
+        let metalArgumentBuffersEnabled: Bool
+        if let value = getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS") {
+            metalArgumentBuffersEnabled = String(cString: value) != "0"
+        } else {
+            // MoltenVK 1.4.1 defaults this setting to enabled.
+            metalArgumentBuffersEnabled = true
+        }
+        let supportsSafeAsynchronousMetalBlit = supportsAsynchronousMetalBlit
+            && MPVMoltenVKDevicePolicy.allowsAsynchronousMetalTextureImport(
+                metalArgumentBuffersEnabled: metalArgumentBuffersEnabled,
+                hasImportedMetalTextureResidencyFix:
+                    mpvkitMoltenVKHasImportedTextureResidencyFix
+            )
         guard returnedVersion == apiVersion,
               flags & requiredCapabilities == requiredCapabilities,
-              flags & (directIOSurfaceCapability | asynchronousMetalBlitCapability) != 0,
+              supportsDirectIOSurface || supportsSafeAsynchronousMetalBlit,
               pixelFormat == bgraPixelFormat else { return nil }
         let nativeCapacity = maximumQueued > 0 ? Int(maximumQueued) : requestedCapacity
         return MPVApplePictureInPictureSink(
@@ -771,7 +913,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             capacity: max(1, min(requestedCapacity, nativeCapacity)),
             preferredFramesPerSecond: preferredFramesPerSecond,
             sourceFramesPerSecond: sourceFramesPerSecond,
-            backend: flags & directIOSurfaceCapability != 0
+            backend: supportsDirectIOSurface
                 ? .singleSessionGPUDirectIOSurface
                 : .singleSessionGPUAsynchronousMetalBlit
         )
@@ -818,7 +960,10 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         currentMode = Self.modeWarmup
         currentRenderSize = renderSize
         preparationCompleted = false
+        enqueuedFrameCount = 0
         timelineNeedsAnchor = true
+        lastTimebaseDriftCheckTime = 0
+        lastAppliedTimebaseRate = nil
         lastEnqueuedPTS = nil
         displayReadinessDemand.reset()
         let operationGeneration = stopOperationGeneration
@@ -840,6 +985,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         }
         pixelBufferPool = resources.pool
         pixelBufferAuxAttributes = resources.auxiliaryAttributes
+        pixelBufferFormatDescription = resources.formatDescription
         poolAllocationRetryGate.replaceDemand()
         forceNextTargetSubmission = true
         try installCallback()
@@ -912,18 +1058,6 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
               size.height > 1,
               abs(size.width - currentRenderSize.width) >= 2
                 || abs(size.height - currentRenderSize.height) >= 2 else { return }
-        advanceNativeGeneration()
-        timelineEpoch &+= 1
-        if !nativeReconfigurationInProgress, callbackContext != nil {
-            let status = api.setMode(handle, currentMode, nativeGeneration)
-            if status != 0 {
-                onError?(MPVApplePictureInPictureSinkError.nativeCall(
-                    "advance resize generation",
-                    status
-                ).localizedDescription)
-                return
-            }
-        }
         pendingResizeSize = size
         if resizeTask != nil {
             schedulerCoalescedRequestCount += 1
@@ -964,7 +1098,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             if discontinuity, position.isFinite {
                 CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 60_000))
             }
-            CMTimebaseSetRate(timebase, rate: timelineRate)
+            applyTimebaseRateIfNeeded(timebase, rate: timelineRate)
         }
         // Timeline/property updates are the demand signal used to retry a pool allocation after
         // AVKit releases a sample. There is intentionally no polling refill timer.
@@ -991,9 +1125,9 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         pendingResizeSize = nil
         resizeTask?.cancel()
         resizeTask = nil
-        targetRefillToken &+= 1
-        targetRefillTask?.cancel()
-        targetRefillTask = nil
+        cancelPendingTargetRefill()
+        targetRefillTimer?.cancel()
+        targetRefillTimer = nil
         nextTargetSubmissionTime = 0
         forceNextTargetSubmission = false
         poolAllocationRetryGate.cancel()
@@ -1009,7 +1143,10 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         let retired = detachNativeWork(retiringPool: pixelBufferPool)
         pixelBufferPool = nil
         pixelBufferAuxAttributes = nil
+        pixelBufferFormatDescription = nil
         timelineNeedsAnchor = true
+        lastTimebaseDriftCheckTime = 0
+        lastAppliedTimebaseRate = nil
         lastEnqueuedPTS = nil
         displayLayer.controlTimebase = nil
         preparationContinuation?.resume(throwing: MPVApplePictureInPictureSinkError.stopped)
@@ -1126,12 +1263,11 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         callbackContext?.deactivate()
         let retired = RetiredNativeWork(
             context: callbackContext,
-            buffers: Array(inFlightBuffers.values) + pendingFrames.values.map(\.0),
+            buffers: inFlightBuffers.values.map(\.pixelBuffer) + pendingFrames.values.map(\.0),
             pool: retiringPool
         )
         callbackContext = nil
         inFlightBuffers.removeAll(keepingCapacity: false)
-        submissionTimes.removeAll(keepingCapacity: false)
         pendingFrames.removeAll(keepingCapacity: false)
         readinessCallbackArmed = false
         displayReadinessDemand.reset()
@@ -1180,8 +1316,10 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             }
             pixelBufferPool = resources.pool
             pixelBufferAuxAttributes = resources.auxiliaryAttributes
+            pixelBufferFormatDescription = resources.formatDescription
             poolAllocationRetryGate.replaceDemand()
             advanceNativeGeneration()
+            timelineEpoch &+= 1
             currentRenderSize = requestedSize
         } catch {
             guard stopOperationGeneration == operationGeneration,
@@ -1219,8 +1357,8 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
                 }
                 pixelBufferPool = resources.pool
                 pixelBufferAuxAttributes = resources.auxiliaryAttributes
+                pixelBufferFormatDescription = resources.formatDescription
                 poolAllocationRetryGate.replaceDemand()
-                advanceNativeGeneration()
                 currentRenderSize = newestSize
             } catch {
                 guard stopOperationGeneration == operationGeneration,
@@ -1361,10 +1499,16 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private final class PixelBufferPoolResources: @unchecked Sendable {
         let pool: CVPixelBufferPool
         let auxiliaryAttributes: CFDictionary
+        let formatDescription: CMVideoFormatDescription
 
-        init(pool: CVPixelBufferPool, auxiliaryAttributes: CFDictionary) {
+        init(
+            pool: CVPixelBufferPool,
+            auxiliaryAttributes: CFDictionary,
+            formatDescription: CMVideoFormatDescription
+        ) {
             self.pool = pool
             self.auxiliaryAttributes = auxiliaryAttributes
+            self.formatDescription = formatDescription
         }
     }
 
@@ -1419,11 +1563,42 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
                     )
                     return
                 }
+                let auxiliaryAttributes = [
+                    kCVPixelBufferPoolAllocationThresholdKey: capacity
+                ] as CFDictionary
+                // Every buffer in this pool has identical dimensions, pixel format, and color
+                // attachments. Build the compatible format description once per pool generation
+                // rather than repeating CoreMedia setup for every PiP frame.
+                var seedBuffer: CVPixelBuffer?
+                let seedStatus = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+                    kCFAllocatorDefault,
+                    pool,
+                    auxiliaryAttributes,
+                    &seedBuffer
+                )
+                guard seedStatus == kCVReturnSuccess, let seedBuffer else {
+                    continuation.resume(
+                        throwing: MPVApplePictureInPictureSinkError.pixelBufferPool(seedStatus)
+                    )
+                    return
+                }
+                mpvApplyApplePictureInPictureSDRAttachments(to: seedBuffer)
+                var formatDescription: CMVideoFormatDescription?
+                let descriptionStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+                    allocator: kCFAllocatorDefault,
+                    imageBuffer: seedBuffer,
+                    formatDescriptionOut: &formatDescription
+                )
+                guard descriptionStatus == noErr, let formatDescription else {
+                    continuation.resume(
+                        throwing: MPVApplePictureInPictureSinkError.sampleBuffer(descriptionStatus)
+                    )
+                    return
+                }
                 continuation.resume(returning: PixelBufferPoolResources(
                     pool: pool,
-                    auxiliaryAttributes: [
-                        kCVPixelBufferPoolAllocationThresholdKey: capacity
-                    ] as CFDictionary
+                    auxiliaryAttributes: auxiliaryAttributes,
+                    formatDescription: formatDescription
                 ))
             }
         }
@@ -1461,9 +1636,34 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     }
 
     private func cancelPendingTargetRefill() {
-        targetRefillToken &+= 1
-        targetRefillTask?.cancel()
-        targetRefillTask = nil
+        guard targetRefillTimerScheduled else { return }
+        targetRefillTimerScheduled = false
+        targetRefillTimer?.schedule(deadline: .distantFuture)
+    }
+
+    private func scheduleTargetRefill(after delay: TimeInterval, generation: UInt64) {
+        let timer: DispatchSourceTimer
+        if let targetRefillTimer {
+            timer = targetRefillTimer
+        } else {
+            let source = DispatchSource.makeTimerSource(queue: .main)
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.targetRefillTimerScheduled else { return }
+                    self.targetRefillTimerScheduled = false
+                    guard self.nativeGeneration == self.targetRefillTimerGeneration,
+                          self.activeGeneration != nil else { return }
+                    self.refillTargetsIfPossible()
+                }
+            }
+            source.schedule(deadline: .distantFuture)
+            source.resume()
+            targetRefillTimer = source
+            timer = source
+        }
+        targetRefillTimerGeneration = generation
+        targetRefillTimerScheduled = true
+        timer.schedule(deadline: .now() + max(0, delay), leeway: .milliseconds(1))
     }
 
     private func refillTargetsIfPossible() {
@@ -1495,20 +1695,11 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         let now = CACurrentMediaTime()
         if !forceNextTargetSubmission, now < nextTargetSubmissionTime {
             schedulerCoalescedRequestCount += 1
-            if targetRefillTask == nil {
-                targetRefillToken &+= 1
-                let token = targetRefillToken
-                let generation = nativeGeneration
-                let delay = max(0, nextTargetSubmissionTime - now)
-                targetRefillTask = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    guard !Task.isCancelled, let self,
-                          self.targetRefillToken == token,
-                          self.nativeGeneration == generation,
-                          self.activeGeneration != nil else { return }
-                    self.targetRefillTask = nil
-                    self.refillTargetsIfPossible()
-                }
+            if !targetRefillTimerScheduled {
+                scheduleTargetRefill(
+                    after: nextTargetSubmissionTime - now,
+                    generation: nativeGeneration
+                )
             }
             return
         }
@@ -1566,26 +1757,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             if let pixelBuffer {
                 // Shared-GPU PiP is SDR full-range BGRA8. Explicit tags prevent AVKit from
                 // inheriting HDR/unknown metadata during display migration.
-                CVBufferSetAttachment(
-                    pixelBuffer,
-                    kCVImageBufferColorPrimariesKey,
-                    kCVImageBufferColorPrimaries_ITU_R_709_2,
-                    .shouldPropagate
-                )
-                CVBufferSetAttachment(
-                    pixelBuffer,
-                    kCVImageBufferTransferFunctionKey,
-                    kCVImageBufferTransferFunction_sRGB,
-                    .shouldPropagate
-                )
-                if let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) {
-                    CVBufferSetAttachment(
-                        pixelBuffer,
-                        kCVImageBufferCGColorSpaceKey,
-                        colorSpace,
-                        .shouldPropagate
-                    )
-                }
+                mpvApplyApplePictureInPictureSDRAttachments(to: pixelBuffer)
             }
             let result = AllocatedTarget(pixelBuffer: pixelBuffer, status: status)
             DispatchQueue.main.async { finishAllocation(result) }
@@ -1625,8 +1797,10 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             if !flushInProgress { armDisplayReadinessCallback() }
             return
         }
-        inFlightBuffers[token] = pixelBuffer
-        submissionTimes[token] = CACurrentMediaTime()
+        inFlightBuffers[token] = InFlightTarget(
+            pixelBuffer: pixelBuffer,
+            submittedAt: CACurrentMediaTime()
+        )
         let api = self.api
         let handleAddress = UInt(bitPattern: self.handle)
         let pixelFormat = Self.bgraPixelFormat
@@ -1642,29 +1816,41 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
                 return
             }
             let surface = unmanagedSurface.takeUnretainedValue()
-            let rawTarget = UnsafeMutableRawPointer.allocate(byteCount: 40, alignment: 8)
-            defer { rawTarget.deallocate() }
-            rawTarget.initializeMemory(as: UInt8.self, repeating: 0, count: 40)
-            rawTarget.storeBytes(of: UInt32(40), toByteOffset: 0, as: UInt32.self)
-            rawTarget.storeBytes(of: UInt32(CVPixelBufferGetWidth(pixelBuffer)), toByteOffset: 4, as: UInt32.self)
-            rawTarget.storeBytes(of: UInt32(CVPixelBufferGetHeight(pixelBuffer)), toByteOffset: 8, as: UInt32.self)
-            rawTarget.storeBytes(of: pixelFormat, toByteOffset: 12, as: UInt32.self)
-            rawTarget.storeBytes(
-                of: Unmanaged.passUnretained(surface).toOpaque(),
-                toByteOffset: 16,
-                as: UnsafeMutableRawPointer.self
-            )
-            rawTarget.storeBytes(of: token, toByteOffset: 24, as: UInt64.self)
-            rawTarget.storeBytes(of: generation, toByteOffset: 32, as: UInt64.self)
-            let status = api.submitTarget(handle, UnsafeRawPointer(rawTarget))
-            DispatchQueue.main.async { finishSubmission(status) }
+            let status = withUnsafeTemporaryAllocation(byteCount: 40, alignment: 8) { target in
+                guard let rawTarget = target.baseAddress else { return Int32(-7) }
+                rawTarget.initializeMemory(as: UInt8.self, repeating: 0, count: 40)
+                rawTarget.storeBytes(of: UInt32(40), toByteOffset: 0, as: UInt32.self)
+                rawTarget.storeBytes(
+                    of: UInt32(CVPixelBufferGetWidth(pixelBuffer)),
+                    toByteOffset: 4,
+                    as: UInt32.self
+                )
+                rawTarget.storeBytes(
+                    of: UInt32(CVPixelBufferGetHeight(pixelBuffer)),
+                    toByteOffset: 8,
+                    as: UInt32.self
+                )
+                rawTarget.storeBytes(of: pixelFormat, toByteOffset: 12, as: UInt32.self)
+                rawTarget.storeBytes(
+                    of: Unmanaged.passUnretained(surface).toOpaque(),
+                    toByteOffset: 16,
+                    as: UnsafeMutableRawPointer.self
+                )
+                rawTarget.storeBytes(of: token, toByteOffset: 24, as: UInt64.self)
+                rawTarget.storeBytes(of: generation, toByteOffset: 32, as: UInt64.self)
+                return api.submitTarget(handle, UnsafeRawPointer(rawTarget))
+            }
+            // A successful submission is completed by the native frame callback. Hopping to the
+            // main actor just to execute a success no-op costs one dispatch per PiP frame.
+            if status != 0 {
+                DispatchQueue.main.async { finishSubmission(status) }
+            }
         }
     }
 
     private func handleTargetSubmission(status: Int32, token: UInt64, generation: UInt64) {
         guard status != 0 else { return }
         inFlightBuffers.removeValue(forKey: token)
-        submissionTimes.removeValue(forKey: token)
         guard generation == nativeGeneration, activeGeneration != nil else {
             staleGenerationDropCount += 1
             return
@@ -1700,13 +1886,15 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         case .surfaceFrame:
             break
         }
-        guard let pixelBuffer = inFlightBuffers.removeValue(forKey: frame.token) else {
+        guard let target = inFlightBuffers.removeValue(forKey: frame.token) else {
             staleGenerationDropCount += 1
             return
         }
-        if let submittedAt = submissionTimes.removeValue(forKey: frame.token) {
-            lastGPULatencyMilliseconds = max(0, (CACurrentMediaTime() - submittedAt) * 1_000)
-        }
+        let pixelBuffer = target.pixelBuffer
+        lastGPULatencyMilliseconds = max(
+            0,
+            (CACurrentMediaTime() - target.submittedAt) * 1_000
+        )
         guard frame.generation == nativeGeneration else {
             staleGenerationDropCount += 1
             refillTargetsIfPossible()
@@ -1750,10 +1938,16 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private final class SampleConstructionWork: @unchecked Sendable {
         let pixelBuffer: CVPixelBuffer
         let frame: MPVApplePictureInPictureFrameValue
+        let formatDescription: CMVideoFormatDescription
 
-        init(pixelBuffer: CVPixelBuffer, frame: MPVApplePictureInPictureFrameValue) {
+        init(
+            pixelBuffer: CVPixelBuffer,
+            frame: MPVApplePictureInPictureFrameValue,
+            formatDescription: CMVideoFormatDescription
+        ) {
             self.pixelBuffer = pixelBuffer
             self.frame = frame
+            self.formatDescription = formatDescription
         }
     }
 
@@ -1773,6 +1967,10 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         if recoverDisplayRendererIfNeeded(pixelBuffer: pixelBuffer, frame: frame) {
             return
         }
+        guard let formatDescription = pixelBufferFormatDescription else {
+            handleRenderFailure("PiP pixel-buffer format description is unavailable")
+            return
+        }
         guard !sampleConstructionInProgress else {
             backpressureDropCount += pendingFrames.count
             pendingFrames.removeAll(keepingCapacity: false)
@@ -1780,26 +1978,15 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             return
         }
         sampleConstructionInProgress = true
-        let work = SampleConstructionWork(pixelBuffer: pixelBuffer, frame: frame)
+        let work = SampleConstructionWork(
+            pixelBuffer: pixelBuffer,
+            frame: frame,
+            formatDescription: formatDescription
+        )
         let finishConstruction: @MainActor @Sendable (PreparedSample) -> Void = { [weak self] result in
             self?.finishSampleConstruction(result, work: work)
         }
         nativeControlQueue.async {
-            var description: CMVideoFormatDescription?
-            let descriptionStatus = CMVideoFormatDescriptionCreateForImageBuffer(
-                allocator: kCFAllocatorDefault,
-                imageBuffer: work.pixelBuffer,
-                formatDescriptionOut: &description
-            )
-            guard descriptionStatus == noErr, let description else {
-                let result = PreparedSample(
-                    sampleBuffer: nil,
-                    presentationTime: .invalid,
-                    status: descriptionStatus
-                )
-                DispatchQueue.main.async { finishConstruction(result) }
-                return
-            }
             let pts = CMTime(seconds: work.frame.pts, preferredTimescale: 60_000)
             let duration = work.frame.duration.isFinite && work.frame.duration > 0
                 ? CMTime(seconds: work.frame.duration, preferredTimescale: 60_000)
@@ -1816,7 +2003,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
                 dataReady: true,
                 makeDataReadyCallback: nil,
                 refcon: nil,
-                formatDescription: description,
+                formatDescription: work.formatDescription,
                 sampleTiming: &timing,
                 sampleBufferOut: &sampleBuffer
             )
@@ -1880,6 +2067,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         }
         lastEnqueuedPTS = work.frame.pts
         lastEnqueuedTimelineEpoch = timelineEpoch
+        enqueuedFrameCount += 1
         if !preparationCompleted {
             preparationCompleted = true
             preparationContinuation?.resume()
@@ -1908,16 +2096,28 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             ) == noErr {
                 displayLayer.controlTimebase = timebase
                 timelineNeedsAnchor = true
+                lastTimebaseDriftCheckTime = 0
+                lastAppliedTimebaseRate = nil
             }
         }
         guard let timebase = displayLayer.controlTimebase else { return }
-        let current = CMTimebaseGetTime(timebase)
-        let drift = abs(CMTimeGetSeconds(current) - CMTimeGetSeconds(pts))
-        if timelineNeedsAnchor || !drift.isFinite || drift > 1 {
-            CMTimebaseSetTime(timebase, time: pts)
-            timelineNeedsAnchor = false
+        let now = CACurrentMediaTime()
+        if timelineNeedsAnchor || now - lastTimebaseDriftCheckTime >= 0.25 {
+            let current = CMTimebaseGetTime(timebase)
+            let drift = abs(CMTimeGetSeconds(current) - CMTimeGetSeconds(pts))
+            lastTimebaseDriftCheckTime = now
+            if timelineNeedsAnchor || !drift.isFinite || drift > 1 {
+                CMTimebaseSetTime(timebase, time: pts)
+                timelineNeedsAnchor = false
+            }
         }
-        CMTimebaseSetRate(timebase, rate: timelineRate)
+        applyTimebaseRateIfNeeded(timebase, rate: timelineRate)
+    }
+
+    private func applyTimebaseRateIfNeeded(_ timebase: CMTimebase, rate: Double) {
+        guard lastAppliedTimebaseRate != rate else { return }
+        CMTimebaseSetRate(timebase, rate: rate)
+        lastAppliedTimebaseRate = rate
     }
 
     private func armDisplayReadinessCallback() {
@@ -2046,9 +2246,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             case .recover:
                 stopRequestingDisplayData()
                 readinessCallbackArmed = false
-                targetRefillToken &+= 1
-                targetRefillTask?.cancel()
-                targetRefillTask = nil
+                cancelPendingTargetRefill()
                 timelineEpoch &+= 1
                 timelineNeedsAnchor = true
                 lastEnqueuedPTS = nil
@@ -2146,6 +2344,15 @@ public final class MPVGPUPlayerRenderer {
         _ = device
         return nil
 #else
+        #if os(iOS)
+        if MPVMoltenVKDevicePolicy.shouldAvoidInlineGPUOnIPad(
+            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            supportsApple5: device.supportsFamily(.apple5),
+            supportsApple6: device.supportsFamily(.apple6)
+        ) {
+            return "MoltenVK 1.4 is disabled on A12-class iPads due to an upstream GPU device-loss regression"
+        }
+        #endif
         guard device.supportsFamily(.apple4) else {
             return "the GPU predates Apple family 4"
         }
@@ -2158,7 +2365,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public static let singleSessionPictureInPictureUnavailableReason =
-        "native gpu-next IOSurface sink symbols or required runtime capabilities are unavailable"
+        "native gpu-next IOSurface sink symbols or a safe direct/asynchronous runtime path are unavailable"
 
     public let inlineLayer: CAMetalLayer
     public let pictureInPictureDisplayLayer: AVSampleBufferDisplayLayer
@@ -2179,9 +2386,35 @@ public final class MPVGPUPlayerRenderer {
     /// Generation-aware counterpart for hosts that replace loads rapidly and must reject late
     /// FILE_LOADED / VIDEO_RECONFIG events from an older item.
     public var onVideoReconfigureForGeneration: ((UInt64) -> Void)?
+    /// Fired only for mpv's generation-matched `MPV_EVENT_VIDEO_RECONFIG`, after the selected
+    /// decoder has configured new video output. Unlike `onVideoReconfigureForGeneration`, this
+    /// excludes FILE_LOADED and colorspace property notifications and is safe as recovery proof.
+    public var onVideoOutputReconfigureForGeneration: ((UInt64) -> Void)?
+    /// Fired only after the recovery epoch observes both new configured video output and a fresh
+    /// `hwdec-current` value engaged in VideoToolbox. The epoch is returned by the corresponding
+    /// recovery submission, preventing an event or cached value from before suspension from
+    /// proving recovery; the two mpv signals may arrive in either order.
+    public var onHardwareDecoderRecoveryOutput: ((_ generation: UInt64, _ epoch: UInt64) -> Void)?
+    /// Reports a causally complete post-epoch VIDEO_RECONFIG + `hwdec-current` observation even
+    /// when the decoder is not VideoToolbox. Hosts use the negative observation only after their
+    /// bounded proof window, allowing a hardware copy-path retry without accepting stale state.
+    public var onHardwareDecoderRecoveryObservation: ((_ generation: UInt64, _ epoch: UInt64, _ decoder: String?) -> Void)?
 
     private var options: MPVGPUPlayerRendererOptions
-    private let pictureInPictureRenderer: MPVMetalSampleBufferRenderer
+    /// The compatibility renderer owns Metal queues, a texture cache, render queues, and a memory
+    /// pressure source. Most clients use the native single-session sink, so do not create those
+    /// resources until compatibility PiP is actually selected.
+    nonisolated(unsafe) private var pictureInPictureRendererStorage: MPVMetalSampleBufferRenderer?
+    private var pictureInPictureRenderer: MPVMetalSampleBufferRenderer {
+        if let renderer = pictureInPictureRendererStorage { return renderer }
+        let renderer = MPVMetalSampleBufferRenderer(
+            displayLayer: pictureInPictureDisplayLayer,
+            options: compatibilityRendererOptions
+        )
+        pictureInPictureRendererStorage = renderer
+        configurePictureInPictureCallbacks(for: renderer)
+        return renderer
+    }
     private var videoFilterChain = ""
     /// Main-actor owned during life; `deinit` exclusively transfers it into the async drain task.
     nonisolated(unsafe) private var singleSessionPictureInPictureSink: MPVSingleSessionPictureInPictureSink?
@@ -2190,6 +2423,8 @@ public final class MPVGPUPlayerRenderer {
     private var currentPrimaryLoadIdentity: MPVLoadIdentityTracker.Identity?
     private var hasSubmittedCurrentPrimaryLoad = false
     private var isAwaitingPrimaryFileLoaded = false
+    private var nativePictureInPictureProbeGate = MPVNativePiPProbeGate()
+    private var pendingNativePictureInPictureProbePrimeCount: Int?
     private var deferredPrimaryLoadActions = MPVGenerationDeferredActions<MPVGPUPlayerDeferredLoadAction>()
     private var mpv: OpaquePointer?
     private var currentURL: URL?
@@ -2202,12 +2437,44 @@ public final class MPVGPUPlayerRenderer {
     private var compatibilityVideoSelection = MPVCompatibilityVideoSelectionState()
     private var cachedPosition: Double = 0
     private var cachedDuration: Double = 0
+    private var cachedSpeed: Double = 1
+    private var cachedEstimatedFramesPerSecond: Double = 0
+    private var cachedDroppedVideoFrameCount: Int64 = 0
+    private var cachedDelayedVideoFrameCount: Int64 = 0
+    private var cachedContainerFramesPerSecond: Double = 0
+    private var cachedVideoCodec = ""
+    private var cachedVideoWidth: Int64 = 0
+    private var cachedVideoHeight: Int64 = 0
+    private var cachedVideoTransferFunction = ""
+    private var cachedVideoColorPrimaries = ""
+    private var cachedVideoSignalPeak: Double = 0
+    private var cachedVideoPixelFormat = ""
+    private var cachedHardwareDecoder = ""
+    private var videoColorMetadataRefreshWorkItem: DispatchWorkItem?
     private var audioRecoveryBaseline: UInt64 = 0
     private var isPaused = true
     private var isBuffering = false
     private var isRunning = false
     private var isStopping = false
     private var engineGeneration: UInt64 = 0
+    private var nextHardwareDecoderRecoveryEpoch: UInt64 = 0
+    private var activeHardwareDecoderRecoveryEpoch: UInt64?
+    private var activeHardwareDecoderRecoveryGeneration: UInt64?
+    private var hardwareDecoderRecoveryProof = MPVHardwareDecoderRecoveryProof()
+    private var nextHardwareDecoderRecoveryTransitionID: UInt64 = 0
+    private var activeHardwareDecoderRecoveryTransitionID: UInt64?
+    private var hardwareDecoderRecoveryInvalidationGeneration: UInt64 = 0
+    private var hardwareDecoderRecoveryTransitionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nextForegroundVideoValidationID: UInt64 = 0
+    private var activeForegroundVideoValidationID: UInt64?
+    private var activeForegroundVideoValidationGeneration: UInt64?
+    private var foregroundVideoValidationAPI: MPVApplePictureInPictureAPI?
+    /// Registry access is lock-protected; deinit can only unregister an opaque token.
+    nonisolated(unsafe) private var foregroundVideoValidationContext: UnsafeMutableRawPointer?
+    private var foregroundVideoValidationTimeoutTask: Task<Void, Never>?
+    private var foregroundVideoValidationContinuation: CheckedContinuation<Bool, Never>?
+    private var nextAsyncCommandRequestID: UInt64 = 0
+    private var pendingAsyncCommandReplies: [UInt64: CheckedContinuation<Int32, Never>] = [:]
     private var isPictureInPicturePrepared = false
     private var isPictureInPictureActive = false
     private var pictureInPicturePreparationGeneration: UInt64 = 0
@@ -2223,9 +2490,22 @@ public final class MPVGPUPlayerRenderer {
     private var singleSessionShutdownGeneration: UInt64 = 0
     private var pendingPrimaryLoadSubmission: Task<Void, Never>?
     private var isPrimaryLoadSubmissionPending = false
+    private var pendingSeekAfterPrimaryLoadSubmission: Double?
     private var pictureInPictureRenderSize: CGSize = .zero
+    private var pendingPictureInPictureRenderSize: CGSize?
+    /// Main-queue owned during life; deinit only cancels the final outstanding item.
+    nonisolated(unsafe) private var pictureInPictureResizeWorkItem: DispatchWorkItem?
     private var pictureInPicturePreparationTimeoutTask: Task<Void, Never>?
     private var pictureInPicturePreparationWaiters: [UInt64: [CheckedContinuation<Void, Error>]] = [:]
+
+    private var isPictureInPictureTrackOwnershipIdle: Bool {
+        switch pictureInPictureState {
+        case .idle, .failed:
+            return true
+        case .preparing, .ready, .active, .restoring:
+            return false
+        }
+    }
     private var pictureInPictureTimelineUpdateSequence: UInt64 = 0
     private var completedPictureInPictureTimelineUpdateSequence: UInt64 = 0
     private var pictureInPictureTimelineUpdateWaiters: [(UInt64, CheckedContinuation<Void, Never>)] = []
@@ -2278,21 +2558,7 @@ public final class MPVGPUPlayerRenderer {
         self.inlineLayer = inlineLayer
         self.pictureInPictureDisplayLayer = pictureInPictureDisplayLayer
         self.options = options
-        self.pictureInPictureRenderer = MPVMetalSampleBufferRenderer(
-            displayLayer: pictureInPictureDisplayLayer,
-            options: MPVMetalSampleBufferRendererOptions(
-                maximumFrameSize: options.maximumPiPFrameSize,
-                preferredFramesPerSecond: options.preferredPiPFramesPerSecond,
-                preferredPiPFramesPerSecond: options.preferredPiPFramesPerSecond,
-                createsMetalCompatibilityProbe: false,
-                prefersMetalPresentation: false,
-                prefersHDRPresentation: false,
-                prefersHighBitDepthRendering: false,
-                maximumInFlightFrameCount: options.maximumInFlightPictureInPictureFrames
-            )
-        )
         configureInlineLayer()
-        configurePictureInPictureCallbacks()
     }
 
     #if os(macOS)
@@ -2330,18 +2596,23 @@ public final class MPVGPUPlayerRenderer {
         if let context = compatibilityInlineRestoreContext {
             MPVApplePictureInPictureCallbackRegistry.unregister(context)
         }
+        if let context = foregroundVideoValidationContext {
+            MPVApplePictureInPictureCallbackRegistry.unregister(context)
+        }
+        foregroundVideoValidationTimeoutTask?.cancel()
         pictureInPicturePreparationTimeoutTask?.cancel()
         inlineResizeWorkItem?.cancel()
+        pictureInPictureResizeWorkItem?.cancel()
         let sink = singleSessionPictureInPictureSink
         let earlierShutdown = pendingSingleSessionShutdown
         let pump = eventPump
-        let compatibilityRenderer = pictureInPictureRenderer
+        let compatibilityRenderer = pictureInPictureRendererStorage
         Task { @MainActor in
             sink?.stop()
             await earlierShutdown?.value
             if let sink { await sink.waitUntilStopped() }
             pump?.stop {}
-            compatibilityRenderer.stop()
+            compatibilityRenderer?.stop()
         }
     }
 
@@ -2359,7 +2630,19 @@ public final class MPVGPUPlayerRenderer {
             self.inlineResizeRequestCount += 1
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            self.inlineLayer.frame = bounds
+            #if os(macOS)
+            let hostOwnsLayerGeometry = (self.inlineLayer.delegate as? NSView)?.layer
+                === self.inlineLayer
+            #else
+            let hostOwnsLayerGeometry = (self.inlineLayer.delegate as? UIView)?.layer
+                === self.inlineLayer
+            #endif
+            // A UIView/NSView owns the frame of its backing layer. Writing that frame from the
+            // view's layout callback re-enters platform layout (and can recurse until the main
+            // thread stack overflows). Standalone hosted sublayers still need explicit sizing.
+            if !hostOwnsLayerGeometry {
+                self.inlineLayer.frame = bounds
+            }
             self.inlineLayer.contentsScale = resolvedScale
             CATransaction.commit()
 
@@ -2421,19 +2704,421 @@ public final class MPVGPUPlayerRenderer {
                   size.height > 1 else { return }
             self.pictureInPictureResizeRequestCount += 1
             let resolvedSize = self.validatedPictureInPictureRenderSize(size)
-            if self.pictureInPictureRenderSize.width > 1,
-               self.pictureInPictureRenderSize.height > 1,
-               abs(resolvedSize.width - self.pictureInPictureRenderSize.width) < 2,
-               abs(resolvedSize.height - self.pictureInPictureRenderSize.height) < 2 {
+            let comparisonSize = self.pendingPictureInPictureRenderSize
+                ?? self.pictureInPictureRenderSize
+            if !MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+                current: comparisonSize,
+                proposed: resolvedSize
+            ) {
                 self.pictureInPictureResizeCoalescedCount += 1
                 return
             }
-            self.pictureInPictureRenderSize = resolvedSize
-            self.pictureInPictureResizeApplicationCount += 1
-            self.markPictureInPictureTimelineUpdate(requiresFrame: true)
-            self.updateCompatibilityRendererOptions()
-            self.singleSessionPictureInPictureSink?.updateRenderSize(self.pictureInPictureRenderSize)
-            self.emitDiagnostics()
+            self.pendingPictureInPictureRenderSize = resolvedSize
+            if self.pictureInPictureResizeWorkItem != nil {
+                self.pictureInPictureResizeCoalescedCount += 1
+                return
+            }
+
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.applyPendingPictureInPictureRenderSize()
+            }
+            self.pictureInPictureResizeWorkItem = workItem
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + self.resolvedInlineResizeDebounceInterval,
+                execute: workItem
+            )
+        }
+    }
+
+    /// Reads the live mpv property instead of the diagnostics cache. Foreground validation uses
+    /// this only at a lifecycle boundary, so it adds no steady-state polling cost.
+    public func refreshCurrentHardwareDecoder() -> String {
+        let decoder = getStringProperty("hwdec-current") ?? ""
+        cachedHardwareDecoder = decoder
+        return decoder
+    }
+
+    /// Proves that the current decoder and inline CAMetalLayer survived a background transition
+    /// without changing `vid`, `hwdec`, playback position, or the audio clock. A forced redraw can
+    /// present mpv's retained pre-suspension frame, so playing content is accepted only after a
+    /// later token-zero presentation is fenced to a higher native VO frame ID. Paused or buffering
+    /// playback keeps the validation latch for `play()` rather than manufacturing decoder activity.
+    public func validateForegroundVideoAfterSystemResume(
+        timeout: TimeInterval = 0.75
+    ) async -> MPVGPUPlayerForegroundVideoValidation {
+        guard isRunning,
+              !isStopping,
+              currentURL != nil,
+              let handle = mpv,
+              let expectedLoadIdentity = currentPrimaryLoadIdentity else {
+            return .unavailable
+        }
+        // The native ABI has one callback slot per mpv handle. A retiring PiP sink clears that
+        // slot only after disable-and-drain, so wait before installing the inline validation
+        // callback or the old sink can erase it underneath us.
+        if let shutdown = pendingSingleSessionShutdown {
+            let shutdownGeneration = singleSessionShutdownGeneration
+            await shutdown.value
+            if singleSessionShutdownGeneration == shutdownGeneration {
+                pendingSingleSessionShutdown = nil
+            }
+        }
+        guard !Task.isCancelled,
+              isRunning,
+              !isStopping,
+              currentURL != nil,
+              mpv == handle,
+              currentPrimaryLoadIdentity == expectedLoadIdentity,
+              pendingSingleSessionShutdown == nil else {
+            return .unavailable
+        }
+        guard !isAwaitingPrimaryFileLoaded,
+              !isPrimaryLoadSubmissionPending,
+              activeHardwareDecoderRecoveryEpoch == nil,
+              activeHardwareDecoderRecoveryTransitionID == nil,
+              activeForegroundVideoValidationID == nil,
+              !isPictureInPicturePrepared,
+              !isPictureInPictureActive,
+              isPictureInPictureTrackOwnershipIdle,
+              activePictureInPictureRestore == nil,
+              inlineLayer.drawableSize.width > 1,
+              inlineLayer.drawableSize.height > 1 else {
+            return .transitionBusy
+        }
+
+        let decoder = refreshCurrentHardwareDecoder()
+        guard MPVVideoToolboxDecodePolicy.isEngaged(decoder) else {
+            return .decoderUnavailable(current: decoder)
+        }
+        guard !isPaused, !isBuffering else {
+            return .playbackDeferred(decoder: decoder)
+        }
+        guard let api = MPVApplePictureInPictureAPI.load(), api.apiVersion() == 1 else {
+            return .unavailable
+        }
+
+        let rawCapabilities = UnsafeMutableRawPointer.allocate(byteCount: 184, alignment: 8)
+        defer { rawCapabilities.deallocate() }
+        rawCapabilities.initializeMemory(as: UInt8.self, repeating: 0, count: 184)
+        rawCapabilities.storeBytes(of: UInt32(184), as: UInt32.self)
+        guard api.getCapabilities(handle, rawCapabilities) == 0 else {
+            return .unavailable
+        }
+        let capabilities = rawCapabilities.load(fromByteOffset: 8, as: UInt64.self)
+        guard capabilities
+                & MPVApplePictureInPictureSink.inlineFreshFrameNotificationCapability != 0 else {
+            // The legacy token-zero callback can redraw a retained frame. It is intentionally not
+            // accepted as decoder proof; hosts fall through to their bounded hardware-only path.
+            return .unavailable
+        }
+
+        nextForegroundVideoValidationID &+= 1
+        if nextForegroundVideoValidationID == 0 { nextForegroundVideoValidationID = 1 }
+        let validationID = nextForegroundVideoValidationID
+        let nativeGeneration = validationID
+        let sourceFPS = cachedEstimatedFramesPerSecond > 0
+            ? cachedEstimatedFramesPerSecond
+            : cachedContainerFramesPerSecond
+        let queuedFrameWindow = sourceFPS.isFinite && sourceFPS > 0 ? 12 / sourceFPS : 1
+        let boundedTimeout = min(2, max(0.1, max(timeout, queuedFrameWindow)))
+
+        let presented = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                activeForegroundVideoValidationID = validationID
+                activeForegroundVideoValidationGeneration = nativeGeneration
+                foregroundVideoValidationAPI = api
+                foregroundVideoValidationContinuation = continuation
+
+                let context = MPVApplePictureInPictureCallbackContext { [weak self] frame in
+                    guard let self,
+                          self.activeForegroundVideoValidationID == validationID,
+                          self.activeForegroundVideoValidationGeneration == nativeGeneration,
+                          frame.status == 0,
+                          frame.token == 0,
+                          frame.generation == nativeGeneration else { return }
+                    self.finishForegroundVideoValidation(id: validationID, presented: true)
+                }
+                let contextPointer = MPVApplePictureInPictureCallbackRegistry.register(context)
+                foregroundVideoValidationContext = contextPointer
+
+                let callbackStatus = api.setCallback(
+                    handle,
+                    mpvAppleInlineRestoreFrameCallback,
+                    contextPointer
+                )
+                let modeStatus = callbackStatus == 0
+                    ? api.setMode(
+                        handle,
+                        MPVApplePictureInPictureSink.modeInlineFreshFrame,
+                        nativeGeneration
+                    )
+                    : callbackStatus
+                guard callbackStatus == 0, modeStatus == 0 else {
+                    finishForegroundVideoValidation(id: validationID, presented: false)
+                    return
+                }
+
+                foregroundVideoValidationTimeoutTask = Task { [weak self] in
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(boundedTimeout * 1_000_000_000)
+                    )
+                    guard !Task.isCancelled else { return }
+                    self?.finishForegroundVideoValidation(id: validationID, presented: false)
+                }
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor in
+                self?.finishForegroundVideoValidation(id: validationID, presented: false)
+            }
+        }
+
+        guard !Task.isCancelled,
+              isRunning,
+              !isStopping,
+              currentPrimaryLoadIdentity == expectedLoadIdentity else {
+            return .unavailable
+        }
+        let confirmedDecoder = refreshCurrentHardwareDecoder()
+        guard presented else {
+            if isPaused || isBuffering {
+                return .playbackDeferred(decoder: confirmedDecoder)
+            }
+            return .inlinePresentationTimedOut(decoder: confirmedDecoder)
+        }
+        guard MPVVideoToolboxDecodePolicy.isEngaged(confirmedDecoder) else {
+            return .decoderUnavailable(current: confirmedDecoder)
+        }
+        return .healthy(decoder: confirmedDecoder)
+    }
+
+    private func finishForegroundVideoValidation(id: UInt64, presented: Bool) {
+        guard activeForegroundVideoValidationID == id else { return }
+        foregroundVideoValidationTimeoutTask?.cancel()
+        foregroundVideoValidationTimeoutTask = nil
+        if let api = foregroundVideoValidationAPI, let handle = mpv {
+            _ = api.setCallback(handle, nil, nil)
+        }
+        if let context = foregroundVideoValidationContext {
+            MPVApplePictureInPictureCallbackRegistry.unregister(context)
+        }
+        foregroundVideoValidationContext = nil
+        foregroundVideoValidationAPI = nil
+        activeForegroundVideoValidationID = nil
+        activeForegroundVideoValidationGeneration = nil
+        let continuation = foregroundVideoValidationContinuation
+        foregroundVideoValidationContinuation = nil
+        continuation?.resume(returning: presented)
+    }
+
+    private func cancelForegroundVideoValidation() {
+        guard let id = activeForegroundVideoValidationID else { return }
+        finishForegroundVideoValidation(id: id, presented: false)
+    }
+
+    /// Recreates the selected video track after the process returns from suspension. VideoToolbox
+    /// can invalidate a decoder session while an app is backgrounded even though `hwdec-current`
+    /// still briefly reports the old backend. MPVKit first waits for mpv to confirm that the old
+    /// track was fully deselected, reapplies the requested VideoToolbox order, and then reselects
+    /// the same track without replacing the media, audio clock, subtitle state, or position.
+    ///
+    /// A successful submission is not itself decoded-frame proof. Match its epoch against
+    /// `onHardwareDecoderRecoveryOutput`; that callback now joins a post-epoch VIDEO_RECONFIG with
+    /// a post-epoch VideoToolbox `hwdec-current` value. This method never adds a software decoder
+    /// and therefore preserves a host's `hwdec-software-fallback=no` policy.
+    @discardableResult
+    public func recreateHardwareDecoderAfterSystemResume(
+        strategy: MPVGPUPlayerHardwareDecoderRecoveryStrategy = .configuredOrder
+    ) async -> MPVGPUPlayerHardwareDecoderRecoverySubmission {
+        cancelForegroundVideoValidation()
+        let coreStrategy: MPVVideoToolboxDecodePolicy.RecoveryStrategy
+        switch strategy {
+        case .configuredOrder:
+            coreStrategy = .configuredOrder
+        case .copyOnly:
+            coreStrategy = .copyOnly
+        }
+        guard let recoverySetting = MPVVideoToolboxDecodePolicy.recoverySetting(
+            configuredDecoders: options.hardwareDecoding,
+            strategy: coreStrategy
+        ) else { return .unavailable }
+        guard isRunning, !isStopping, currentURL != nil else { return .unavailable }
+        guard activeHardwareDecoderRecoveryEpoch == nil,
+              activeHardwareDecoderRecoveryTransitionID == nil else { return .transitionBusy }
+        // A retiring native PiP sink still owns the mpv callback/target while disable-and-drain
+        // completes. Let the caller's bounded lifecycle retry run after that ownership is idle
+        // instead of changing `vid` underneath the retiring sink.
+        guard pendingSingleSessionShutdown == nil else { return .transitionBusy }
+        guard !isAwaitingPrimaryFileLoaded,
+              !isPictureInPicturePrepared,
+              !isPictureInPictureActive,
+              isPictureInPictureTrackOwnershipIdle,
+              activePictureInPictureRestore == nil else { return .transitionBusy }
+        let selectedVideoTrack = currentVideoTrackID()
+        guard selectedVideoTrack >= 0 else {
+            return .unavailable
+        }
+
+        guard let expectedLoadIdentity = currentPrimaryLoadIdentity else { return .unavailable }
+        let expectedInvalidationGeneration = hardwareDecoderRecoveryInvalidationGeneration
+        let selection = String(selectedVideoTrack)
+
+        nextHardwareDecoderRecoveryTransitionID &+= 1
+        let transitionID = nextHardwareDecoderRecoveryTransitionID
+        activeHardwareDecoderRecoveryTransitionID = transitionID
+        defer {
+            finishHardwareDecoderRecoveryTransition(transitionID)
+        }
+        let restoreSelectionIfCurrent = { [self] in
+            guard isRunning,
+                  !isStopping,
+                  currentURL != nil,
+                  currentPrimaryLoadIdentity == expectedLoadIdentity else { return }
+            _ = setHardwareDecoderRecoveryVideoSelection(selection)
+        }
+        guard !Task.isCancelled else { return .cancelled }
+
+        let deselectionStatus = await commandPrimaryAsync(["set", "vid", "no"])
+        guard activeHardwareDecoderRecoveryTransitionID == transitionID else {
+            return .cancelled
+        }
+        guard hardwareDecoderRecoveryInvalidationGeneration == expectedInvalidationGeneration else {
+            if deselectionStatus >= 0 { restoreSelectionIfCurrent() }
+            return .cancelled
+        }
+        if Task.isCancelled {
+            if deselectionStatus >= 0 { restoreSelectionIfCurrent() }
+            return .cancelled
+        }
+        guard deselectionStatus >= 0 else {
+            return .commandFailed
+        }
+        guard isRunning,
+              !isStopping,
+              currentURL != nil,
+              currentPrimaryLoadIdentity == expectedLoadIdentity else {
+            restoreSelectionIfCurrent()
+            return .transitionBusy
+        }
+        guard !isAwaitingPrimaryFileLoaded,
+              !isPictureInPicturePrepared,
+              !isPictureInPictureActive,
+              isPictureInPictureTrackOwnershipIdle,
+              activeHardwareDecoderRecoveryEpoch == nil,
+              activePictureInPictureRestore == nil else {
+            restoreSelectionIfCurrent()
+            return .transitionBusy
+        }
+
+        // The deselection reply proves the command completed; this second ordered request drains
+        // the same client event stream while no decoder exists. Only then activate an epoch and
+        // synchronously reselect, so a queued pre-suspension VIDEO_RECONFIG cannot be tagged as
+        // output from the new decoder and a replacement load cannot overtake the reselect.
+        let fenceStatus = await commandPrimaryAsync(["get_property", "vid"])
+        guard activeHardwareDecoderRecoveryTransitionID == transitionID else {
+            return .cancelled
+        }
+        guard hardwareDecoderRecoveryInvalidationGeneration == expectedInvalidationGeneration else {
+            restoreSelectionIfCurrent()
+            return .cancelled
+        }
+        if Task.isCancelled {
+            restoreSelectionIfCurrent()
+            return .cancelled
+        }
+        guard fenceStatus >= 0 else {
+            restoreSelectionIfCurrent()
+            return .commandFailed
+        }
+        guard isRunning,
+              !isStopping,
+              currentURL != nil,
+              currentPrimaryLoadIdentity == expectedLoadIdentity else {
+            restoreSelectionIfCurrent()
+            return .transitionBusy
+        }
+        guard !isAwaitingPrimaryFileLoaded,
+              !isPictureInPicturePrepared,
+              !isPictureInPictureActive,
+              isPictureInPictureTrackOwnershipIdle,
+              activeHardwareDecoderRecoveryEpoch == nil,
+              activePictureInPictureRestore == nil else {
+            restoreSelectionIfCurrent()
+            return .transitionBusy
+        }
+
+        nextHardwareDecoderRecoveryEpoch &+= 1
+        let epoch = nextHardwareDecoderRecoveryEpoch
+        // A pre-suspension diagnostics value cannot participate in proof for this epoch. The
+        // callback below is released only after both a fresh VIDEO_RECONFIG and a fresh engaged
+        // `hwdec-current` notification arrive, in either order.
+        cachedHardwareDecoder = ""
+        hardwareDecoderRecoveryProof.reset()
+        activeHardwareDecoderRecoveryEpoch = epoch
+        activeHardwareDecoderRecoveryGeneration = expectedLoadIdentity.clientGeneration
+        guard commandPrimary(["set", "hwdec", recoverySetting]) >= 0 else {
+            _ = setHardwareDecoderRecoveryVideoSelection(selection)
+            _ = finishHardwareDecoderRecoveryAttempt(epoch: epoch)
+            return .commandFailed
+        }
+        guard setHardwareDecoderRecoveryVideoSelection(selection) >= 0 else {
+            _ = setHardwareDecoderRecoveryVideoSelection(selection)
+            _ = finishHardwareDecoderRecoveryAttempt(epoch: epoch)
+            return .commandFailed
+        }
+        return .accepted(epoch: epoch)
+    }
+
+    @discardableResult
+    private func setHardwareDecoderRecoveryVideoSelection(_ selection: String) -> Int32 {
+        let status = commandPrimary(["set", "vid", selection])
+        if status >= 0 {
+            // The temporary `vid=no` property event may be delivered after the synchronous
+            // reselect. Keep the compatibility state anchored to the host's intended track; its
+            // ordinary property observer will resolve the current primary selection afterward.
+            _ = compatibilityVideoSelection.select(selection)
+        }
+        return status
+    }
+
+    private func finishHardwareDecoderRecoveryTransition(_ transitionID: UInt64) {
+        guard activeHardwareDecoderRecoveryTransitionID == transitionID else { return }
+        activeHardwareDecoderRecoveryTransitionID = nil
+        let waiters = hardwareDecoderRecoveryTransitionWaiters
+        hardwareDecoderRecoveryTransitionWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitForHardwareDecoderRecoveryTransition() async {
+        while activeHardwareDecoderRecoveryTransitionID != nil, !Task.isCancelled {
+            await withCheckedContinuation { continuation in
+                guard activeHardwareDecoderRecoveryTransitionID != nil else {
+                    continuation.resume()
+                    return
+                }
+                hardwareDecoderRecoveryTransitionWaiters.append(continuation)
+            }
+        }
+    }
+
+    /// Ends an accepted recovery attempt without changing the decoder that now owns the current
+    /// track. In mpv, changing `hwdec` reinitializes an active decoder, so a proven copy-path
+    /// recovery must remain installed until the next decoder-free load or recovery boundary.
+    @discardableResult
+    public func finishHardwareDecoderRecoveryAttempt(epoch: UInt64) -> Bool {
+        guard activeHardwareDecoderRecoveryEpoch == epoch else { return false }
+        activeHardwareDecoderRecoveryEpoch = nil
+        activeHardwareDecoderRecoveryGeneration = nil
+        hardwareDecoderRecoveryProof.reset()
+        return true
+    }
+
+    /// Gives an imminent PiP transition priority over foreground decoder reconstruction. An
+    /// in-flight async deselect observes the invalidation after its next reply and restores the
+    /// selected track; an already accepted epoch releases ownership without changing its decoder.
+    public func yieldHardwareDecoderRecoveryToPictureInPicture() {
+        hardwareDecoderRecoveryInvalidationGeneration &+= 1
+        if let epoch = activeHardwareDecoderRecoveryEpoch {
+            _ = finishHardwareDecoderRecoveryAttempt(epoch: epoch)
         }
     }
 
@@ -2446,11 +3131,8 @@ public final class MPVGPUPlayerRenderer {
             throw MPVMetalSampleBufferRendererError.metalUnavailable
         }
 
-        // MoltenVK 1.4.1's descriptor implementation deliberately traps invalid resource
-        // lifetimes. Keep its live-resource validation enabled unless the host explicitly chose a
-        // different policy, converting a potential use-after-free crash into validation/fallback.
-        if getenv("MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES") == nil {
-            _ = setenv("MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES", "1", 0)
+        if let device = MTLCreateSystemDefaultDevice() {
+            Self.configureMoltenVKEnvironment(for: device)
         }
 
         isStopping = false
@@ -2463,7 +3145,11 @@ public final class MPVGPUPlayerRenderer {
         mpv = handle
 
         setOption("terminal", "no", handle: handle)
-        setOption("msg-level", "all=warn,cplayer=v,ffmpeg=v,vo=v,gpu=v")
+        // `terminal=no` does not make enabled verbose logging free: mpv still formats accepted
+        // messages and serializes them through its root log mutex. Keep normal playback at errors
+        // only; hosts that need a trace can override `msg-level` and `terminal` through
+        // additionalMPVOptions.
+        setOption("msg-level", "all=error")
         setOption("idle", "yes", handle: handle)
         setOption("keep-open", "yes", handle: handle)
         setOption("wid", value: layerWindowID(), handle: handle)
@@ -2476,6 +3162,12 @@ public final class MPVGPUPlayerRenderer {
         setOption("video-sync", "audio", handle: handle)
         setOption("framedrop", "vo", handle: handle)
         setOption("interpolation", "no", handle: handle)
+        #if os(tvOS)
+        // AudioUnit can open but remain silent on recent Dolby/Atmos HDMI routes. The
+        // AVSampleBufferAudioRenderer-backed output handles those routes and AudioUnit remains a
+        // fallback. Hosts can still override this through additionalMPVOptions.
+        setOption("ao", "avfoundation,audiounit", handle: handle)
+        #endif
         setOption("target-colorspace-hint", options.enablesTargetColorspaceHint ? "yes" : "no", handle: handle)
         setOption("subs-match-os-language", "yes", handle: handle)
         setOption("sub-auto", "fuzzy", handle: handle)
@@ -2513,6 +3205,7 @@ public final class MPVGPUPlayerRenderer {
 
     public func stop() {
         if isStopping { return }
+        cancelForegroundVideoValidation()
         guard isRunning || mpv != nil || eventPump != nil else {
             if state != .stopped { updateState(.stopped) }
             resumeStopWaiters()
@@ -2520,14 +3213,23 @@ public final class MPVGPUPlayerRenderer {
         }
         isStopping = true
         engineGeneration &+= 1
+        hardwareDecoderRecoveryInvalidationGeneration &+= 1
+        activeHardwareDecoderRecoveryEpoch = nil
+        activeHardwareDecoderRecoveryGeneration = nil
+        hardwareDecoderRecoveryProof.reset()
+        resumePendingAsyncCommandReplies(with: -1)
         pendingPrimaryLoadSubmission?.cancel()
         pendingPrimaryLoadSubmission = nil
         isPrimaryLoadSubmissionPending = false
+        pendingSeekAfterPrimaryLoadSubmission = nil
         updateState(.stopping)
         resetLoadGenerations()
         inlineResizeWorkItem?.cancel()
         inlineResizeWorkItem = nil
         pendingInlineDrawableSize = nil
+        pictureInPictureResizeWorkItem?.cancel()
+        pictureInPictureResizeWorkItem = nil
+        pendingPictureInPictureRenderSize = nil
         cancelPictureInPictureRestore()
         cancelPictureInPicturePreparation(with: MPVGPUPlayerRendererError.pictureInPicturePreparationSuperseded)
         if let sink = singleSessionPictureInPictureSink {
@@ -2535,7 +3237,8 @@ public final class MPVGPUPlayerRenderer {
         }
         singleSessionPictureInPictureSink = nil
 
-        pictureInPictureRenderer.stop()
+        let compatibilityRenderer = pictureInPictureRendererStorage
+        compatibilityRenderer?.stop()
         isPictureInPicturePrepared = false
         isPictureInPictureActive = false
         pendingPictureInPictureBegin = false
@@ -2545,7 +3248,7 @@ public final class MPVGPUPlayerRenderer {
         eventPump = nil
         mpv = nil
         eventPumpStopCompleted = pump == nil
-        sampleRendererStopCompleted = false
+        sampleRendererStopCompleted = compatibilityRenderer == nil
         let nativeShutdown = pendingSingleSessionShutdown
         Task { [weak self, pump] in
             await nativeShutdown?.value
@@ -2560,11 +3263,13 @@ public final class MPVGPUPlayerRenderer {
             }
         }
 
-        Task { [weak self, pictureInPictureRenderer] in
-            await pictureInPictureRenderer.waitUntilStopped()
-            guard let self else { return }
-            self.sampleRendererStopCompleted = true
-            self.finishStopIfPossible()
+        if let compatibilityRenderer {
+            Task { [weak self, compatibilityRenderer] in
+                await compatibilityRenderer.waitUntilStopped()
+                guard let self else { return }
+                self.sampleRendererStopCompleted = true
+                self.finishStopIfPossible()
+            }
         }
         finishStopIfPossible()
     }
@@ -2591,16 +3296,30 @@ public final class MPVGPUPlayerRenderer {
                 self.reportError(MPVGPUPlayerRendererError.teardownInProgress.localizedDescription)
                 return
             }
+            self.cancelForegroundVideoValidation()
+            let mustWaitForHardwareDecoderRecovery =
+                self.activeHardwareDecoderRecoveryTransitionID != nil
+            self.hardwareDecoderRecoveryInvalidationGeneration &+= 1
+            self.pendingPrimaryLoadSubmission?.cancel()
+            self.pendingPrimaryLoadSubmission = nil
+            self.isPrimaryLoadSubmissionPending = false
+            self.pendingSeekAfterPrimaryLoadSubmission = nil
             self.currentURL = url
             self.currentHeaders = headers
+            if let epoch = self.activeHardwareDecoderRecoveryEpoch {
+                _ = self.finishHardwareDecoderRecoveryAttempt(epoch: epoch)
+            }
             self.cancelPictureInPictureRestore()
             self.pictureInPicturePreparationGeneration &+= 1
             let preparationGeneration = self.pictureInPicturePreparationGeneration
             self.cancelPictureInPicturePreparation(
                 with: MPVGPUPlayerRendererError.pictureInPicturePreparationSuperseded
             )
+            self.pictureInPictureResizeWorkItem?.cancel()
+            self.pictureInPictureResizeWorkItem = nil
+            self.pendingPictureInPictureRenderSize = nil
             self.restorePrimaryVideoAfterCompatibilityIfNeeded()
-            self.setStringProperty("vid", self.compatibilityVideoSelection.beginLoad())
+            _ = self.compatibilityVideoSelection.beginLoad()
             if self.selectedPictureInPictureBackend == .compatibilityDualSession,
                self.isPictureInPicturePrepared || self.isPictureInPictureActive {
                 self.pictureInPictureRenderer.pause()
@@ -2622,6 +3341,7 @@ public final class MPVGPUPlayerRenderer {
             self.updatePictureInPictureState(.idle)
             self.cachedPosition = 0
             self.cachedDuration = 0
+            self.resetCachedVideoProperties()
             self.isBuffering = false
             self.setInlineExtendedDynamicRange(false)
             guard self.mpv != nil else { return }
@@ -2629,10 +3349,12 @@ public final class MPVGPUPlayerRenderer {
                !self.hasSubmittedCurrentPrimaryLoad {
                 self.loadIdentityTracker.cancel(previousIdentity)
             }
-            let loadIdentity = self.loadIdentityTracker.submit(clientGeneration: generation)
+            let loadIdentity = self.loadIdentityTracker.reserve(clientGeneration: generation)
             self.currentPrimaryLoadIdentity = loadIdentity
             self.hasSubmittedCurrentPrimaryLoad = false
             self.isAwaitingPrimaryFileLoaded = true
+            self.nativePictureInPictureProbeGate.beginLoad(sequence: loadIdentity.sequence)
+            self.pendingNativePictureInPictureProbePrimeCount = nil
             self.deferredPrimaryLoadActions.beginGeneration(loadIdentity.sequence)
             // These are media-item identities, unlike subtitle appearance and video filters.
             self.externalSubtitleURLs = []
@@ -2652,11 +3374,17 @@ public final class MPVGPUPlayerRenderer {
                 )
             }
             self.updateState(.loading)
-            if let shutdown = self.pendingSingleSessionShutdown {
+            let shutdown = self.pendingSingleSessionShutdown
+            if mustWaitForHardwareDecoderRecovery || shutdown != nil {
                 self.isPrimaryLoadSubmissionPending = true
                 let engineGeneration = self.engineGeneration
-                let submission = Task { [weak self] in
-                    await shutdown.value
+                let submission = Task { @MainActor [weak self] in
+                    if mustWaitForHardwareDecoderRecovery {
+                        await self?.waitForHardwareDecoderRecoveryTransition()
+                    }
+                    if let shutdown {
+                        await shutdown.value
+                    }
                     guard let self,
                           !Task.isCancelled,
                           !self.isStopping,
@@ -2665,6 +3393,7 @@ public final class MPVGPUPlayerRenderer {
                           self.currentPrimaryLoadIdentity == loadIdentity else {
                         return
                     }
+                    self.pendingPrimaryLoadSubmission = nil
                     self.isPrimaryLoadSubmissionPending = false
                     self.submitPrimaryLoad(url, headers: headers, identity: loadIdentity)
                 }
@@ -2683,27 +3412,44 @@ public final class MPVGPUPlayerRenderer {
         identity: MPVLoadIdentityTracker.Identity
     ) {
         guard currentPrimaryLoadIdentity == identity else { return }
+        guard loadIdentityTracker.submit(identity) else { return }
         hasSubmittedCurrentPrimaryLoad = true
         updateHTTPHeaders(headers)
         let target = url.isFileURL ? url.path : url.absoluteString
         let replacedPlaylistEntryID = currentPlaylistEntryID()
-        let status = command(["loadfile", target, "replace"])
+        let perFileOptions = [
+            "hwdec=\(fixedLengthOptionValue(options.hardwareDecoding))",
+            "vid=\(fixedLengthOptionValue(compatibilityVideoSelection.desiredSelection))"
+        ].joined(separator: ",")
+        let status = command(["loadfile", target, "replace", "-1", perFileOptions])
         if status < 0 {
             loadIdentityTracker.cancel(identity)
             isAwaitingPrimaryFileLoaded = false
+            nativePictureInPictureProbeGate.reset()
+            pendingNativePictureInPictureProbePrimeCount = nil
             deferredPrimaryLoadActions.cancel()
             if currentPrimaryLoadIdentity == identity {
                 currentPrimaryLoadIdentity = nil
             }
             reportError("gpu-next loadfile failed status=\(status)")
-        } else if let playlistEntryID = currentPlaylistEntryID(),
-                  playlistEntryID != replacedPlaylistEntryID {
-            loadIdentityTracker.bind(playlistEntryID: playlistEntryID, to: identity)
+        } else {
+            if let playlistEntryID = currentPlaylistEntryID(),
+               playlistEntryID != replacedPlaylistEntryID {
+                loadIdentityTracker.bind(playlistEntryID: playlistEntryID, to: identity)
+            }
         }
     }
 
-    private func retireSingleSessionSink(_ sink: MPVSingleSessionPictureInPictureSink) {
-        if activePictureInPictureRestore?.sinkIdentity == ObjectIdentifier(sink) {
+    private func fixedLengthOptionValue(_ value: String) -> String {
+        "%\(value.utf8.count)%\(value)"
+    }
+
+    private func retireSingleSessionSink(
+        _ sink: MPVSingleSessionPictureInPictureSink,
+        cancelsActiveRestore: Bool = true
+    ) {
+        if cancelsActiveRestore,
+           activePictureInPictureRestore?.sinkIdentity == ObjectIdentifier(sink) {
             cancelPictureInPictureRestore()
         }
         sink.onFrameEnqueued = nil
@@ -2727,8 +3473,15 @@ public final class MPVGPUPlayerRenderer {
     public func play() {
         performOnMain {
             self.isPaused = false
+            guard !self.isPrimaryLoadSubmissionPending,
+                  !self.isAwaitingPrimaryFileLoaded else {
+                self.updateState(.loading)
+                return
+            }
             self.setFlagProperty("pause", false)
-            if self.isPictureInPictureActive {
+            if self.isBuffering {
+                self.updateState(.loading)
+            } else if self.isPictureInPictureActive {
                 if self.selectedPictureInPictureBackend == .compatibilityDualSession {
                     self.synchronizeCompatibilityPlaybackState(shouldRealign: false)
                 }
@@ -2744,8 +3497,15 @@ public final class MPVGPUPlayerRenderer {
     public func pause() {
         performOnMain {
             self.isPaused = true
+            guard !self.isPrimaryLoadSubmissionPending,
+                  !self.isAwaitingPrimaryFileLoaded else {
+                self.updateState(.loading)
+                return
+            }
             self.setFlagProperty("pause", true)
-            if self.isPictureInPictureActive {
+            if self.isBuffering {
+                self.updateState(.loading)
+            } else if self.isPictureInPictureActive {
                 if self.selectedPictureInPictureBackend == .compatibilityDualSession {
                     self.synchronizeCompatibilityPlaybackState(shouldRealign: false)
                 }
@@ -2763,6 +3523,11 @@ public final class MPVGPUPlayerRenderer {
         performOnMain {
             self.cachedPosition = clamped
             self.markPictureInPictureTimelineUpdate(requiresFrame: true)
+            guard !self.isPrimaryLoadSubmissionPending,
+                  !self.isAwaitingPrimaryFileLoaded else {
+                self.pendingSeekAfterPrimaryLoadSubmission = clamped
+                return
+            }
             _ = self.command(["seek", "\(clamped)", "absolute+exact"])
             if self.selectedPictureInPictureBackend == .compatibilityDualSession,
                self.isPictureInPicturePrepared || self.isPictureInPictureActive {
@@ -2779,6 +3544,7 @@ public final class MPVGPUPlayerRenderer {
     public func setSpeed(_ speed: Double) {
         let clamped = speed.isFinite ? max(0.1, speed) : 1
         performOnMain {
+            self.cachedSpeed = clamped
             self.setStringProperty("speed", "\(clamped)")
             if self.selectedPictureInPictureBackend == .compatibilityDualSession,
                self.isPictureInPicturePrepared || self.isPictureInPictureActive {
@@ -2790,7 +3556,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func getSpeed() -> Double {
-        return getDoubleProperty("speed") ?? 1.0
+        cachedSpeed
     }
 
     /// Waits until the most recent PiP seek/clock command visible at invocation has been installed.
@@ -2813,6 +3579,7 @@ public final class MPVGPUPlayerRenderer {
     /// Prepares the selected PiP backend and returns only after a valid, current-generation frame
     /// has reached the AVSampleBufferDisplayLayer.
     public func preparePictureInPicture() async throws {
+        cancelForegroundVideoValidation()
         guard !isStopping else { throw MPVGPUPlayerRendererError.teardownInProgress }
         guard isRunning else { throw MPVGPUPlayerRendererError.rendererNotRunning }
         guard currentURL != nil else { throw MPVGPUPlayerRendererError.mediaNotLoaded }
@@ -2831,6 +3598,37 @@ public final class MPVGPUPlayerRenderer {
         #endif
 
         let generation = pictureInPicturePreparationGeneration
+        if let shutdown = pendingSingleSessionShutdown {
+            let shutdownGeneration = singleSessionShutdownGeneration
+            await shutdown.value
+            if singleSessionShutdownGeneration == shutdownGeneration {
+                pendingSingleSessionShutdown = nil
+            }
+            guard !Task.isCancelled,
+                  !isStopping,
+                  isRunning,
+                  currentURL != nil,
+                  generation == pictureInPicturePreparationGeneration,
+                  pendingSingleSessionShutdown == nil else {
+                throw MPVGPUPlayerRendererError.pictureInPicturePreparationSuperseded
+            }
+        }
+        if activeHardwareDecoderRecoveryTransitionID != nil {
+            await waitForHardwareDecoderRecoveryTransition()
+            guard !Task.isCancelled,
+                  !isStopping,
+                  isRunning,
+                  currentURL != nil,
+                  generation == pictureInPicturePreparationGeneration else {
+                throw MPVGPUPlayerRendererError.pictureInPicturePreparationSuperseded
+            }
+        }
+        guard activeHardwareDecoderRecoveryTransitionID == nil,
+              activeHardwareDecoderRecoveryEpoch == nil else {
+            throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(
+                "video decoder recovery is changing track ownership"
+            )
+        }
         if let submission = pendingPrimaryLoadSubmission {
             await submission.value
             guard generation == pictureInPicturePreparationGeneration,
@@ -2874,6 +3672,8 @@ public final class MPVGPUPlayerRenderer {
         guard !isStopping,
               isRunning,
               currentURL != nil,
+              activeHardwareDecoderRecoveryTransitionID == nil,
+              activeHardwareDecoderRecoveryEpoch == nil,
               !compatibilityRendererRequiresStopWait,
               !isPrimaryLoadSubmissionPending else { return false }
         if case .restoring(_) = pictureInPictureState { return false }
@@ -2904,6 +3704,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func beginPictureInPicture() {
+        cancelForegroundVideoValidation()
         guard !isPrimaryLoadSubmissionPending else { return }
         let generation = pictureInPicturePreparationGeneration
         switch pictureInPictureState {
@@ -2952,19 +3753,26 @@ public final class MPVGPUPlayerRenderer {
         case .completed(let restored):
             return restored
         case .pending(let identity):
-            return await withCheckedContinuation { continuation in
-                if let result = lastPictureInPictureRestoreResult,
-                   result.identity == identity {
-                    continuation.resume(returning: result.restored)
-                } else if activePictureInPictureRestore == identity {
-                    pictureInPictureRestoreWaiters.append(MPVPictureInPictureRestoreWaiter(
-                        operationID: identity.operationID,
-                        continuation: continuation
-                    ))
-                } else {
-                    continuation.resume(returning: false)
+            let restored = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if let result = lastPictureInPictureRestoreResult,
+                       result.identity == identity {
+                        continuation.resume(returning: result.restored)
+                    } else if activePictureInPictureRestore == identity {
+                        pictureInPictureRestoreWaiters.append(MPVPictureInPictureRestoreWaiter(
+                            operationID: identity.operationID,
+                            continuation: continuation
+                        ))
+                    } else {
+                        continuation.resume(returning: false)
+                    }
+                }
+            } onCancel: { [weak self] in
+                Task { @MainActor in
+                    self?.cancelPictureInPictureRestoreForTaskCancellation(identity)
                 }
             }
+            return !Task.isCancelled && restored
         }
     }
 
@@ -3057,7 +3865,7 @@ public final class MPVGPUPlayerRenderer {
         if restoringInlinePlayback {
             setFlagProperty("pause", !shouldResume)
             isPaused = !shouldResume
-            updateState(shouldResume ? .playing : .paused)
+            updateState(isBuffering ? .loading : (shouldResume ? .playing : .paused))
         } else {
             setFlagProperty("pause", true)
             isPaused = true
@@ -3093,6 +3901,35 @@ public final class MPVGPUPlayerRenderer {
             lastPictureInPictureRestoreResult = nil
             return
         }
+        completePictureInPictureRestore(identity, restored: false)
+    }
+
+    /// Task cancellation represents a newer lifecycle owner (most commonly foreground returning
+    /// to background). Retire the in-flight native sink instead of allowing its old inline restore
+    /// to keep the renderer in `.restoring` and block the newer PiP cycle.
+    private func cancelPictureInPictureRestoreForTaskCancellation(
+        _ identity: MPVPictureInPictureRestoreIdentity
+    ) {
+        guard activePictureInPictureRestore == identity else { return }
+        pendingPictureInPictureBegin = false
+
+        if identity.backend == .compatibilityDualSession {
+            pendingCompatibilityStopAfterInlinePresentation = false
+            cancelCompatibilityInlinePresentationProbe()
+            pictureInPictureRenderer.stop()
+            observeCompatibilityRendererStop()
+        } else if let sink = singleSessionPictureInPictureSink,
+                  ObjectIdentifier(sink) == identity.sinkIdentity {
+            singleSessionPictureInPictureSink = nil
+            selectedPictureInPictureBackend = nil
+            didAttemptSingleSessionBackend = false
+            retireSingleSessionSink(sink, cancelsActiveRestore: false)
+        }
+
+        isPictureInPicturePrepared = false
+        isPictureInPictureActive = false
+        updatePictureInPictureState(.idle)
+        emitDiagnostics()
         completePictureInPictureRestore(identity, restored: false)
     }
 
@@ -3145,6 +3982,41 @@ public final class MPVGPUPlayerRenderer {
     private func commandPrimary(_ args: [String]) -> Int32 {
         guard let handle = mpv, !args.isEmpty else { return -1 }
         return command(handle: handle, args: args)
+    }
+
+    private func commandPrimaryAsync(_ args: [String]) async -> Int32 {
+        guard let handle = mpv, !args.isEmpty else { return -1 }
+        nextAsyncCommandRequestID &+= 1
+        let requestID = nextAsyncCommandRequestID
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                pendingAsyncCommandReplies[requestID] = continuation
+                var cargs = args.map { UnsafePointer<CChar>(strdup($0)) }
+                cargs.append(nil)
+                let status = mpv_command_async(handle, requestID, &cargs)
+                for pointer in cargs where pointer != nil {
+                    free(UnsafeMutablePointer(mutating: pointer))
+                }
+                if status < 0 {
+                    pendingAsyncCommandReplies.removeValue(forKey: requestID)?.resume(returning: status)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.pendingAsyncCommandReplies[requestID] != nil,
+                      let handle = self.mpv else { return }
+                mpv_abort_async_command(handle, requestID)
+            }
+        }
+    }
+
+    private func resumePendingAsyncCommandReplies(with status: Int32) {
+        let continuations = Array(pendingAsyncCommandReplies.values)
+        pendingAsyncCommandReplies.removeAll(keepingCapacity: false)
+        for continuation in continuations {
+            continuation.resume(returning: status)
+        }
     }
 
     private func isSafeCompatibilityVisualCommand(_ args: [String]) -> Bool {
@@ -3454,6 +4326,9 @@ public final class MPVGPUPlayerRenderer {
             inFlightGPUFrameCount: nativeDiagnostics?.inFlightGPUFrameCount
                 ?? compatibilityDiagnostics?.inFlightGPUFrameCount
                 ?? 0,
+            pictureInPictureEnqueuedFrameCount: nativeDiagnostics?.enqueuedFrameCount
+                ?? compatibilityDiagnostics?.frameCount
+                ?? 0,
             lastGPULatencyMilliseconds: nativeDiagnostics?.lastGPULatencyMilliseconds
                 ?? compatibilityDiagnostics?.lastGPULatencyMilliseconds
                 ?? 0,
@@ -3464,17 +4339,19 @@ public final class MPVGPUPlayerRenderer {
                 ?? compatibilityDiagnostics?.timelineRate
                 ?? 0,
             audioRecoveryCount: Int(min(audioRecoveryDelta, UInt64(Int.max))),
-            estimatedFramesPerSecond: getDoubleProperty("estimated-vf-fps")
-                ?? getDoubleProperty("container-fps")
-                ?? 0,
-            videoCodec: getStringProperty("video-codec") ?? "",
-            videoWidth: Int(getInt64Property("video-params/w") ?? 0),
-            videoHeight: Int(getInt64Property("video-params/h") ?? 0),
-            videoTransferFunction: getStringProperty("video-params/gamma") ?? "",
-            videoColorPrimaries: getStringProperty("video-params/primaries") ?? "",
-            videoSignalPeak: getDoubleProperty("video-params/sig-peak") ?? 0,
-            videoPixelFormat: getStringProperty("video-params/pixelformat") ?? "",
-            hardwareDecoder: getStringProperty("hwdec-current") ?? ""
+            estimatedFramesPerSecond: cachedEstimatedFramesPerSecond > 0
+                ? cachedEstimatedFramesPerSecond
+                : cachedContainerFramesPerSecond,
+            droppedVideoFrameCount: Int(clamping: cachedDroppedVideoFrameCount),
+            delayedVideoFrameCount: Int(clamping: cachedDelayedVideoFrameCount),
+            videoCodec: cachedVideoCodec,
+            videoWidth: Int(cachedVideoWidth),
+            videoHeight: Int(cachedVideoHeight),
+            videoTransferFunction: cachedVideoTransferFunction,
+            videoColorPrimaries: cachedVideoColorPrimaries,
+            videoSignalPeak: cachedVideoSignalPeak,
+            videoPixelFormat: cachedVideoPixelFormat,
+            hardwareDecoder: cachedHardwareDecoder
         )
     }
 
@@ -3490,10 +4367,35 @@ public final class MPVGPUPlayerRenderer {
         setInlineExtendedDynamicRange(shouldEnableInlineExtendedDynamicRange)
     }
 
+    private static func configureMoltenVKEnvironment(for device: MTLDevice) {
+        // Unmarked MoltenVK 1.4.1 predates the imported-MTLTexture residency fix. The native direct
+        // backend can fall back to that path after capability selection, so every device disables
+        // argument buffers in that configuration. A provenance-marked local rebuild contains the
+        // fix; only Apple-5 GPUs retain their independent workaround there.
+        let shouldDisableArgumentBuffers = MPVMoltenVKDevicePolicy
+            .shouldDisableMetalArgumentBuffers(
+                supportsApple5: device.supportsFamily(.apple5),
+                supportsApple6: device.supportsFamily(.apple6),
+                hasImportedMetalTextureResidencyFix:
+                    mpvkitMoltenVKHasImportedTextureResidencyFix
+            )
+        if shouldDisableArgumentBuffers {
+            // This is a crash-prevention constraint for the bundled runtime, not a tuning default.
+            _ = setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 1)
+        }
+
+        // The bundled libplacebo batches per-pass command submissions into one
+        // vkQueueSubmit2 per flush point when this is set, which removes most of
+        // MoltenVK's per-submit MTLCommandBuffer commit cost from the render
+        // thread. Runtimes without the patch ignore the variable. Deliberately
+        // not `setenv(..., 1)`: a host override wins.
+        _ = setenv("PL_VK_DEFER_SUBMITS", "1", 0)
+    }
+
     private var shouldEnableInlineExtendedDynamicRange: Bool {
         guard options.enablesTargetColorspaceHint else { return false }
-        let transfer = (getStringProperty("video-params/gamma") ?? "").lowercased()
-        return (getDoubleProperty("video-params/sig-peak") ?? 0) > 1
+        let transfer = cachedVideoTransferFunction.lowercased()
+        return cachedVideoSignalPeak > 1
             || transfer.contains("pq")
             || transfer.contains("hlg")
     }
@@ -3523,8 +4425,10 @@ public final class MPVGPUPlayerRenderer {
         #endif
     }
 
-    private func configurePictureInPictureCallbacks() {
-        pictureInPictureRenderer.onError = { [weak self] message in
+    private func configurePictureInPictureCallbacks(
+        for renderer: MPVMetalSampleBufferRenderer
+    ) {
+        renderer.onError = { [weak self] message in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if self.selectedPictureInPictureBackend == .compatibilityDualSession,
@@ -3541,10 +4445,10 @@ public final class MPVGPUPlayerRenderer {
                 }
             }
         }
-        pictureInPictureRenderer.onDiagnostics = { [weak self] _ in
+        renderer.onDiagnostics = { [weak self] _ in
             Task { @MainActor [weak self] in self?.emitDiagnostics() }
         }
-        pictureInPictureRenderer.onStateChange = { [weak self] _ in
+        renderer.onStateChange = { [weak self] _ in
             Task { @MainActor [weak self] in self?.emitDiagnostics() }
         }
     }
@@ -3600,6 +4504,15 @@ public final class MPVGPUPlayerRenderer {
         guard !isStopping else { throw MPVGPUPlayerRendererError.teardownInProgress }
         guard isRunning else { throw MPVGPUPlayerRendererError.rendererNotRunning }
         guard currentURL != nil else { throw MPVGPUPlayerRendererError.mediaNotLoaded }
+        guard activeHardwareDecoderRecoveryTransitionID == nil,
+              activeHardwareDecoderRecoveryEpoch == nil else {
+            throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(
+                "video decoder recovery is changing track ownership"
+            )
+        }
+        guard pendingSingleSessionShutdown == nil else {
+            throw MPVGPUPlayerRendererError.teardownInProgress
+        }
         #if os(iOS)
         guard #available(iOS 15.0, *) else {
             throw MPVGPUPlayerRendererError.pictureInPictureUnavailable("iOS 15 or newer is required")
@@ -3624,12 +4537,15 @@ public final class MPVGPUPlayerRenderer {
         pictureInPicturePreparationStartedAt = CACurrentMediaTime()
         pictureInPicturePreparationLatency = 0
         updatePictureInPictureState(.preparing(generation: generation))
+        // The deadline starts when the host asks to prepare, not after mpv eventually creates its
+        // video output. Waiting for FILE_LOADED / VIDEO_RECONFIG therefore consumes the same
+        // bounded preparation budget as native setup and the first frame.
+        schedulePictureInPicturePreparationTimeout(generation: generation)
 
         // Backend selection is latched for the load. In particular, `.automatic` never probes,
         // fails, and then oscillates back to the native path on a later PiP cycle.
         if selectedPictureInPictureBackend == .compatibilityDualSession {
             try startCompatibilityPreparation(generation: generation, primeCount: legacyPrimeCount)
-            schedulePictureInPicturePreparationTimeout(generation: generation)
             emitDiagnostics()
             return
         }
@@ -3638,7 +4554,6 @@ public final class MPVGPUPlayerRenderer {
            selectedPictureInPictureBackend != .compatibilityDualSession {
             if let sink = singleSessionPictureInPictureSink {
                 startSingleSessionPreparation(sink, generation: generation)
-                schedulePictureInPicturePreparationTimeout(generation: generation)
                 emitDiagnostics()
                 return
             }
@@ -3648,7 +4563,6 @@ public final class MPVGPUPlayerRenderer {
                     ?? "the previously selected single-session backend was retired"
                 didAttemptCompatibilityFailover = true
                 try startCompatibilityPreparation(generation: generation, primeCount: legacyPrimeCount)
-                schedulePictureInPicturePreparationTimeout(generation: generation)
                 emitDiagnostics()
                 return
             }
@@ -3659,41 +4573,93 @@ public final class MPVGPUPlayerRenderer {
 
         switch options.pictureInPictureBackendPreference {
         case .singleSessionGPU:
-            didAttemptSingleSessionBackend = true
-            let nativeSink = makeSingleSessionPictureInPictureSink()
-            guard let nativeSink else {
-                let reason = Self.singleSessionPictureInPictureUnavailableReason
-                failPictureInPicturePreparation(
-                    generation: generation,
-                    error: MPVGPUPlayerRendererError.pictureInPictureUnavailable(reason)
-                )
-                throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(reason)
-            }
-            startSingleSessionPreparation(nativeSink, generation: generation)
+            try requestNativePictureInPictureProbeWhenReady(
+                generation: generation,
+                primeCount: legacyPrimeCount
+            )
         case .automatic:
             guard !didAttemptSingleSessionBackend else {
                 pictureInPictureFallbackReason = pictureInPictureFallbackReason
                     ?? "single-session GPU was already attempted for this load"
                 try startCompatibilityPreparation(generation: generation, primeCount: legacyPrimeCount)
-                schedulePictureInPicturePreparationTimeout(generation: generation)
                 emitDiagnostics()
                 return
             }
-            didAttemptSingleSessionBackend = true
-            let nativeSink = makeSingleSessionPictureInPictureSink()
+            try requestNativePictureInPictureProbeWhenReady(
+                generation: generation,
+                primeCount: legacyPrimeCount
+            )
+        case .compatibilityDualSession:
+            try startCompatibilityPreparation(generation: generation, primeCount: legacyPrimeCount)
+        }
+        emitDiagnostics()
+    }
+
+    private func requestNativePictureInPictureProbeWhenReady(
+        generation: UInt64,
+        primeCount: Int
+    ) throws {
+        guard !didAttemptSingleSessionBackend else {
+            throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(
+                "single-session GPU was already attempted for this load"
+            )
+        }
+        guard let identity = currentPrimaryLoadIdentity else {
+            throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(
+                "there is no current media load"
+            )
+        }
+        pendingNativePictureInPictureProbePrimeCount = min(2, max(1, primeCount))
+        if let readyGeneration = nativePictureInPictureProbeGate.requestProbe(
+            loadSequence: identity.sequence,
+            preparationGeneration: generation
+        ) {
+            try performNativePictureInPictureProbe(generation: readyGeneration)
+        }
+    }
+
+    private func resumeNativePictureInPictureProbeIfReady(_ generation: UInt64?) {
+        guard let generation else { return }
+        do {
+            try performNativePictureInPictureProbe(generation: generation)
+        } catch {
+            failIfPictureInPicturePreparationIsPending(generation: generation, error: error)
+        }
+    }
+
+    private func performNativePictureInPictureProbe(generation: UInt64) throws {
+        guard generation == pictureInPicturePreparationGeneration,
+              case .preparing(let activeGeneration) = pictureInPictureState,
+              activeGeneration == generation,
+              pendingNativePictureInPictureProbePrimeCount != nil else {
+            throw MPVGPUPlayerRendererError.pictureInPicturePreparationSuperseded
+        }
+        let primeCount = pendingNativePictureInPictureProbePrimeCount ?? 2
+        pendingNativePictureInPictureProbePrimeCount = nil
+        didAttemptSingleSessionBackend = true
+
+        let nativeSink = makeSingleSessionPictureInPictureSink()
+        switch options.pictureInPictureBackendPreference {
+        case .singleSessionGPU:
+            guard let nativeSink else {
+                throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(
+                    Self.singleSessionPictureInPictureUnavailableReason
+                )
+            }
+            startSingleSessionPreparation(nativeSink, generation: generation)
+        case .automatic:
             if let nativeSink {
                 startSingleSessionPreparation(nativeSink, generation: generation)
             } else {
                 pictureInPictureFallbackReason = Self.singleSessionPictureInPictureUnavailableReason
                 try startCompatibilityPreparation(
                     generation: generation,
-                    primeCount: legacyPrimeCount
+                    primeCount: primeCount
                 )
             }
         case .compatibilityDualSession:
-            try startCompatibilityPreparation(generation: generation, primeCount: legacyPrimeCount)
+            try startCompatibilityPreparation(generation: generation, primeCount: primeCount)
         }
-        schedulePictureInPicturePreparationTimeout(generation: generation)
         emitDiagnostics()
     }
 
@@ -3704,9 +4670,9 @@ public final class MPVGPUPlayerRenderer {
                 pictureInPictureDisplayLayer,
                 options.maximumInFlightPictureInPictureFrames,
                 options.preferredPiPFramesPerSecond,
-                getDoubleProperty("estimated-vf-fps")
-                    ?? getDoubleProperty("container-fps")
-                    ?? 0
+                cachedEstimatedFramesPerSecond > 0
+                    ? cachedEstimatedFramesPerSecond
+                    : cachedContainerFramesPerSecond
             )
         }
     }
@@ -3790,7 +4756,10 @@ public final class MPVGPUPlayerRenderer {
         }
         selectedPictureInPictureBackend = .compatibilityDualSession
         pictureInPictureRenderer.onFrame = { [weak self] _ in
-            Task { @MainActor [weak self] in
+            // MPVMetalSampleBufferRenderer publishes frames from its main-actor enqueue seam, but
+            // keep the public callback type source-compatible for clients that store an ordinary
+            // closure rather than exposing a new global-actor function type.
+            MainActor.assumeIsolated {
                 self?.handleCompatibilityFrameEnqueued(generation: generation)
             }
         }
@@ -3933,7 +4902,7 @@ public final class MPVGPUPlayerRenderer {
         pendingPictureInPictureBegin = false
         completePictureInPictureTimelineUpdates(through: pictureInPictureTimelineUpdateSequence)
         updatePictureInPictureState(.failed(generation: generation, reason: message))
-        updateState(isPaused ? .paused : .playing)
+        updateState(isBuffering ? .loading : (isPaused ? .paused : .playing))
         reportError(message)
         onPictureInPictureStopRequested?(message)
     }
@@ -3969,6 +4938,14 @@ public final class MPVGPUPlayerRenderer {
         guard generation == pictureInPicturePreparationGeneration,
               case .preparing(let activeGeneration) = pictureInPictureState,
               activeGeneration == generation else { return }
+        let nativeProbeWasWaiting = cancelPendingNativePictureInPictureProbe(
+            generation: generation
+        )
+        if nativeProbeWasWaiting {
+            // The one native attempt for this load has expired even though mpv never exposed a
+            // matching video output on which the capability call could safely run.
+            didAttemptSingleSessionBackend = true
+        }
         if selectedPictureInPictureBackend != .compatibilityDualSession,
            options.pictureInPictureBackendPreference == .automatic {
             pictureInPicturePreparationTimeoutTask?.cancel()
@@ -3979,7 +4956,9 @@ public final class MPVGPUPlayerRenderer {
             singleSessionPictureInPictureSink = nil
             isPictureInPicturePrepared = false
             didAttemptCompatibilityFailover = true
-            pictureInPictureFallbackReason = "single-session GPU preparation timed out"
+            pictureInPictureFallbackReason = nativeProbeWasWaiting
+                ? "single-session GPU video output did not become ready before preparation timed out"
+                : "single-session GPU preparation timed out"
             startCompatibilityAfterSingleSessionRetirement(
                 generation: generation,
                 reportMessage: nil
@@ -4007,6 +4986,7 @@ public final class MPVGPUPlayerRenderer {
         guard generation == pictureInPicturePreparationGeneration,
               case .preparing(let activeGeneration) = pictureInPictureState,
               activeGeneration == generation else { return }
+        cancelPendingNativePictureInPictureProbe(generation: generation)
         pictureInPicturePreparationTimeoutTask?.cancel()
         pictureInPicturePreparationTimeoutTask = nil
         if let started = pictureInPicturePreparationStartedAt {
@@ -4028,6 +5008,7 @@ public final class MPVGPUPlayerRenderer {
     private func failPictureInPicturePreparation(generation: UInt64, error: Error) {
         guard generation == pictureInPicturePreparationGeneration else { return }
         let wasActive = isPictureInPictureActive
+        cancelPendingNativePictureInPictureProbe(generation: generation)
         pictureInPicturePreparationTimeoutTask?.cancel()
         pictureInPicturePreparationTimeoutTask = nil
         if let started = pictureInPicturePreparationStartedAt {
@@ -4052,7 +5033,7 @@ public final class MPVGPUPlayerRenderer {
         waiters.forEach { $0.resume(throwing: error) }
         reportError(reason)
         if wasActive {
-            updateState(isPaused ? .paused : .playing)
+            updateState(isBuffering ? .loading : (isPaused ? .paused : .playing))
             onPictureInPictureStopRequested?(reason)
         }
     }
@@ -4064,6 +5045,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     private func cancelPictureInPicturePreparation(with error: Error) {
+        cancelPendingNativePictureInPictureProbe(generation: pictureInPicturePreparationGeneration)
         pictureInPicturePreparationTimeoutTask?.cancel()
         pictureInPicturePreparationTimeoutTask = nil
         pictureInPicturePreparationStartedAt = nil
@@ -4075,6 +5057,14 @@ public final class MPVGPUPlayerRenderer {
         completePictureInPictureTimelineUpdates(
             through: pictureInPictureTimelineUpdateSequence
         )
+    }
+
+    @discardableResult
+    private func cancelPendingNativePictureInPictureProbe(generation: UInt64) -> Bool {
+        nativePictureInPictureProbeGate.cancelPreparation(generation: generation)
+        guard pendingNativePictureInPictureProbePrimeCount != nil else { return false }
+        pendingNativePictureInPictureProbePrimeCount = nil
+        return true
     }
 
     private func markPictureInPictureTimelineUpdate(requiresFrame: Bool) {
@@ -4196,7 +5186,10 @@ public final class MPVGPUPlayerRenderer {
         }
         isPictureInPictureActive = true
         updatePictureInPictureState(.active(generation: generation))
-        updateState(.pictureInPicture)
+        // Preserve a cache stall that was already active when the sink handoff completed. The
+        // authoritative PiP timeline is rate zero in this state, and publishing `.pictureInPicture`
+        // would make clients tell AVKit that the frozen timeline is playing.
+        updateState(isBuffering ? .loading : .pictureInPicture)
         emitDiagnostics()
     }
 
@@ -4419,36 +5412,42 @@ public final class MPVGPUPlayerRenderer {
             : fallback
         let device = MTLCreateSystemDefaultDevice()
         let textureLimit = Self.maximumTextureDimension2D(for: device)
-        var width = min(requested.width, maximum.width, textureLimit)
-        var height = min(requested.height, maximum.height, textureLimit)
         let pixelLimit: Double
         #if os(macOS)
         pixelLimit = 14_745_600
         #else
         pixelLimit = 8_294_400
         #endif
-        let pixels = Double(width) * Double(height)
-        if pixels > pixelLimit {
-            let scale = sqrt(pixelLimit / pixels)
-            width *= scale
-            height *= scale
-        }
-        return CGSize(width: max(2, floor(width)), height: max(2, floor(height)))
+        return MPVPictureInPictureRenderSizePolicy.resolved(
+            requested: requested,
+            maximum: maximum,
+            fallback: fallback,
+            textureDimensionLimit: textureLimit,
+            pixelLimit: pixelLimit
+        )
+    }
+
+    private var compatibilityRendererOptions: MPVMetalSampleBufferRendererOptions {
+        let softwareFallbackValue = options.additionalMPVOptions["hwdec-software-fallback"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let allowsSoftwareDecoderFallback = !["no", "false", "0"]
+            .contains(softwareFallbackValue ?? "yes")
+        return MPVMetalSampleBufferRendererOptions(
+            maximumFrameSize: resolvedPictureInPictureRenderSize,
+            preferredFramesPerSecond: options.preferredPiPFramesPerSecond,
+            preferredPiPFramesPerSecond: options.preferredPiPFramesPerSecond,
+            createsMetalCompatibilityProbe: false,
+            prefersMetalPresentation: false,
+            prefersHDRPresentation: false,
+            prefersHighBitDepthRendering: false,
+            allowsSoftwareDecoderFallback: allowsSoftwareDecoderFallback,
+            maximumInFlightFrameCount: options.maximumInFlightPictureInPictureFrames
+        )
     }
 
     private func updateCompatibilityRendererOptions() {
-        pictureInPictureRenderer.updateOptions(
-            MPVMetalSampleBufferRendererOptions(
-                maximumFrameSize: resolvedPictureInPictureRenderSize,
-                preferredFramesPerSecond: options.preferredPiPFramesPerSecond,
-                preferredPiPFramesPerSecond: options.preferredPiPFramesPerSecond,
-                createsMetalCompatibilityProbe: false,
-                prefersMetalPresentation: false,
-                prefersHDRPresentation: false,
-                prefersHighBitDepthRendering: false,
-                maximumInFlightFrameCount: options.maximumInFlightPictureInPictureFrames
-            )
-        )
+        pictureInPictureRendererStorage?.updateOptions(compatibilityRendererOptions)
     }
 
     private var resolvedMaximumInlineDrawablePixelCount: Int {
@@ -4519,17 +5518,39 @@ public final class MPVGPUPlayerRenderer {
         emitDiagnostics()
     }
 
+    private func applyPendingPictureInPictureRenderSize() {
+        pictureInPictureResizeWorkItem = nil
+        guard let size = pendingPictureInPictureRenderSize else { return }
+        pendingPictureInPictureRenderSize = nil
+        guard MPVPictureInPictureRenderSizePolicy.shouldReplacePool(
+            current: pictureInPictureRenderSize,
+            proposed: size
+        ) else { return }
+        pictureInPictureRenderSize = size
+        pictureInPictureResizeApplicationCount += 1
+        markPictureInPictureTimelineUpdate(requiresFrame: true)
+        updateCompatibilityRendererOptions()
+        singleSessionPictureInPictureSink?.updateRenderSize(size)
+        emitDiagnostics()
+    }
+
     private var backendDescription: String {
+        let presentation: String
         switch selectedPictureInPictureBackend {
         case .singleSessionGPUDirectIOSurface:
-            return "single-session gpu-next PiP rendering directly into IOSurface buffers"
+            presentation = "single-session gpu-next PiP rendering directly into IOSurface buffers"
         case .singleSessionGPUAsynchronousMetalBlit:
-            return "single-session gpu-next PiP with an asynchronous Metal IOSurface blit"
+            presentation = "single-session gpu-next PiP with an asynchronous Metal IOSurface blit"
         case .compatibilityDualSession:
-            return "video-only MPVMetalSampleBufferRenderer compatibility bridge; primary mpv owns audio and clock"
+            presentation = "video-only MPVMetalSampleBufferRenderer compatibility bridge; primary mpv owns audio and clock"
         case nil:
-            return "mpv gpu-next renderer backed by MoltenVK CAMetalLayer"
+            presentation = "mpv gpu-next renderer backed by MoltenVK CAMetalLayer"
         }
+        let argumentBuffers = getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS")
+            .map { String(cString: $0) } ?? "default"
+        let liveResourceCheck = getenv("MVK_CONFIG_LIVE_CHECK_ALL_RESOURCES")
+            .map { String(cString: $0) } ?? "default"
+        return "\(presentation); MVK argumentBuffers=\(argumentBuffers) liveResourceCheck=\(liveResourceCheck)"
     }
 
     private func finishStopIfPossible() {
@@ -4544,6 +5565,7 @@ public final class MPVGPUPlayerRenderer {
         currentHeaders = nil
         cachedPosition = 0
         cachedDuration = 0
+        resetCachedVideoProperties()
         _ = compatibilityVideoSelection.beginLoad()
         selectedPictureInPictureBackend = nil
         pictureInPictureFallbackReason = nil
@@ -4558,6 +5580,51 @@ public final class MPVGPUPlayerRenderer {
         waiters.forEach { $0.resume() }
     }
 
+    private func resetCachedVideoProperties() {
+        videoColorMetadataRefreshWorkItem?.cancel()
+        videoColorMetadataRefreshWorkItem = nil
+        cachedEstimatedFramesPerSecond = 0
+        cachedContainerFramesPerSecond = 0
+        cachedDroppedVideoFrameCount = 0
+        cachedDelayedVideoFrameCount = 0
+        cachedVideoCodec = ""
+        cachedVideoWidth = 0
+        cachedVideoHeight = 0
+        cachedVideoTransferFunction = ""
+        cachedVideoColorPrimaries = ""
+        cachedVideoSignalPeak = 0
+        cachedVideoPixelFormat = ""
+        cachedHardwareDecoder = ""
+    }
+
+    /// Resolve the independent color properties as one snapshot at rare file/reconfigure
+    /// boundaries. This keeps the first HDR decision coherent without restoring per-frame gets.
+    private func refreshCachedVideoColorMetadataCoherently() {
+        videoColorMetadataRefreshWorkItem?.cancel()
+        videoColorMetadataRefreshWorkItem = nil
+        cachedVideoTransferFunction = getStringProperty("video-params/gamma") ?? ""
+        cachedVideoColorPrimaries = getStringProperty("video-params/primaries") ?? ""
+        cachedVideoSignalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
+        setInlineExtendedDynamicRange(shouldEnableInlineExtendedDynamicRange)
+    }
+
+    private func scheduleCachedVideoColorMetadataRefresh(generation: UInt64) {
+        videoColorMetadataRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self,
+                      !self.isStopping,
+                      self.currentPrimaryLoadIdentity?.clientGeneration == generation else { return }
+                self.videoColorMetadataRefreshWorkItem = nil
+                self.setInlineExtendedDynamicRange(self.shouldEnableInlineExtendedDynamicRange)
+                self.emitDiagnostics()
+                self.notifyVideoReconfigure(generation: generation)
+            }
+        }
+        videoColorMetadataRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(10), execute: workItem)
+    }
+
     private func layerWindowID() -> Int64 {
         Int64(Int(bitPattern: Unmanaged.passUnretained(inlineLayer).toOpaque()))
     }
@@ -4570,13 +5637,22 @@ public final class MPVGPUPlayerRenderer {
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("seeking", MPV_FORMAT_FLAG),
             ("speed", MPV_FORMAT_DOUBLE),
+            ("estimated-vf-fps", MPV_FORMAT_DOUBLE),
+            ("frame-drop-count", MPV_FORMAT_INT64),
+            ("vo-delayed-frame-count", MPV_FORMAT_INT64),
+            ("container-fps", MPV_FORMAT_DOUBLE),
             ("track-list", MPV_FORMAT_NONE),
-            ("vid", MPV_FORMAT_NONE),
+            ("vid", MPV_FORMAT_STRING),
             ("sid", MPV_FORMAT_NONE),
             ("aid", MPV_FORMAT_NONE),
-            ("video-params/gamma", MPV_FORMAT_NONE),
-            ("video-params/primaries", MPV_FORMAT_NONE),
-            ("video-params/sig-peak", MPV_FORMAT_NONE)
+            ("video-codec", MPV_FORMAT_STRING),
+            ("video-params/w", MPV_FORMAT_INT64),
+            ("video-params/h", MPV_FORMAT_INT64),
+            ("video-params/gamma", MPV_FORMAT_STRING),
+            ("video-params/primaries", MPV_FORMAT_STRING),
+            ("video-params/sig-peak", MPV_FORMAT_DOUBLE),
+            ("video-params/pixelformat", MPV_FORMAT_STRING),
+            ("hwdec-current", MPV_FORMAT_STRING)
         ]
         for (name, format) in properties {
             _ = name.withCString { mpv_observe_property(handle, 0, $0, format) }
@@ -4593,20 +5669,45 @@ public final class MPVGPUPlayerRenderer {
             updateState(.loading)
         case .fileLoaded(let playlistEntryID):
             guard let identity = currentLoadIdentity(for: playlistEntryID) else { return }
+            let pendingNativeProbeGeneration = nativePictureInPictureProbeGate.markFileLoaded(
+                loadSequence: identity.sequence
+            )
             isAwaitingPrimaryFileLoaded = false
+            refreshCachedVideoColorMetadataCoherently()
+            setFlagProperty("pause", isPaused)
+            if let pendingSeekAfterPrimaryLoadSubmission {
+                self.pendingSeekAfterPrimaryLoadSubmission = nil
+                _ = command(["seek", "\(pendingSeekAfterPrimaryLoadSubmission)", "absolute+exact"])
+            }
             applyDeferredPrimaryLoadActions(identity: identity)
-            updateState(isPaused ? .paused : .playing)
+            updateState(isBuffering ? .loading : (isPaused ? .paused : .playing))
             emitDiagnostics()
             notifyVideoReconfigure(generation: identity.clientGeneration)
+            resumeNativePictureInPictureProbeIfReady(pendingNativeProbeGeneration)
         case .videoReconfigure(let playlistEntryID):
             guard let identity = currentLoadIdentity(for: playlistEntryID) else { return }
+            let pendingNativeProbeGeneration = nativePictureInPictureProbeGate
+                .markVideoReconfigured(loadSequence: identity.sequence)
+            refreshCachedVideoColorMetadataCoherently()
             notifyVideoReconfigure(generation: identity.clientGeneration)
+            onVideoOutputReconfigureForGeneration?(identity.clientGeneration)
+            if let epoch = activeHardwareDecoderRecoveryEpoch,
+               activeHardwareDecoderRecoveryGeneration == identity.clientGeneration {
+                let provedVideoToolbox = hardwareDecoderRecoveryProof.observeVideoReconfiguration()
+                if case .decoder(let decoder)? = hardwareDecoderRecoveryProof.completedDecoderObservation {
+                    onHardwareDecoderRecoveryObservation?(identity.clientGeneration, epoch, decoder)
+                }
+                if provedVideoToolbox {
+                    onHardwareDecoderRecoveryOutput?(identity.clientGeneration, epoch)
+                }
+            }
+            resumeNativePictureInPictureProbeIfReady(pendingNativeProbeGeneration)
         case .endFile(let playlistEntryID, let error):
             let identity = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
             if let error, let identity, loadIdentityTracker.isLatest(identity) {
                 onError?("playback ended with error: \(error)")
             }
-        case .propertyChange(let name, let playlistEntryID):
+        case .propertyChange(let name, let value, let playlistEntryID):
             let generation: UInt64
             if let playlistEntryID {
                 guard let identity = currentLoadIdentity(for: playlistEntryID) else { return }
@@ -4619,7 +5720,7 @@ public final class MPVGPUPlayerRenderer {
                 ) else { return }
                 generation = loadIdentityTracker.latestIdentity?.clientGeneration ?? 0
             }
-            refreshProperty(named: name, generation: generation)
+            refreshProperty(named: name, value: value, generation: generation)
         case .logError(let message, let playlistEntryID):
             if let playlistEntryID {
                 guard currentLoadIdentity(for: playlistEntryID) != nil else { return }
@@ -4627,6 +5728,8 @@ public final class MPVGPUPlayerRenderer {
                 return
             }
             onError?(message)
+        case .commandReply(let requestID, let error):
+            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.resume(returning: error)
         case .shutdown:
             stop()
         }
@@ -4640,26 +5743,38 @@ public final class MPVGPUPlayerRenderer {
         return identity
     }
 
-    private func refreshProperty(named name: String, generation: UInt64) {
+    private func refreshProperty(
+        named name: String,
+        value: MPVGPUObservedPropertyValue,
+        generation: UInt64
+    ) {
         switch name {
         case "duration":
-            cachedDuration = getDoubleProperty("duration") ?? cachedDuration
+            if case .double(let duration) = value {
+                cachedDuration = duration
+            }
         case "time-pos":
-            cachedPosition = getDoubleProperty("time-pos") ?? cachedPosition
+            if case .double(let position) = value {
+                cachedPosition = position
+            }
             updateSingleSessionTimeline(discontinuity: false)
         case "pause":
-            isPaused = getFlagProperty("pause")
+            if case .flag(let paused) = value {
+                isPaused = paused
+            }
             updateSingleSessionTimeline(discontinuity: false)
             if selectedPictureInPictureBackend == .compatibilityDualSession,
                isPictureInPicturePrepared || isPictureInPictureActive {
                 synchronizeCompatibilityPlaybackState(shouldRealign: false)
             }
             if !isPictureInPictureActive, !isAwaitingPrimaryFileLoaded {
-                updateState(isPaused ? .paused : .playing)
+                updateState(isBuffering ? .loading : (isPaused ? .paused : .playing))
             }
         case "paused-for-cache":
             let wasBuffering = isBuffering
-            isBuffering = getFlagProperty("paused-for-cache")
+            if case .flag(let buffering) = value {
+                isBuffering = buffering
+            }
             updateSingleSessionTimeline(discontinuity: false)
             if selectedPictureInPictureBackend == .compatibilityDualSession,
                isPictureInPicturePrepared || isPictureInPictureActive {
@@ -4669,32 +5784,135 @@ public final class MPVGPUPlayerRenderer {
             }
             if isBuffering {
                 updateState(.loading)
+            } else if isPictureInPictureActive {
+                // Buffering temporarily drives the authoritative PiP timeline rate to zero. Once
+                // cache pause clears, publish the active state again so the bridge/AVKit no longer
+                // reports a sticky loading pause while frames have resumed.
+                updateState(.pictureInPicture)
             } else if !isPictureInPictureActive, !isAwaitingPrimaryFileLoaded {
                 updateState(isPaused ? .paused : .playing)
             }
         case "speed":
+            if case .double(let speed) = value, speed.isFinite {
+                cachedSpeed = speed
+            }
             if selectedPictureInPictureBackend == .compatibilityDualSession,
                isPictureInPicturePrepared || isPictureInPictureActive {
-                pictureInPictureRenderer.setSpeed(getSpeed())
+                pictureInPictureRenderer.setSpeed(cachedSpeed)
             }
             updateSingleSessionTimeline(discontinuity: false)
         case "seeking":
-            if !getFlagProperty("seeking"),
+            if case .flag(false) = value,
                selectedPictureInPictureBackend == .compatibilityDualSession,
                isPictureInPicturePrepared || isPictureInPictureActive,
                abs(pictureInPictureRenderer.currentTime - cachedPosition) > 0.25 {
                 pictureInPictureRenderer.seek(to: cachedPosition)
             }
         case "vid":
-            compatibilityVideoSelection.observePrimarySelection(getStringProperty("vid"))
+            if case .string(let selection) = value {
+                compatibilityVideoSelection.observePrimarySelection(selection)
+            } else if case .unavailable = value {
+                compatibilityVideoSelection.observePrimarySelection(nil)
+            }
             emitDiagnostics()
         case "track-list", "sid", "aid":
             emitDiagnostics()
-        case "video-params/gamma", "video-params/primaries", "video-params/sig-peak":
-            // Colorspace/HDR characteristics resolved or changed — let the host re-evaluate HDR.
-            setInlineExtendedDynamicRange(shouldEnableInlineExtendedDynamicRange)
+        case "estimated-vf-fps":
+            if case .double(let fps) = value {
+                cachedEstimatedFramesPerSecond = fps
+            } else if case .unavailable = value {
+                cachedEstimatedFramesPerSecond = 0
+            }
+        case "frame-drop-count":
+            if case .int64(let count) = value {
+                cachedDroppedVideoFrameCount = count
+            } else if case .unavailable = value {
+                cachedDroppedVideoFrameCount = 0
+            }
+        case "vo-delayed-frame-count":
+            if case .int64(let count) = value {
+                cachedDelayedVideoFrameCount = count
+            } else if case .unavailable = value {
+                cachedDelayedVideoFrameCount = 0
+            }
+        case "container-fps":
+            if case .double(let fps) = value {
+                cachedContainerFramesPerSecond = fps
+            } else if case .unavailable = value {
+                cachedContainerFramesPerSecond = 0
+            }
+        case "video-codec":
+            if case .string(let codec) = value {
+                cachedVideoCodec = codec
+            } else if case .unavailable = value {
+                cachedVideoCodec = ""
+            }
+        case "video-params/w":
+            if case .int64(let width) = value {
+                cachedVideoWidth = width
+            } else if case .unavailable = value {
+                cachedVideoWidth = 0
+            }
+        case "video-params/h":
+            if case .int64(let height) = value {
+                cachedVideoHeight = height
+            } else if case .unavailable = value {
+                cachedVideoHeight = 0
+            }
+        case "video-params/pixelformat":
+            if case .string(let pixelFormat) = value {
+                cachedVideoPixelFormat = pixelFormat
+            } else if case .unavailable = value {
+                cachedVideoPixelFormat = ""
+            }
+        case "hwdec-current":
+            // `hwdec-current` becomes a VideoToolbox value only after decoded output is available,
+            // making this the foreground-recovery proof rather than a configuration guess.
+            if case .string(let decoder) = value {
+                cachedHardwareDecoder = decoder
+            } else if case .unavailable = value {
+                cachedHardwareDecoder = ""
+            }
             emitDiagnostics()
-            notifyVideoReconfigure(generation: generation)
+            if let epoch = activeHardwareDecoderRecoveryEpoch,
+               activeHardwareDecoderRecoveryGeneration == generation {
+                let provedVideoToolbox = hardwareDecoderRecoveryProof.observeHardwareDecoder(
+                    cachedHardwareDecoder
+                )
+                if case .decoder(let decoder)? = hardwareDecoderRecoveryProof.completedDecoderObservation {
+                    onHardwareDecoderRecoveryObservation?(generation, epoch, decoder)
+                }
+                if provedVideoToolbox {
+                    onHardwareDecoderRecoveryOutput?(generation, epoch)
+                }
+            }
+        case "video-params/gamma", "video-params/primaries", "video-params/sig-peak":
+            var didChange = false
+            switch (name, value) {
+            case ("video-params/gamma", .string(let transfer)):
+                didChange = cachedVideoTransferFunction != transfer
+                cachedVideoTransferFunction = transfer
+            case ("video-params/primaries", .string(let primaries)):
+                didChange = cachedVideoColorPrimaries != primaries
+                cachedVideoColorPrimaries = primaries
+            case ("video-params/sig-peak", .double(let signalPeak)):
+                didChange = cachedVideoSignalPeak != signalPeak
+                cachedVideoSignalPeak = signalPeak
+            case ("video-params/gamma", .unavailable):
+                didChange = !cachedVideoTransferFunction.isEmpty
+                cachedVideoTransferFunction = ""
+            case ("video-params/primaries", .unavailable):
+                didChange = !cachedVideoColorPrimaries.isEmpty
+                cachedVideoColorPrimaries = ""
+            case ("video-params/sig-peak", .unavailable):
+                didChange = cachedVideoSignalPeak != 0
+                cachedVideoSignalPeak = 0
+            default:
+                break
+            }
+            if didChange {
+                scheduleCachedVideoColorMetadataRefresh(generation: generation)
+            }
         default:
             break
         }
@@ -4705,7 +5923,10 @@ public final class MPVGPUPlayerRenderer {
         currentPrimaryLoadIdentity = nil
         hasSubmittedCurrentPrimaryLoad = false
         isAwaitingPrimaryFileLoaded = false
+        nativePictureInPictureProbeGate.reset()
+        pendingNativePictureInPictureProbePrimeCount = nil
         deferredPrimaryLoadActions.cancel()
+        pendingSeekAfterPrimaryLoadSubmission = nil
     }
 
     private func notifyVideoReconfigure(generation: UInt64) {
@@ -4830,20 +6051,6 @@ public final class MPVGPUPlayerRenderer {
         _ = name.withCString { mpv_set_property(handle, $0, MPV_FORMAT_FLAG, &data) }
     }
 
-    private func getFlagProperty(_ name: String) -> Bool {
-        guard let handle = mpv else { return false }
-        var data: Int32 = 0
-        _ = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_FLAG, &data) }
-        return data != 0
-    }
-
-    private func getDoubleProperty(_ name: String) -> Double? {
-        guard let handle = mpv else { return nil }
-        var data = Double()
-        let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_DOUBLE, &data) }
-        return status >= 0 ? data : nil
-    }
-
     private func getInt64Property(_ name: String) -> Int64? {
         guard let handle = mpv else { return nil }
         var data = Int64()
@@ -4867,6 +6074,15 @@ public final class MPVGPUPlayerRenderer {
         guard let raw = name.withCString({ mpv_get_property_string(handle, $0) }) else { return nil }
         defer { mpv_free(raw) }
         return String(cString: raw)
+    }
+
+    private func getDoubleProperty(_ name: String) -> Double? {
+        guard let handle = mpv else { return nil }
+        var value = Double()
+        let status = name.withCString {
+            mpv_get_property(handle, $0, MPV_FORMAT_DOUBLE, &value)
+        }
+        return status >= 0 ? value : nil
     }
 
     private func mpvColorString(_ color: CGColor) -> String {
@@ -4929,6 +6145,9 @@ public final class MPVGPUPlayerRenderer {
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
     public var onVideoReconfigure: (() -> Void)?
     public var onVideoReconfigureForGeneration: ((UInt64) -> Void)?
+    public var onVideoOutputReconfigureForGeneration: ((UInt64) -> Void)?
+    public var onHardwareDecoderRecoveryOutput: ((_ generation: UInt64, _ epoch: UInt64) -> Void)?
+    public var onHardwareDecoderRecoveryObservation: ((_ generation: UInt64, _ epoch: UInt64, _ decoder: String?) -> Void)?
 
     public convenience init(options: MPVGPUPlayerRendererOptions = MPVGPUPlayerRendererOptions()) {
         self.init(
@@ -4968,6 +6187,23 @@ public final class MPVGPUPlayerRenderer {
     public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat? = nil) { _ = bounds; _ = contentsScale }
     public func updatePictureInPictureRenderSize(_ size: CGSize) { _ = size }
     public func updateOptions(_ newOptions: MPVGPUPlayerRendererOptions) { _ = newOptions }
+    public func refreshCurrentHardwareDecoder() -> String { "" }
+    public func validateForegroundVideoAfterSystemResume(
+        timeout: TimeInterval = 0.75
+    ) async -> MPVGPUPlayerForegroundVideoValidation {
+        _ = timeout
+        return .unavailable
+    }
+    @discardableResult
+    public func recreateHardwareDecoderAfterSystemResume(
+        strategy: MPVGPUPlayerHardwareDecoderRecoveryStrategy = .configuredOrder
+    ) async -> MPVGPUPlayerHardwareDecoderRecoverySubmission {
+        _ = strategy
+        return .unavailable
+    }
+    @discardableResult
+    public func finishHardwareDecoderRecoveryAttempt(epoch: UInt64) -> Bool { _ = epoch; return false }
+    public func yieldHardwareDecoderRecoveryToPictureInPicture() {}
     public func start() throws { throw MPVMetalSampleBufferRendererError.unsupportedPlatform }
     public func stop() {}
     public func waitUntilStopped() async {}
@@ -5052,11 +6288,14 @@ public final class MPVGPUPlayerRenderer {
             poolExhaustionDropCount: 0,
             staleGenerationDropCount: 0,
             inFlightGPUFrameCount: 0,
+            pictureInPictureEnqueuedFrameCount: 0,
             lastGPULatencyMilliseconds: 0,
             timelineEpoch: 0,
             timelineRate: 0,
             audioRecoveryCount: 0,
             estimatedFramesPerSecond: 0,
+            droppedVideoFrameCount: 0,
+            delayedVideoFrameCount: 0,
             videoCodec: "",
             videoWidth: 0,
             videoHeight: 0,
