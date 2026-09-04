@@ -36,6 +36,20 @@ done < <(find "$patch_directory" -maxdepth 1 -type f -name '*.patch' -print | LC
 
 git -C "$worktree" diff --check
 
+grep -Fq 'static bool audio_frame_matches_ao' "$worktree/audio/out/buffer.c"
+grep -Fq 'mp_aframe_get_format(frame) != ao->format' "$worktree/audio/out/buffer.c"
+grep -Fq 'mp_aframe_get_rate(frame) != ao->samplerate' "$worktree/audio/out/buffer.c"
+grep -Fq 'mp_aframe_get_planes(frame) != ao->num_planes' "$worktree/audio/out/buffer.c"
+grep -Fq 'mp_aframe_get_sstride(frame) != (size_t)ao->sstride' \
+    "$worktree/audio/out/buffer.c"
+grep -Fq '!mp_aframe_get_chmap(frame, &channels)' "$worktree/audio/out/buffer.c"
+grep -Fq '!mp_chmap_equals(&channels, &ao->channels)' "$worktree/audio/out/buffer.c"
+grep -Fq 'if (!data[n])' "$worktree/audio/out/buffer.c"
+grep -Fq 'if (!audio_frame_matches_ao(ao, p->pending, fdata)) {' \
+    "$worktree/audio/out/buffer.c"
+grep -Fq 'TA_FREEP(&p->pending);' "$worktree/audio/out/buffer.c"
+grep -Fq 'ao_request_reload(ao);' "$worktree/audio/out/buffer.c"
+
 # `git apply` accepts extra added lines after an under-counted new-file hunk as trailing
 # patch text. Guard the two generated Objective-C translation units explicitly so a malformed
 # hunk cannot silently truncate their final cleanup/initializer lines again.

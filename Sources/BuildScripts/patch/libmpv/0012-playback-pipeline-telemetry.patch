@@ -1,0 +1,342 @@
+diff --git a/demux/demux.c b/demux/demux.c
+index d1accba..a37c7a5 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -395,6 +395,9 @@ struct demux_stream {
+     bool attached_picture_added;
+     bool need_wakeup;       // call wakeup_cb on next reader_head state change
+     double force_read_until;// eager=false streams (subs): force read-ahead
++    double diagnostic_last_packet_pts;
++    double diagnostic_last_packet_dts;
++    int64_t diagnostic_wait_started_ns;
+ 
+     // For demux_internal.dumper. Currently, this is used only temporarily
+     // during blocking dumping.
+@@ -816,6 +819,9 @@ static void ds_clear_reader_state(struct demux_stream *ds,
+     ds->last_ret_pos = -1;
+     ds->last_ret_dts = MP_NOPTS_VALUE;
+     ds->force_read_until = MP_NOPTS_VALUE;
++    ds->diagnostic_last_packet_pts = MP_NOPTS_VALUE;
++    ds->diagnostic_last_packet_dts = MP_NOPTS_VALUE;
++    ds->diagnostic_wait_started_ns = 0;
+ 
+     if (clear_back_state) {
+         ds->back_restart_pos = -1;
+@@ -2698,6 +2704,8 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
+             if (!lazy_stream_needs_wait(ds))
+                 ds->eof = eof = true;
+         }
++        if (!eof && ds->eager && !ds->diagnostic_wait_started_ns)
++            ds->diagnostic_wait_started_ns = mp_time_ns();
+         return eof ? -1 : 0;
+     }
+ 
+@@ -2706,6 +2714,9 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
+     pkt = read_packet_from_cache(in, pkt);
+     if (!pkt)
+         return 0;
++    int64_t diagnostic_wait_ns = ds->diagnostic_wait_started_ns > 0
++        ? mp_time_ns() - ds->diagnostic_wait_started_ns : 0;
++    ds->diagnostic_wait_started_ns = 0;
+ 
+     if (in->back_demuxing) {
+         if (pkt->keyframe) {
+@@ -2752,6 +2763,40 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
+     pkt->pts = MP_ADD_PTS(pkt->pts, in->ts_offset);
+     pkt->dts = MP_ADD_PTS(pkt->dts, in->ts_offset);
+ 
++    if (diagnostic_wait_ns >= MP_TIME_MS_TO_NS(250) &&
++        !in->seeking && !in->back_demuxing && !ds->refreshing)
++    {
++        MP_WARN(in, "[MPVKitDemuxWait] stream=%s index=%d waitMs=%.2f "
++                "pts=%.3f dts=%.3f durationMs=%.2f bytes=%zu keyframe=%d\n",
++                stream_type_name(ds->type), ds->index,
++                MP_TIME_NS_TO_MS(diagnostic_wait_ns), pkt->pts, pkt->dts,
++                pkt->duration * 1000.0, pkt->len, pkt->keyframe);
++    }
++
++    if ((ds->type == STREAM_VIDEO || ds->type == STREAM_AUDIO) &&
++        !in->seeking && !in->back_demuxing && !ds->refreshing)
++    {
++        double pts_gap = pkt->pts != MP_NOPTS_VALUE &&
++                         ds->diagnostic_last_packet_pts != MP_NOPTS_VALUE
++                       ? pkt->pts - ds->diagnostic_last_packet_pts
++                       : 0;
++        double dts_gap = pkt->dts != MP_NOPTS_VALUE &&
++                         ds->diagnostic_last_packet_dts != MP_NOPTS_VALUE
++                       ? pkt->dts - ds->diagnostic_last_packet_dts
++                       : 0;
++        if (pts_gap >= 0.250 || dts_gap >= 0.250) {
++            MP_WARN(in, "[MPVKitPacketGap] stream=%s index=%d pts=%.3f "
++                    "dts=%.3f ptsGapMs=%.2f dtsGapMs=%.2f durationMs=%.2f "
++                    "bytes=%zu keyframe=%d segmented=%d\n",
++                    stream_type_name(ds->type), ds->index, pkt->pts, pkt->dts,
++                    pts_gap * 1000.0, dts_gap * 1000.0,
++                    pkt->duration * 1000.0, pkt->len, pkt->keyframe,
++                    pkt->segmented);
++        }
++        ds->diagnostic_last_packet_pts = pkt->pts;
++        ds->diagnostic_last_packet_dts = pkt->dts;
++    }
++
+     if (pkt->segmented) {
+         pkt->start = MP_ADD_PTS(pkt->start, in->ts_offset);
+         pkt->end = MP_ADD_PTS(pkt->end, in->ts_offset);
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..18839cd 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -1224,7 +1224,8 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
+         av_packet_free(&pkt);
+         if (r == AVERROR_EOF)
+             return false;
+-        MP_WARN(demux, "error reading packet: %s.\n", av_err2str(r));
++        MP_WARN(demux, "[MPVKitDemuxReadError] code=%d retry=%d message=%s\n",
++                r, priv->retry_counter, av_err2str(r));
+         if (priv->retry_counter >= 10) {
+             MP_ERR(demux, "...treating it as fatal error.\n");
+             return false;
+diff --git a/player/audio.c b/player/audio.c
+index b3e975d..829141f 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -732,6 +732,26 @@ static void ao_process(struct mp_filter *f)
+ 
+         mpctx->shown_aframes += samples;
+         double real_samplerate = mp_aframe_get_rate(af) / mpctx->audio_speed;
++        double frame_pts = mp_aframe_get_pts(af);
++        if (frame_pts != MP_NOPTS_VALUE &&
++            ao_c->last_out_pts != MP_NOPTS_VALUE &&
++            fabs(frame_pts - ao_c->last_out_pts) >= 0.250)
++        {
++            MP_WARN(mpctx, "[MPVKitDecodedAudioGap] prevEndPTS=%.3f pts=%.3f "
++                    "gapMs=%.2f samples=%d sampleRate=%d frameDurationMs=%.2f "
++                    "videoPTS=%.3f avsync=%.3f delayMs=%.2f speed=%.3f "
++                    "videoStatus=%s audioStatus=%s paused=%d cachePaused=%d "
++                    "queueFrames=%d\n",
++                    ao_c->last_out_pts, frame_pts,
++                    (frame_pts - ao_c->last_out_pts) * 1000.0,
++                    samples, mp_aframe_get_rate(af),
++                    samples / real_samplerate * 1000.0, mpctx->video_pts,
++                    mpctx->last_av_difference, mpctx->delay * 1000.0,
++                    mpctx->audio_speed, mp_status_str(mpctx->video_status),
++                    mp_status_str(mpctx->audio_status), mpctx->paused,
++                    mpctx->paused_for_cache,
++                    mp_async_queue_get_frames(ao_c->ao_queue));
++        }
+         if (mpctx->video_status != STATUS_EOF)
+             mpctx->delay += samples / real_samplerate;
+         ao_c->last_out_pts = mp_aframe_end_pts(af);
+@@ -945,7 +965,18 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+             ao_reset(ao_c->ao);
+         } else {
+             if (!ao_c->ao_underrun) {
+-                MP_WARN(mpctx, "Audio device underrun detected.\n");
++                MP_WARN(mpctx, "[MPVKitAudioUnderrun] audioPTS=%.3f "
++                        "videoPTS=%.3f avsync=%.3f aoDelayMs=%.2f "
++                        "queueFrames=%d speed=%.3f videoStatus=%s "
++                        "audioStatus=%s paused=%d cachePaused=%d\n",
++                        playing_audio_pts(mpctx), mpctx->video_pts,
++                        mpctx->last_av_difference,
++                        ao_get_delay(ao_c->ao) * 1000.0,
++                        mp_async_queue_get_frames(ao_c->ao_queue),
++                        mpctx->audio_speed,
++                        mp_status_str(mpctx->video_status),
++                        mp_status_str(mpctx->audio_status), mpctx->paused,
++                        mpctx->paused_for_cache);
+                 ao_c->ao_underrun = true;
+                 mp_wakeup_core(mpctx);
+                 ao_c->underrun = true;
+diff --git a/player/video.c b/player/video.c
+index 0e1ac29..5350a1d 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -380,10 +380,39 @@ static void handle_new_frame(struct MPContext *mpctx)
+         frame_time = pts - mpctx->video_pts;
+         double tolerance = mpctx->demuxer->ts_resets_possible &&
+                            !is_sparse ? 5 : 1e4;
++        if (frame_time >= 0.250 && frame_time < tolerance) {
++            struct mp_decoder_wrapper *decoder =
++                mpctx->vo_chain && mpctx->vo_chain->track
++                ? mpctx->vo_chain->track->dec : NULL;
++            int64_t decoder_drops = decoder
++                ? mp_decoder_wrapper_get_frames_dropped(decoder) : 0;
++            double audio_pts = playing_audio_pts(mpctx);
++            MP_WARN(mpctx, "[MPVKitDecodedVideoGap] prevPTS=%.3f pts=%.3f "
++                    "dts=%.3f sourceGapMs=%.2f pktDurationMs=%.2f "
++                    "audioPTS=%.3f avsync=%.3f timeFrameMs=%.2f delayMs=%.2f "
++                    "speed=%.3f videoStatus=%s audioStatus=%s paused=%d "
++                    "cachePaused=%d queued=%d decoderDrops=%lld voDrops=%lld\n",
++                    mpctx->video_pts, pts, mpctx->next_frames[0]->dts,
++                    frame_time * 1000.0,
++                    mpctx->next_frames[0]->pkt_duration * 1000.0,
++                    audio_pts, mpctx->last_av_difference,
++                    mpctx->time_frame * 1000.0, mpctx->delay * 1000.0,
++                    mpctx->video_speed, mp_status_str(mpctx->video_status),
++                    mp_status_str(mpctx->audio_status), mpctx->paused,
++                    mpctx->paused_for_cache, mpctx->num_next_frames,
++                    (long long)decoder_drops,
++                    (long long)vo_get_drop_count(mpctx->video_out));
++        }
+         if (frame_time <= 0 || frame_time >= tolerance) {
+             // Assume a discontinuity.
+-            MP_WARN(mpctx, "Invalid video timestamp: %f -> %f\n",
+-                    mpctx->video_pts, pts);
++            MP_WARN(mpctx, "[MPVKitVideoTimestampReset] prevPTS=%.3f pts=%.3f "
++                    "gapMs=%.2f dts=%.3f pktDurationMs=%.2f paused=%d "
++                    "cachePaused=%d seeking=%d\n",
++                    mpctx->video_pts, pts, frame_time * 1000.0,
++                    mpctx->next_frames[0]->dts,
++                    mpctx->next_frames[0]->pkt_duration * 1000.0,
++                    mpctx->paused, mpctx->paused_for_cache,
++                    mpctx->hrseek_active);
+             frame_time = 0;
+         }
+     }
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 399e1d5..21cd440 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -1154,8 +1154,8 @@ static void handle_err(struct mp_filter *vd)
+     vd_ffmpeg_ctx *ctx = vd->priv;
+     struct hwdec_opts *hwdec_opts = ctx->hwdec_opts;
+ 
+-    MP_WARN(vd, "Error while decoding frame%s!\n",
+-            ctx->use_hwdec ? " (hardware decoding)" : "");
++    MP_WARN(vd, "[MPVKitDecodeError] hardware=%d failureCount=%d\n",
++            ctx->use_hwdec, ctx->hwdec_fail_count + 1);
+ 
+     if (ctx->use_hwdec) {
+         ctx->hwdec_fail_count += 1;
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..e3808b9 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -990,6 +990,21 @@ static bool render_frame(struct vo *vo)
+ 
+     if (in->dropped_frame) {
+         in->drop_count += 1;
++        if (in->drop_count <= 10 || in->drop_count % 30 == 0) {
++            double media_pts = frame->current
++                ? frame->current->pts : MP_NOPTS_VALUE;
++            double next_pts = frame->num_frames > 1 && frame->frames[1]
++                ? frame->frames[1]->pts : MP_NOPTS_VALUE;
++            MP_WARN(vo, "[MPVKitVODrop] count=%lld mediaPTS=%.3f "
++                    "nextPTS=%.3f lateMs=%.2f durationMs=%.2f "
++                    "displaySynced=%d canDrop=%d repeat=%d redraw=%d "
++                    "paused=%d numFrames=%d\n",
++                    (long long)in->drop_count, media_pts, next_pts,
++                    (now - end_time) / 1e6,
++                    duration >= 0 ? duration / 1e6 : -1,
++                    frame->display_synced, frame->can_drop, frame->repeat,
++                    frame->redraw, in->paused, frame->num_frames);
++        }
+         wakeup_core(vo);
+     } else {
+         in->rendering = true;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index d1ff80c..c8a30e0 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1588,7 +1588,7 @@ static bool hwdec_reconfig(struct priv *p, struct ra_hwdec *hwdec,
+ 
+     p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, par);
+     if (!p->hwdec_mapper) {
+-        MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
++        MP_ERR(p, "[MPVKitGPUError] stage=hwdec-texture-init\n");
+         return NULL;
+     }
+ 
+@@ -1633,7 +1633,7 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
+     }
+ #endif
+ 
+-    MP_ERR(p, "Failed mapping hwdec frame? Open a bug!\n");
++    MP_ERR(p, "[MPVKitGPUError] stage=hwdec-frame-map-null\n");
+     return false;
+ }
+ 
+@@ -1646,7 +1646,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+         return false;
+ 
+     if (ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0) {
+-        MP_ERR(p, "Mapping hardware decoded surface failed.\n");
++        MP_ERR(p, "[MPVKitGPUError] stage=hwdec-surface-map\n");
+         return false;
+     }
+ 
+@@ -1794,7 +1794,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+             }
+ 
+             if (!pl_upload_plane(gpu, plane, &tex[n], &data[n])) {
+-                MP_ERR(vo, "Failed uploading frame!\n");
++                MP_ERR(vo, "[MPVKitGPUError] stage=frame-upload\n");
+                 talloc_free(data[n].priv);
+                 talloc_free(mpi);
+                 return false;
+@@ -2056,6 +2056,29 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+ #if HAVE_APPLE_GPU_PIP
++    double inline_current_pts = frame->current
++        ? frame->current->pts : MP_NOPTS_VALUE;
++    double inline_next_pts = frame->num_frames > 1 && frame->frames[1]
++        ? frame->frames[1]->pts : MP_NOPTS_VALUE;
++    double inline_source_gap = inline_current_pts != MP_NOPTS_VALUE &&
++                               inline_next_pts != MP_NOPTS_VALUE
++        ? inline_next_pts - inline_current_pts : 0;
++    if (frame->current && frame->frame_id && inline_source_gap >= 0.250) {
++        double scheduled_ms = frame->pts > 0
++            ? (frame->pts - mp_time_ns()) / 1e6 : 0;
++        MP_WARN(vo, "[MPVKitFrameWindow] frame=%llu currentPTS=%.3f "
++                "nextPTS=%.3f sourceGapMs=%.2f scheduledMs=%.2f "
++                "durationMs=%.2f approxMs=%.2f vsyncMs=%.2f "
++                "displaySynced=%d canDrop=%d repeat=%d redraw=%d still=%d "
++                "numFrames=%d\n",
++                (unsigned long long)frame->frame_id, inline_current_pts,
++                inline_next_pts, inline_source_gap * 1000.0, scheduled_ms,
++                frame->duration >= 0 ? frame->duration / 1e6 : -1,
++                frame->approx_duration * 1000.0,
++                frame->vsync_interval * 1000.0, frame->display_synced,
++                frame->can_drop, frame->repeat, frame->redraw, frame->still,
++                frame->num_frames);
++    }
+     if (frame->num_frames > 0 && frame->frame_id) {
+         uint64_t highest_frame_id = frame->frame_id + frame->num_frames - 1;
+         if (highest_frame_id > p->apple_pip_highest_seen_frame_id)
+@@ -2456,7 +2479,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ 
+         switch (pl_queue_update(p->queue, &mix, &qparams)) {
+         case PL_QUEUE_ERR:
+-            MP_ERR(vo, "Failed updating frames!\n");
++            MP_ERR(vo, "[MPVKitGPUError] stage=libplacebo-queue-update\n");
+             goto done;
+         case PL_QUEUE_EOF:
+             abort(); // we never signal EOF
+@@ -2532,7 +2555,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ #endif
+     bool primary_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+     if (!primary_ok) {
+-        MP_ERR(vo, "Failed rendering frame!\n");
++        MP_ERR(vo, "[MPVKitGPUError] stage=inline-render\n");
+ #if HAVE_APPLE_GPU_PIP
+         if (primary_is_pip)
+             pip_gpu_used = true;
+@@ -2562,7 +2585,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         pip_rendered = pl_render_image_mix(p->rr, &mix, &pip_target, &params) &&
+                        mix.num_frames > 0;
+         if (!pip_rendered)
+-            MP_ERR(vo, "Failed rendering direct IOSurface PiP frame!\n");
++            MP_ERR(vo, "[MPVKitGPUError] stage=pip-iosurface-render\n");
+     }
+ #endif
+ 
+@@ -2625,7 +2648,7 @@ static void flip_page(struct vo *vo)
+     if (p->frame_pending) {
+         bool submitted = pl_swapchain_submit_frame(p->sw);
+         if (!submitted)
+-            MP_ERR(vo, "Failed presenting frame!\n");
++            MP_ERR(vo, "[MPVKitGPUError] stage=swapchain-submit\n");
+ #if HAVE_APPLE_GPU_PIP
+         inline_presented = submitted && p->apple_pip_inline_frame_valid;
+         if (inline_presented)

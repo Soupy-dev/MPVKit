@@ -1,0 +1,65 @@
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index efc07e7..b011651 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -112,6 +112,7 @@ struct cache {
+ 
+ #if HAVE_APPLE_GPU_PIP
+ #define APPLE_PIP_MAX_TARGETS 8
++#define APPLE_INLINE_HITCH_GAP_NS MP_TIME_MS_TO_NS(250)
+ 
+ enum apple_pip_slot_state {
+     APPLE_PIP_SLOT_FREE = 0,
+@@ -223,6 +224,8 @@ struct priv {
+     bool apple_pip_inline_frame_valid;
+     uint64_t apple_pip_inline_frame_id;
+     uint64_t apple_pip_highest_seen_frame_id;
++    uint64_t apple_pip_last_inline_presented_frame_id;
++    int64_t apple_pip_last_inline_presented_ns;
+ #endif
+ 
+     pl_options pars;
+@@ -2635,8 +2638,31 @@ static void flip_page(struct vo *vo)
+ 
+     sw->fns->swap_buffers(sw);
+ #if HAVE_APPLE_GPU_PIP
+-    if (inline_presented)
++    if (inline_presented) {
++        int64_t inline_presented_ns = mp_time_ns();
++        bool inline_fresh_present = inline_frame_id &&
++            inline_frame_id != p->apple_pip_last_inline_presented_frame_id;
++        int64_t inline_present_gap_ns = 0;
++        if (inline_fresh_present) {
++            if (p->apple_pip_last_inline_presented_ns > 0 &&
++                inline_frame_id > p->apple_pip_last_inline_presented_frame_id)
++            {
++                inline_present_gap_ns = inline_presented_ns -
++                    p->apple_pip_last_inline_presented_ns;
++            }
++            p->apple_pip_last_inline_presented_frame_id = inline_frame_id;
++            p->apple_pip_last_inline_presented_ns = inline_presented_ns;
++        }
++        if (inline_fresh_present &&
++            inline_present_gap_ns >= APPLE_INLINE_HITCH_GAP_NS)
++        {
++            MP_WARN(vo, "[MPVKitInlineHitch] stage=present frame=%llu pts=%.3f "
++                     "presentGapMs=%.2f fresh=1\n",
++                    (unsigned long long)inline_frame_id, p->last_pts,
++                    MP_TIME_NS_TO_MS(inline_present_gap_ns));
++        }
+         apple_pip_signal_inline_presented(p, inline_frame_id);
++    }
+ #endif
+ }
+ 
+@@ -2686,6 +2712,10 @@ static void resize(struct vo *vo)
+ static int reconfig(struct vo *vo, struct mp_image_params *params)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_APPLE_GPU_PIP
++    p->apple_pip_last_inline_presented_frame_id = 0;
++    p->apple_pip_last_inline_presented_ns = 0;
++#endif
+     if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
+         return -1;
+ 

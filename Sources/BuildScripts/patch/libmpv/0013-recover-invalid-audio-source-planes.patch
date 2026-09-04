@@ -1,0 +1,44 @@
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -116,6 +116,28 @@ struct mp_async_queue *ao_get_queue(struct ao *ao)
+     return p->queue;
+ }
+ 
++static bool audio_frame_matches_ao(struct ao *ao, struct mp_aframe *frame,
++                                   uint8_t **data)
++{
++    if (!data || mp_aframe_get_format(frame) != ao->format ||
++        mp_aframe_get_rate(frame) != ao->samplerate ||
++        mp_aframe_get_planes(frame) != ao->num_planes ||
++        mp_aframe_get_sstride(frame) != (size_t)ao->sstride)
++        return false;
++
++    struct mp_chmap channels;
++    if (!mp_aframe_get_chmap(frame, &channels) ||
++        !mp_chmap_equals(&channels, &ao->channels))
++        return false;
++
++    for (int n = 0; n < ao->num_planes; n++) {
++        if (!data[n])
++            return false;
++    }
++
++    return true;
++}
++
+ // Special behavior with data==NULL: caller uses p->pending.
+ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+                        bool pad_silence)
+@@ -143,6 +165,11 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+ 
+         int copy = mp_aframe_get_size(p->pending);
+         uint8_t **fdata = mp_aframe_get_data_ro(p->pending);
++        if (!audio_frame_matches_ao(ao, p->pending, fdata)) {
++            TA_FREEP(&p->pending);
++            ao_request_reload(ao);
++            break;
++        }
+         copy = MPMIN(copy, samples - pos);
+         for (int n = 0; n < ao->num_planes; n++) {
+             memcpy((char *)data[n] + pos * ao->sstride,

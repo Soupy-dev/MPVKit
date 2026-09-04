@@ -300,8 +300,92 @@ private enum MPVGPUPlayerEvent: Sendable {
     case endFile(playlistEntryID: Int64, error: String?)
     case propertyChange(String, value: MPVGPUObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
+    case inlineHitchDiagnostic(String, playlistEntryID: Int64?)
     case commandReply(requestID: UInt64, error: Int32)
     case shutdown
+}
+
+private enum MPVGPUInlineDiagnosticStream: Hashable {
+    case audio
+    case video
+    case other
+}
+
+private enum MPVGPUInlineGPUErrorStage: Hashable {
+    case hwdecTextureInit
+    case hwdecFrameMapNull
+    case hwdecSurfaceMap
+    case frameUpload
+    case libplaceboQueueUpdate
+    case inlineRender
+    case pipIOSurfaceRender
+    case swapchainSubmit
+    case other
+}
+
+private enum MPVGPUInlineDiagnosticCategory: Hashable {
+    case inlineHitch
+    case audioUnderrun
+    case decodeError
+    case decodedAudioGap
+    case decodedVideoGap
+    case demuxReadError
+    case demuxWait(MPVGPUInlineDiagnosticStream)
+    case frameWindow
+    case gpuError(MPVGPUInlineGPUErrorStage)
+    case packetGap(MPVGPUInlineDiagnosticStream)
+    case voDrop
+    case videoTimestampReset
+    case other
+}
+
+private func mpvGPUInlineDiagnosticStream(_ message: String) -> MPVGPUInlineDiagnosticStream {
+    if message.contains("stream=audio") {
+        return .audio
+    }
+    if message.contains("stream=video") {
+        return .video
+    }
+    return .other
+}
+
+private func mpvGPUInlineGPUErrorStage(_ message: String) -> MPVGPUInlineGPUErrorStage {
+    if message.contains("stage=hwdec-texture-init") { return .hwdecTextureInit }
+    if message.contains("stage=hwdec-frame-map-null") { return .hwdecFrameMapNull }
+    if message.contains("stage=hwdec-surface-map") { return .hwdecSurfaceMap }
+    if message.contains("stage=frame-upload") { return .frameUpload }
+    if message.contains("stage=libplacebo-queue-update") { return .libplaceboQueueUpdate }
+    if message.contains("stage=inline-render") { return .inlineRender }
+    if message.contains("stage=pip-iosurface-render") { return .pipIOSurfaceRender }
+    if message.contains("stage=swapchain-submit") { return .swapchainSubmit }
+    return .other
+}
+
+private func mpvGPUInlineDiagnosticCategory(_ message: String) -> MPVGPUInlineDiagnosticCategory? {
+    guard let markerStart = message.range(of: "[MPVKit")?.lowerBound else { return nil }
+    let markerLimit = message.index(
+        markerStart,
+        offsetBy: 40,
+        limitedBy: message.endIndex
+    ) ?? message.endIndex
+    guard let markerEnd = message[markerStart..<markerLimit].firstIndex(of: "]") else {
+        return .other
+    }
+    switch message[markerStart...markerEnd] {
+    case "[MPVKitInlineHitch]": return .inlineHitch
+    case "[MPVKitAudioUnderrun]": return .audioUnderrun
+    case "[MPVKitDecodeError]": return .decodeError
+    case "[MPVKitDecodedAudioGap]": return .decodedAudioGap
+    case "[MPVKitDecodedVideoGap]": return .decodedVideoGap
+    case "[MPVKitDemuxReadError]": return .demuxReadError
+    case "[MPVKitDemuxWait]": return .demuxWait(mpvGPUInlineDiagnosticStream(message))
+    case "[MPVKitFrameWindow]": return .frameWindow
+    case "[MPVKitGPUError]": return .gpuError(mpvGPUInlineGPUErrorStage(message))
+    case "[MPVKitPacketGap]": return .packetGap(mpvGPUInlineDiagnosticStream(message))
+    case "[MPVKitVODrop]": return .voDrop
+    case "[MPVKitVideoTimestampReset]": return .videoTimestampReset
+    default: return .other
+    }
 }
 
 /// Deep-copied observed-property payload. libmpv owns `mpv_event_property.data` only until the
@@ -358,6 +442,7 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
     private var stopCompletions: [@MainActor @Sendable () -> Void] = []
     /// Accessed only by `queue`; copied onto each event before crossing to the main actor.
     private var activePlaylistEntryID: Int64?
+    private var lastForwardedInlineDiagnosticUptimeNanosecondsByCategory: [MPVGPUInlineDiagnosticCategory: UInt64] = [:]
 
     init(handle: OpaquePointer, eventHandler: @escaping @Sendable (MPVGPUPlayerEvent) -> Void) {
         self.handle = handle
@@ -422,6 +507,7 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
         case MPV_EVENT_START_FILE:
             guard let data = event.data else { return nil }
             let startFile = data.assumingMemoryBound(to: mpv_event_start_file.self).pointee
+            lastForwardedInlineDiagnosticUptimeNanosecondsByCategory.removeAll(keepingCapacity: true)
             activePlaylistEntryID = startFile.playlist_entry_id
             return .startFile(playlistEntryID: startFile.playlist_entry_id)
         case MPV_EVENT_FILE_LOADED:
@@ -452,9 +538,18 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
             guard let log = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) else { return nil }
             let text = log.pointee.text.map { String(cString: $0) } ?? ""
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty
-                ? nil
-                : .logError(trimmed, playlistEntryID: activePlaylistEntryID)
+            guard let category = mpvGPUInlineDiagnosticCategory(trimmed) else { return nil }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if let last = lastForwardedInlineDiagnosticUptimeNanosecondsByCategory[category],
+               now >= last,
+               now - last < 5_000_000_000 {
+                return nil
+            }
+            lastForwardedInlineDiagnosticUptimeNanosecondsByCategory[category] = now
+            return .inlineHitchDiagnostic(
+                trimmed,
+                playlistEntryID: activePlaylistEntryID
+            )
         case MPV_EVENT_COMMAND_REPLY:
             return .commandReply(requestID: event.reply_userdata, error: event.error)
         case MPV_EVENT_SHUTDOWN:
@@ -2380,6 +2475,7 @@ public final class MPVGPUPlayerRenderer {
     /// compatibility rendering have failed for the current load.
     public var onPictureInPictureStopRequested: ((String) -> Void)?
     public var onError: ((String) -> Void)?
+    public var onInlineHitchDiagnostic: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
     /// Fired on the main thread when decoded video parameters may have changed.
     public var onVideoReconfigure: (() -> Void)?
@@ -2416,6 +2512,7 @@ public final class MPVGPUPlayerRenderer {
         return renderer
     }
     private var videoFilterChain = ""
+    private var audioFilterChain: String?
     /// Main-actor owned during life; `deinit` exclusively transfers it into the async drain task.
     nonisolated(unsafe) private var singleSessionPictureInPictureSink: MPVSingleSessionPictureInPictureSink?
     private var eventPump: MPVGPUPlayerEventPump?
@@ -2441,6 +2538,7 @@ public final class MPVGPUPlayerRenderer {
     private var cachedEstimatedFramesPerSecond: Double = 0
     private var cachedDroppedVideoFrameCount: Int64 = 0
     private var cachedDelayedVideoFrameCount: Int64 = 0
+    private var cachedSeeking = false
     private var cachedContainerFramesPerSecond: Double = 0
     private var cachedVideoCodec = ""
     private var cachedVideoWidth: Int64 = 0
@@ -3136,6 +3234,7 @@ public final class MPVGPUPlayerRenderer {
         }
 
         isStopping = false
+        audioFilterChain = nil
         updateState(.starting)
 
         guard let handle = mpv_create() else {
@@ -3187,6 +3286,7 @@ public final class MPVGPUPlayerRenderer {
             throw MPVMetalSampleBufferRendererError.mpvInitializationFailed(initStatus)
         }
 
+        _ = mpv_request_log_messages(handle, "warn")
         observeProperties(handle: handle)
         engineGeneration &+= 1
         let eventEngineGeneration = engineGeneration
@@ -3247,6 +3347,7 @@ public final class MPVGPUPlayerRenderer {
         let pump = eventPump
         eventPump = nil
         mpv = nil
+        audioFilterChain = nil
         eventPumpStopCompleted = pump == nil
         sampleRendererStopCompleted = compatibilityRenderer == nil
         let nativeShutdown = pendingSingleSessionShutdown
@@ -4069,7 +4170,9 @@ public final class MPVGPUPlayerRenderer {
     /// by the primary handle. Pass an empty string to clear all filters.
     public func setAudioFilterChain(_ chain: String) {
         performOnMain {
-            self.setStringProperty("af", chain)
+            guard self.audioFilterChain != chain else { return }
+            guard self.setStringProperty("af", chain) >= 0 else { return }
+            self.audioFilterChain = chain
         }
     }
 
@@ -4355,6 +4458,34 @@ public final class MPVGPUPlayerRenderer {
         )
     }
 
+    public func frameDeliveryDiagnosticsSnapshot() -> MPVGPUPlayerRendererDiagnostics {
+        refreshCachedFrameDeliveryDiagnostics()
+        return diagnosticsSnapshot()
+    }
+
+    public func playbackDiagnosticSnapshot() -> String {
+        refreshCachedFrameDeliveryDiagnostics()
+        func decimal(_ value: Double?) -> String {
+            guard let value, value.isFinite else { return "na" }
+            return String(format: "%.3f", value)
+        }
+
+        let audioPTS = getDoubleProperty("audio-pts")
+        let avSync = getDoubleProperty("avsync")
+        let decoderDrops = getInt64Property("decoder-frame-drop-count") ?? 0
+        let mistimedFrames = getInt64Property("mistimed-frame-count") ?? 0
+        let cacheDuration = getDoubleProperty("demuxer-cache-duration")
+        let cacheEnd = getDoubleProperty("demuxer-cache-time")
+        let cacheState = getInt64Property("cache-buffering-state") ?? 0
+        let cacheSpeed = getInt64Property("cache-speed") ?? 0
+        let cacheIdle = getFlagProperty("demuxer-cache-idle") ?? false
+        let coreIdle = getFlagProperty("core-idle") ?? false
+        let speed = String(format: "%.2f", cachedSpeed)
+        let codec = cachedVideoCodec.isEmpty ? "na" : cachedVideoCodec
+        let hardwareDecoder = cachedHardwareDecoder.isEmpty ? "na" : cachedHardwareDecoder
+        return "position=\(decimal(cachedPosition)) audioPTS=\(decimal(audioPTS)) avsync=\(decimal(avSync)) speed=\(speed) decoderDrops=\(decoderDrops) voDrops=\(cachedDroppedVideoFrameCount) delayed=\(cachedDelayedVideoFrameCount) mistimed=\(mistimedFrames) paused=\(isPaused) cachePaused=\(isBuffering) seeking=\(cachedSeeking) coreIdle=\(coreIdle) cacheIdle=\(cacheIdle) cacheDuration=\(decimal(cacheDuration)) cacheEnd=\(decimal(cacheEnd)) cacheState=\(cacheState) cacheBytesPerSecond=\(cacheSpeed) state=\(String(describing: state)) codec=\(codec) hwdec=\(hardwareDecoder)"
+    }
+
     private func configureInlineLayer() {
         inlineLayer.framebufferOnly = true
         #if os(macOS)
@@ -4384,12 +4515,7 @@ public final class MPVGPUPlayerRenderer {
             _ = setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 1)
         }
 
-        // The bundled libplacebo batches per-pass command submissions into one
-        // vkQueueSubmit2 per flush point when this is set, which removes most of
-        // MoltenVK's per-submit MTLCommandBuffer commit cost from the render
-        // thread. Runtimes without the patch ignore the variable. Deliberately
-        // not `setenv(..., 1)`: a host override wins.
-        _ = setenv("PL_VK_DEFER_SUBMITS", "1", 0)
+        _ = setenv("PL_VK_DEFER_SUBMITS", "0", 1)
     }
 
     private var shouldEnableInlineExtendedDynamicRange: Bool {
@@ -5587,6 +5713,7 @@ public final class MPVGPUPlayerRenderer {
         cachedContainerFramesPerSecond = 0
         cachedDroppedVideoFrameCount = 0
         cachedDelayedVideoFrameCount = 0
+        cachedSeeking = false
         cachedVideoCodec = ""
         cachedVideoWidth = 0
         cachedVideoHeight = 0
@@ -5606,6 +5733,20 @@ public final class MPVGPUPlayerRenderer {
         cachedVideoColorPrimaries = getStringProperty("video-params/primaries") ?? ""
         cachedVideoSignalPeak = getDoubleProperty("video-params/sig-peak") ?? 0
         setInlineExtendedDynamicRange(shouldEnableInlineExtendedDynamicRange)
+    }
+
+    private func refreshCachedVideoMetadataCoherently() {
+        refreshCachedVideoColorMetadataCoherently()
+        refreshCachedFrameDeliveryDiagnostics()
+        cachedVideoWidth = getInt64Property("video-params/w") ?? 0
+        cachedVideoHeight = getInt64Property("video-params/h") ?? 0
+        cachedVideoPixelFormat = getStringProperty("video-params/pixelformat") ?? ""
+    }
+
+    private func refreshCachedFrameDeliveryDiagnostics() {
+        cachedEstimatedFramesPerSecond = getDoubleProperty("estimated-vf-fps") ?? 0
+        cachedDroppedVideoFrameCount = getInt64Property("frame-drop-count") ?? 0
+        cachedDelayedVideoFrameCount = getInt64Property("vo-delayed-frame-count") ?? 0
     }
 
     private func scheduleCachedVideoColorMetadataRefresh(generation: UInt64) {
@@ -5637,21 +5778,12 @@ public final class MPVGPUPlayerRenderer {
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("seeking", MPV_FORMAT_FLAG),
             ("speed", MPV_FORMAT_DOUBLE),
-            ("estimated-vf-fps", MPV_FORMAT_DOUBLE),
-            ("frame-drop-count", MPV_FORMAT_INT64),
-            ("vo-delayed-frame-count", MPV_FORMAT_INT64),
             ("container-fps", MPV_FORMAT_DOUBLE),
             ("track-list", MPV_FORMAT_NONE),
             ("vid", MPV_FORMAT_STRING),
             ("sid", MPV_FORMAT_NONE),
             ("aid", MPV_FORMAT_NONE),
             ("video-codec", MPV_FORMAT_STRING),
-            ("video-params/w", MPV_FORMAT_INT64),
-            ("video-params/h", MPV_FORMAT_INT64),
-            ("video-params/gamma", MPV_FORMAT_STRING),
-            ("video-params/primaries", MPV_FORMAT_STRING),
-            ("video-params/sig-peak", MPV_FORMAT_DOUBLE),
-            ("video-params/pixelformat", MPV_FORMAT_STRING),
             ("hwdec-current", MPV_FORMAT_STRING)
         ]
         for (name, format) in properties {
@@ -5673,7 +5805,7 @@ public final class MPVGPUPlayerRenderer {
                 loadSequence: identity.sequence
             )
             isAwaitingPrimaryFileLoaded = false
-            refreshCachedVideoColorMetadataCoherently()
+            refreshCachedVideoMetadataCoherently()
             setFlagProperty("pause", isPaused)
             if let pendingSeekAfterPrimaryLoadSubmission {
                 self.pendingSeekAfterPrimaryLoadSubmission = nil
@@ -5688,7 +5820,7 @@ public final class MPVGPUPlayerRenderer {
             guard let identity = currentLoadIdentity(for: playlistEntryID) else { return }
             let pendingNativeProbeGeneration = nativePictureInPictureProbeGate
                 .markVideoReconfigured(loadSequence: identity.sequence)
-            refreshCachedVideoColorMetadataCoherently()
+            refreshCachedVideoMetadataCoherently()
             notifyVideoReconfigure(generation: identity.clientGeneration)
             onVideoOutputReconfigureForGeneration?(identity.clientGeneration)
             if let epoch = activeHardwareDecoderRecoveryEpoch,
@@ -5728,6 +5860,13 @@ public final class MPVGPUPlayerRenderer {
                 return
             }
             onError?(message)
+        case .inlineHitchDiagnostic(let message, let playlistEntryID):
+            if let playlistEntryID {
+                guard currentLoadIdentity(for: playlistEntryID) != nil else { return }
+            } else if isAwaitingPrimaryFileLoaded {
+                return
+            }
+            onInlineHitchDiagnostic?(message)
         case .commandReply(let requestID, let error):
             pendingAsyncCommandReplies.removeValue(forKey: requestID)?.resume(returning: error)
         case .shutdown:
@@ -5802,6 +5941,9 @@ public final class MPVGPUPlayerRenderer {
             }
             updateSingleSessionTimeline(discontinuity: false)
         case "seeking":
+            if case .flag(let seeking) = value {
+                cachedSeeking = seeking
+            }
             if case .flag(false) = value,
                selectedPictureInPictureBackend == .compatibilityDualSession,
                isPictureInPicturePrepared || isPictureInPictureActive,
@@ -6031,9 +6173,10 @@ public final class MPVGPUPlayerRenderer {
         _ = name.withCString { mpv_set_option(handle, $0, MPV_FORMAT_INT64, &data) }
     }
 
-    private func setStringProperty(_ name: String, _ value: String) {
-        guard let handle = mpv else { return }
-        _ = name.withCString { namePointer in
+    @discardableResult
+    private func setStringProperty(_ name: String, _ value: String) -> Int32 {
+        guard let handle = mpv else { return -1 }
+        return name.withCString { namePointer in
             value.withCString { valuePointer in
                 mpv_set_property_string(handle, namePointer, valuePointer)
             }
@@ -6056,6 +6199,13 @@ public final class MPVGPUPlayerRenderer {
         var data = Int64()
         let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_INT64, &data) }
         return status >= 0 ? data : nil
+    }
+
+    private func getFlagProperty(_ name: String) -> Bool? {
+        guard let handle = mpv else { return nil }
+        var data = Int32()
+        let status = name.withCString { mpv_get_property(handle, $0, MPV_FORMAT_FLAG, &data) }
+        return status >= 0 ? data != 0 : nil
     }
 
     private func currentPlaylistEntryID() -> Int64? {
@@ -6142,6 +6292,7 @@ public final class MPVGPUPlayerRenderer {
     public var onPictureInPictureStateChange: ((MPVPictureInPictureState) -> Void)?
     public var onPictureInPictureStopRequested: ((String) -> Void)?
     public var onError: ((String) -> Void)?
+    public var onInlineHitchDiagnostic: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
     public var onVideoReconfigure: (() -> Void)?
     public var onVideoReconfigureForGeneration: ((UInt64) -> Void)?
@@ -6305,6 +6456,12 @@ public final class MPVGPUPlayerRenderer {
             videoPixelFormat: "",
             hardwareDecoder: ""
         )
+    }
+    public func frameDeliveryDiagnosticsSnapshot() -> MPVGPUPlayerRendererDiagnostics {
+        diagnosticsSnapshot()
+    }
+    public func playbackDiagnosticSnapshot() -> String {
+        "unsupported-platform"
     }
 }
 
