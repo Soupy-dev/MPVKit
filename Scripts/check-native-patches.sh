@@ -75,4 +75,6 @@ xcrun --sdk iphoneos clang \
     -target arm64-apple-ios14.0 \
     "$worktree/video/out/apple_pip_metal.m"
 
+bash "$repository_root/Scripts/check-avfoundation-recovery.sh" "$worktree"
+
 echo "All libmpv patches apply cleanly to mpv v0.41.0."

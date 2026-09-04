@@ -68,6 +68,13 @@ binary_count=0
 while IFS= read -r binary; do
     binary_count=$((binary_count + 1))
     exported="$(nm -gU "$binary")"
+    if [[ "$artifact" == "$repository_root/dist/release/xcframework/Libmpv.xcframework" ]] \
+       && [[ "$binary" == */ios-* && "$binary" != *maccatalyst* ]] \
+       && { ! grep -Fq 'requesting synchronized audio output recovery' "$binary" \
+           || ! grep -Fq 'preserving playback position during AVFoundation recovery' "$binary"; }; then
+        echo "Missing synchronized AVFoundation audio recovery in iOS slice: $binary" >&2
+        exit 1
+    fi
     for symbol in "${pip_symbols[@]}"; do
         if ! grep -q " _$symbol$" <<<"$exported"; then
             echo "Missing $symbol in built slice: $binary" >&2

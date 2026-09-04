@@ -1,0 +1,87 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -34,7 +34,9 @@
+ 
+ @interface AVObserver : NSObject {
+     struct ao *ao;
+-}
++    BOOL reloadRequested;
++}
++- (void)invalidate;
+ - (void)handleRestartNotification:(NSNotification*)notification;
+ @end
+ 
+@@ -71,6 +73,10 @@
+     int request_sample_count = samplerate / 10;
+     int buffer_size = request_sample_count * sstride;
+     void *data[] = {CFAllocatorAllocate(NULL, buffer_size, 0)};
++    if (!data[0]) {
++        MP_ERR(ao, "unable to allocate audio buffer\n");
++        goto error;
++    }
+ 
+     int64_t cur_time_av = CMTimeGetNanoseconds([p->synchronizer currentTime]);
+     int64_t cur_time_mp = mp_time_ns();
+@@ -205,13 +211,20 @@
+     }
+     return self;
+ }
++- (void)invalidate {
++    @synchronized (self) {
++        ao = NULL;
++    }
++}
+ - (void)handleRestartNotification:(NSNotification*)notification {
+-    // Use NSString -UTF8String (portable) instead of cfstr_get_cstr, whose
+-    // implementation (osdep/utils-mac.c) is only built on macOS (Cocoa).
+-    MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
+-    MP_VERBOSE(ao, "notification name: %s\n", notification.name.UTF8String);
+-    stop(ao);
+-    start(ao);
++    @synchronized (self) {
++        if (!ao || reloadRequested)
++            return;
++        reloadRequested = YES;
++        MP_WARN(ao, "requesting synchronized audio output recovery\n");
++        MP_VERBOSE(ao, "notification name: %s\n", notification.name.UTF8String);
++        ao_request_reload(ao);
++    }
+ }
+ @end
+ 
+@@ -336,6 +349,8 @@
+ {
+     struct priv *p = ao->priv;
+ 
++    [p->observer invalidate];
++    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+     stop(ao);
+ 
+     [p->renderer release];
+@@ -343,7 +358,6 @@
+     dispatch_release(p->queue);
+     CFRelease(p->format_description);
+ 
+-    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+     [p->observer release];
+ 
+ #if TARGET_OS_IPHONE
+diff --git a/player/audio.c b/player/audio.c
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -786,6 +786,14 @@
+ {
+     if (!mpctx->ao)
+         return;
++
++    double playback_time = get_current_time(mpctx);
++    if (strcmp(ao_get_name(mpctx->ao), "avfoundation") == 0 &&
++        mpctx->demuxer && mpctx->demuxer->seekable &&
++        playback_time != MP_NOPTS_VALUE && isfinite(playback_time)) {
++        MP_VERBOSE(mpctx, "preserving playback position during AVFoundation recovery\n");
++        issue_refresh_seek(mpctx, MPSEEK_EXACT);
++    }
+ 
+     ao_reset(mpctx->ao);
+     uninit_audio_out(mpctx);
