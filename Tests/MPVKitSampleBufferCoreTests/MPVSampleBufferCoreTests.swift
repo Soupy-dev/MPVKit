@@ -207,6 +207,67 @@ final class MPVSampleBufferCoreTests: XCTestCase {
         XCTAssertEqual(MPVDrawablePixelLimit.resolved(configured: 4, platformMaximum: 3), 3)
     }
 
+    func testInlineDrawableLayoutKeepsMoltenVKSurfaceAtSelectedResolution() throws {
+        let bounds = CGSize(width: 1920, height: 1080)
+        for target in [
+            CGSize(width: 3840, height: 2160),
+            CGSize(width: 1920, height: 1080),
+            CGSize(width: 1280, height: 720),
+            CGSize(width: 3840, height: 2160)
+        ] {
+            let layout = try XCTUnwrap(MPVInlineDrawableLayout.resolved(
+                bounds: bounds,
+                presentationScale: 2,
+                maximumDrawableSize: target
+            ))
+            XCTAssertEqual(layout.drawableSize, target)
+            XCTAssertEqual((bounds.width * layout.contentsScale).rounded(.toNearestOrEven), target.width)
+            XCTAssertEqual((bounds.height * layout.contentsScale).rounded(.toNearestOrEven), target.height)
+        }
+    }
+
+    func testInlineDrawableLayoutPreservesNaturalSizeAndFractionalBounds() throws {
+        let bounds = CGSize(width: 1920.25, height: 1080.75)
+        let layout = try XCTUnwrap(MPVInlineDrawableLayout.resolved(
+            bounds: bounds,
+            presentationScale: 2,
+            maximumDrawableSize: CGSize(width: 1920, height: 1080)
+        ))
+        XCTAssertEqual(layout.drawableSize.width, (bounds.width * layout.contentsScale).rounded(.toNearestOrEven))
+        XCTAssertEqual(layout.drawableSize.height, (bounds.height * layout.contentsScale).rounded(.toNearestOrEven))
+        XCTAssertLessThanOrEqual(layout.drawableSize.width * layout.drawableSize.height, 2_073_600)
+
+        let natural = try XCTUnwrap(MPVInlineDrawableLayout.resolved(
+            bounds: CGSize(width: 1280, height: 720),
+            presentationScale: 1,
+            maximumDrawableSize: CGSize(width: 3840, height: 2160)
+        ))
+        XCTAssertEqual(natural.contentsScale, 1)
+        XCTAssertEqual(natural.drawableSize, CGSize(width: 1280, height: 720))
+    }
+
+    func testInlineDrawableLayoutRejectsDetachedAndUnboundedGeometry() {
+        for bounds in [
+            CGSize.zero,
+            CGSize(width: CGFloat.infinity, height: 1080),
+            CGSize(width: 1920, height: CGFloat.nan),
+            CGSize(width: -1920, height: 1080)
+        ] {
+            XCTAssertNil(MPVInlineDrawableLayout.resolved(
+                bounds: bounds,
+                presentationScale: 2,
+                maximumDrawableSize: CGSize(width: 1920, height: 1080)
+            ))
+        }
+        for scale in [CGFloat.zero, -1, .infinity, .nan] {
+            XCTAssertNil(MPVInlineDrawableLayout.resolved(
+                bounds: CGSize(width: 1920, height: 1080),
+                presentationScale: scale,
+                maximumDrawableSize: CGSize(width: 1920, height: 1080)
+            ))
+        }
+    }
+
     func testPictureInPictureRenderSizeUsesWindowAspectAtConfiguredQuality() {
         let maximum = CGSize(width: 1280, height: 720)
         let common = { (requested: CGSize) in

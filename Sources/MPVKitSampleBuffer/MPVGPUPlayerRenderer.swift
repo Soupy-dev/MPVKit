@@ -174,6 +174,12 @@ public struct MPVGPUPlayerRendererOptions: Equatable, Sendable {
     }
 }
 
+public struct MPVGPUPlayerRenderPass: Equatable, Sendable {
+    public let description: String
+    public let sampleCount: Int
+    public let lastNanoseconds: Int64
+}
+
 public struct MPVGPUPlayerRendererDiagnostics: Equatable, Sendable {
     public let state: MPVGPUPlayerRendererState
     public let presentationMode: MPVGPUPlayerPresentationMode
@@ -2726,6 +2732,12 @@ public final class MPVGPUPlayerRenderer {
             guard resolvedScale.isFinite, resolvedScale > 0 else { return }
 
             self.inlineResizeRequestCount += 1
+            #if os(tvOS)
+            let layout = self.resolvedInlineDrawableLayout(
+                bounds: bounds.size,
+                presentationScale: resolvedScale
+            )
+            #endif
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             #if os(macOS)
@@ -2741,16 +2753,26 @@ public final class MPVGPUPlayerRenderer {
             if !hostOwnsLayerGeometry {
                 self.inlineLayer.frame = bounds
             }
+            #if os(tvOS)
+            if let layout {
+                self.inlineLayer.contentsScale = layout.contentsScale
+            }
+            #else
             self.inlineLayer.contentsScale = resolvedScale
+            #endif
             CATransaction.commit()
 
             // A zero-sized detached scene keeps its last valid drawable, avoiding a destructive
             // swapchain resize during Stage Manager/scene transitions.
+            #if os(tvOS)
+            guard let drawableSize = layout?.drawableSize else { return }
+            #else
             let requestedSize = CGSize(
                 width: bounds.width * resolvedScale,
                 height: bounds.height * resolvedScale
             )
             guard let drawableSize = self.validatedInlineDrawableSize(requestedSize) else { return }
+            #endif
             self.pendingInlineDrawableSize = drawableSize
             if self.inlineResizeWorkItem != nil {
                 self.inlineResizeCoalescedCount += 1
@@ -4463,6 +4485,71 @@ public final class MPVGPUPlayerRenderer {
         return diagnosticsSnapshot()
     }
 
+    public func inlineRenderPasses(includeRedraw: Bool = false) -> [MPVGPUPlayerRenderPass] {
+        guard let handle = mpv, isRunning, !isStopping else { return [] }
+        var node = mpv_node()
+        let status = "vo-passes".withCString {
+            mpv_get_property(handle, $0, MPV_FORMAT_NODE, &node)
+        }
+        guard status >= 0 else { return [] }
+        defer { mpv_free_node_contents(&node) }
+        guard node.format == MPV_FORMAT_NODE_MAP,
+              let root = node.u.list,
+              let rootKeys = root.pointee.keys,
+              let rootValues = root.pointee.values else { return [] }
+        var passNodes: [mpv_node] = []
+        for index in 0..<min(16, max(0, Int(root.pointee.num))) {
+            guard let key = rootKeys[index] else { continue }
+            let stage = String(cString: key)
+            guard stage == "fresh" || (includeRedraw && stage == "redraw") else { continue }
+            let stageNode = rootValues[index]
+            guard stageNode.format == MPV_FORMAT_NODE_ARRAY,
+                  let list = stageNode.u.list,
+                  let values = list.pointee.values else { continue }
+            for passIndex in 0..<min(128 - passNodes.count, max(0, Int(list.pointee.num))) {
+                passNodes.append(values[passIndex])
+            }
+        }
+        var passes: [MPVGPUPlayerRenderPass] = []
+        for item in passNodes {
+            guard item.format == MPV_FORMAT_NODE_MAP,
+                  let map = item.u.list,
+                  let keys = map.pointee.keys,
+                  let entries = map.pointee.values else { continue }
+            var description = ""
+            var sampleCount = 0
+            var lastNanoseconds: Int64 = 0
+            for entryIndex in 0..<min(16, max(0, Int(map.pointee.num))) {
+                guard let keyPointer = keys[entryIndex] else { continue }
+                let key = String(cString: keyPointer)
+                let value = entries[entryIndex]
+                switch key {
+                case "desc":
+                    if value.format == MPV_FORMAT_STRING, let string = value.u.string {
+                        description = String(String(cString: string).prefix(512))
+                    }
+                case "count":
+                    if value.format == MPV_FORMAT_INT64 {
+                        sampleCount = max(0, Int(clamping: value.u.int64))
+                    }
+                case "last":
+                    if value.format == MPV_FORMAT_INT64 {
+                        lastNanoseconds = max(0, value.u.int64)
+                    }
+                default:
+                    break
+                }
+            }
+            guard !description.isEmpty else { continue }
+            passes.append(MPVGPUPlayerRenderPass(
+                description: description,
+                sampleCount: sampleCount,
+                lastNanoseconds: lastNanoseconds
+            ))
+        }
+        return passes
+    }
+
     public func playbackDiagnosticSnapshot() -> String {
         refreshCachedFrameDeliveryDiagnostics()
         func decimal(_ value: Double?) -> String {
@@ -4493,7 +4580,19 @@ public final class MPVGPUPlayerRenderer {
         inlineLayer.contentsScale = presentationScale
         #else
         inlineLayer.backgroundColor = UIColor.black.cgColor
+        #if os(tvOS)
+        if let layout = resolvedInlineDrawableLayout(
+            bounds: inlineLayer.bounds.size,
+            presentationScale: presentationScale
+        ) {
+            inlineLayer.contentsScale = layout.contentsScale
+            pendingInlineDrawableSize = layout.drawableSize
+            inlineResizeWorkItem?.cancel()
+            applyPendingInlineDrawableSize()
+        }
+        #else
         inlineLayer.contentsScale = presentationScale
+        #endif
         #endif
         setInlineExtendedDynamicRange(shouldEnableInlineExtendedDynamicRange)
     }
@@ -5601,6 +5700,24 @@ public final class MPVGPUPlayerRenderer {
         #endif
     }
 
+    #if os(tvOS)
+    private func resolvedInlineDrawableLayout(
+        bounds: CGSize,
+        presentationScale: CGFloat
+    ) -> MPVInlineDrawableLayout? {
+        let requested = CGSize(
+            width: bounds.width * presentationScale,
+            height: bounds.height * presentationScale
+        )
+        guard let maximum = validatedInlineDrawableSize(requested) else { return nil }
+        return MPVInlineDrawableLayout.resolved(
+            bounds: bounds,
+            presentationScale: presentationScale,
+            maximumDrawableSize: maximum
+        )
+    }
+    #endif
+
     private func validatedInlineDrawableSize(_ requestedSize: CGSize) -> CGSize? {
         guard requestedSize.width.isFinite,
               requestedSize.height.isFinite,
@@ -6338,6 +6455,7 @@ public final class MPVGPUPlayerRenderer {
     public func updateInlineLayerLayout(bounds: CGRect, contentsScale: CGFloat? = nil) { _ = bounds; _ = contentsScale }
     public func updatePictureInPictureRenderSize(_ size: CGSize) { _ = size }
     public func updateOptions(_ newOptions: MPVGPUPlayerRendererOptions) { _ = newOptions }
+    public func inlineRenderPasses(includeRedraw: Bool = false) -> [MPVGPUPlayerRenderPass] { _ = includeRedraw; return [] }
     public func refreshCurrentHardwareDecoder() -> String { "" }
     public func validateForegroundVideoAfterSystemResume(
         timeout: TimeInterval = 0.75

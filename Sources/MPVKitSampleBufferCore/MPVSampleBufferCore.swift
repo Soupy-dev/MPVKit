@@ -72,6 +72,40 @@ public enum MPVDrawablePixelLimit {
     }
 }
 
+public struct MPVInlineDrawableLayout: Equatable, Sendable {
+    public let contentsScale: CGFloat
+    public let drawableSize: CGSize
+
+    public static func resolved(
+        bounds: CGSize,
+        presentationScale: CGFloat,
+        maximumDrawableSize: CGSize
+    ) -> MPVInlineDrawableLayout? {
+        guard bounds.width.isFinite,
+              bounds.height.isFinite,
+              bounds.width > 0,
+              bounds.height > 0,
+              presentationScale.isFinite,
+              presentationScale > 0,
+              maximumDrawableSize.width.isFinite,
+              maximumDrawableSize.height.isFinite,
+              maximumDrawableSize.width > 1,
+              maximumDrawableSize.height > 1 else { return nil }
+        let scale = min(
+            presentationScale,
+            maximumDrawableSize.width / bounds.width,
+            maximumDrawableSize.height / bounds.height
+        )
+        let width = (bounds.width * scale).rounded(.toNearestOrEven)
+        let height = (bounds.height * scale).rounded(.toNearestOrEven)
+        guard scale.isFinite, scale > 0, width > 1, height > 1 else { return nil }
+        return MPVInlineDrawableLayout(
+            contentsScale: scale,
+            drawableSize: CGSize(width: width, height: height)
+        )
+    }
+}
+
 /// Resolves AVKit's PiP render-size callback into a high-quality, bounded pixel-buffer size.
 ///
 /// AVKit's callback is useful for selecting the current aspect-ratio variant, but on iPhone it
