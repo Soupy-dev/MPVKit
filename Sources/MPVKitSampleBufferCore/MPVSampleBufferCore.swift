@@ -1,6 +1,239 @@
 import CoreGraphics
 import Foundation
 
+@MainActor
+package final class MPVAsyncCommandReply {
+    private var result: Int32?
+    private var waiters: [CheckedContinuation<Int32, Never>] = []
+    private var abortHandler: (() -> Void)?
+
+    package init(abort: (() -> Void)? = nil) {
+        abortHandler = abort
+    }
+
+    package var isCompleted: Bool { result != nil }
+
+    package func value() async -> Int32 {
+        if let result { return result }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+
+    package func abort() {
+        let handler = abortHandler
+        abortHandler = nil
+        handler?()
+    }
+
+    package func complete(_ status: Int32) {
+        guard result == nil else { return }
+        result = status
+        abortHandler = nil
+        let continuations = waiters
+        waiters.removeAll()
+        for continuation in continuations {
+            continuation.resume(returning: status)
+        }
+    }
+}
+
+@MainActor
+package final class MPVExternalSubtitleQueue {
+    package struct Batch: Equatable, Sendable {
+        package let id: UUID
+        package let urls: [String]
+        package let names: [String]?
+        package let selectFirst: Bool
+
+        package init(urls: [String], names: [String]?, selectFirst: Bool) {
+            id = UUID()
+            self.urls = urls
+            self.names = names
+            self.selectFirst = selectFirst
+        }
+    }
+
+    package enum Selection: Equatable, Sendable {
+        case track(Int)
+        case external(batch: UUID, index: Int, stream: Int)
+    }
+
+    package struct SelectionIntent: Equatable, Sendable {
+        package let batchID: UUID?
+        package let committed: Selection?
+    }
+
+    private struct Command {
+        let batch: Batch
+        let index: Int
+
+        var arguments: [String] {
+            var result = ["sub-add", batch.urls[index], index == 0 && batch.selectFirst ? "select" : "auto"]
+            if let names = batch.names, names.indices.contains(index) {
+                result.append(names[index])
+            }
+            return result
+        }
+    }
+
+    private struct Submission {
+        let generation: UInt64
+        let command: Command
+        let previousTrackIDs: Set<Int>
+        let reply: MPVAsyncCommandReply
+    }
+
+    package private(set) var batches: [Batch] = []
+    package private(set) var selectionIntent: SelectionIntent?
+    private var generation: UInt64 = 0
+    private var ready = false
+    private var commands: [Command] = []
+    private var commandIndex = 0
+    private var inFlight: Submission?
+    private var worker: Task<Void, Never>?
+    private var trackSelections: [Int: Selection] = [:]
+    private let submit: ([String]) -> MPVAsyncCommandReply
+    private let trackIDs: () -> [Int]
+    private let selectedTrackID: () -> Int
+    private let applySelection: (Int) -> Void
+    private let didChange: () -> Void
+
+    package init(
+        submit: @escaping ([String]) -> MPVAsyncCommandReply,
+        trackIDs: @escaping () -> [Int],
+        selectedTrackID: @escaping () -> Int,
+        applySelection: @escaping (Int) -> Void,
+        didChange: @escaping () -> Void
+    ) {
+        self.submit = submit
+        self.trackIDs = trackIDs
+        self.selectedTrackID = selectedTrackID
+        self.applySelection = applySelection
+        self.didChange = didChange
+    }
+
+    @discardableResult
+    package func beginGeneration() -> MPVAsyncCommandReply? {
+        generation &+= 1
+        ready = false
+        commands.removeAll()
+        commandIndex = 0
+        batches.removeAll()
+        trackSelections.removeAll()
+        selectionIntent = nil
+        let reply = inFlight?.reply
+        reply?.abort()
+        return reply?.isCompleted == false ? reply : nil
+    }
+
+    package func setReady() {
+        ready = true
+        reconcileSelection()
+        startWorkerIfNeeded()
+    }
+
+    package func enqueue(_ batch: Batch) {
+        guard !batch.urls.isEmpty else { return }
+        batches.append(batch)
+        if batch.selectFirst {
+            selectionIntent = SelectionIntent(batchID: batch.id, committed: selectionIntent?.committed)
+        }
+        commands.append(contentsOf: batch.urls.indices.map { Command(batch: batch, index: $0) })
+        startWorkerIfNeeded()
+    }
+
+    package func selection(forTrackID id: Int) -> Selection {
+        if let submission = inFlight, submission.generation == generation,
+           let stream = trackIDs().filter({ !submission.previousTrackIDs.contains($0) }).firstIndex(of: id) {
+            return .external(batch: submission.command.batch.id, index: submission.command.index, stream: stream)
+        }
+        if let selection = trackSelections[id] { return selection }
+        return .track(id)
+    }
+
+    package func select(_ selection: Selection) {
+        selectionIntent = SelectionIntent(batchID: nil, committed: selection)
+        reconcileSelection()
+    }
+
+    package func restoreSelectionIntent(_ intent: SelectionIntent?) {
+        selectionIntent = intent
+        reconcileSelection()
+    }
+
+    private func startWorkerIfNeeded() {
+        guard ready, worker == nil, commandIndex < commands.count else { return }
+        worker = Task { @MainActor [weak self] in
+            while let submission = self?.submitNext() {
+                let status = await submission.reply.value()
+                self?.finish(submission, status: status)
+            }
+            self?.worker = nil
+        }
+    }
+
+    private func submitNext() -> Submission? {
+        guard ready, commandIndex < commands.count else { return nil }
+        let command = commands[commandIndex]
+        commandIndex += 1
+        if let intent = selectionIntent, intent.committed == nil {
+            selectionIntent = SelectionIntent(
+                batchID: intent.batchID,
+                committed: selection(forTrackID: selectedTrackID())
+            )
+        }
+        let previousTrackIDs = Set(trackIDs())
+        let submission = Submission(
+            generation: generation,
+            command: command,
+            previousTrackIDs: previousTrackIDs,
+            reply: submit(command.arguments)
+        )
+        inFlight = submission
+        return submission
+    }
+
+    private func finish(_ submission: Submission, status: Int32) {
+        inFlight = nil
+        guard submission.generation == generation else { return }
+        let command = submission.command
+        if status >= 0 {
+            let addedIDs = trackIDs().filter { !submission.previousTrackIDs.contains($0) }
+            for (stream, id) in addedIDs.enumerated() {
+                trackSelections[id] = .external(batch: command.batch.id, index: command.index, stream: stream)
+            }
+            if command.index == 0,
+               command.batch.selectFirst,
+               selectionIntent?.batchID == command.batch.id,
+               let firstID = addedIDs.first {
+                selectionIntent = SelectionIntent(
+                    batchID: command.batch.id,
+                    committed: selection(forTrackID: firstID)
+                )
+            }
+        }
+        reconcileSelection()
+        if commandIndex == commands.count {
+            commands.removeAll(keepingCapacity: true)
+            commandIndex = 0
+        }
+        didChange()
+    }
+
+    private func reconcileSelection() {
+        guard ready, let selection = selectionIntent?.committed else { return }
+        switch selection {
+        case .track(let id):
+            applySelection(id)
+        case .external:
+            if let id = trackSelections.first(where: { $0.value == selection })?.key {
+                applySelection(id)
+            } else {
+                applySelection(-1)
+            }
+        }
+    }
+}
+
 /// A lock-backed handoff between a renderer's main-actor lifecycle and its serial render queue.
 /// Render work never reads actor-owned generation/teardown fields directly, which keeps stop/load
 /// invalidation deterministic even under Thread Sanitizer.

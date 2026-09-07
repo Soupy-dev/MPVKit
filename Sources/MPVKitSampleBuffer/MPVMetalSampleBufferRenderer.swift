@@ -263,6 +263,7 @@ private enum MPVMetalSampleBufferEvent: Sendable {
     case endFile(playlistEntryID: Int64)
     case propertyChange(String, value: MPVMetalObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
+    case commandReply(requestID: UInt64, error: Int32)
     case shutdown
 }
 
@@ -335,6 +336,8 @@ private func copyMPVMetalSampleBufferEvent(
         return trimmed.isEmpty
             ? nil
             : .logError(trimmed, playlistEntryID: activePlaylistEntryID)
+    case MPV_EVENT_COMMAND_REPLY:
+        return .commandReply(requestID: event.reply_userdata, error: event.error)
     case MPV_EVENT_SHUTDOWN:
         return .shutdown
     default:
@@ -345,8 +348,6 @@ private func copyMPVMetalSampleBufferEvent(
 private enum MPVMetalSampleBufferDeferredLoadAction {
     case videoTrack(String)
     case audioTrack(Int)
-    case subtitleTrack(Int)
-    case externalSubtitles(urls: [String], names: [String]?, selectFirst: Bool)
     case subtitleStyle(MPVMetalSampleBufferSubtitleStyle)
 }
 
@@ -719,6 +720,28 @@ public final class MPVMetalSampleBufferRenderer {
     private var loadIdentityTracker = MPVLoadIdentityTracker()
     private var deferredLoadActions = MPVGenerationDeferredActions<MPVMetalSampleBufferDeferredLoadAction>()
     private var isAwaitingCurrentFileLoaded = false
+    private var pendingLoadSubmission: Task<Void, Never>?
+    private var nextAsyncCommandRequestID: UInt64 = 0
+    private var pendingAsyncCommandReplies: [UInt64: MPVAsyncCommandReply] = [:]
+    private lazy var externalSubtitles = MPVExternalSubtitleQueue(
+        submit: { [weak self] args in
+            guard let self else {
+                let reply = MPVAsyncCommandReply()
+                reply.complete(-1)
+                return reply
+            }
+            return self.submitAsyncCommand(args)
+        },
+        trackIDs: { [weak self] in self?.subtitleTracks().map(\.id) ?? [] },
+        selectedTrackID: { [weak self] in self?.currentSubtitleTrackID() ?? -1 },
+        applySelection: { [weak self] id in self?.applySubtitleTrack(id) },
+        didChange: { [weak self] in
+            self?.requestPausedPresentationRefresh()
+            if let self {
+                self.onDiagnostics?(self.diagnosticsSnapshot())
+            }
+        }
+    )
     private var scheduledRenderWorkItem: DispatchWorkItem?
     private var demandScheduler = MPVFrameDemandScheduler()
     private var legacyPrimeBudget = MPVLegacyPrimeBudget(capacity: 2)
@@ -860,6 +883,10 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     deinit {
+        let replies = Array(pendingAsyncCommandReplies.values)
+        Task { @MainActor in
+            for reply in replies { reply.complete(-1) }
+        }
         emergencyCleanup.cleanup()
     }
 
@@ -949,6 +976,12 @@ public final class MPVMetalSampleBufferRenderer {
     public func stop() {
         guard !isStopping else { return }
         guard state != .stopped else { return }
+        _ = externalSubtitles.beginGeneration()
+        pendingLoadSubmission?.cancel()
+        pendingLoadSubmission = nil
+        let replies = Array(pendingAsyncCommandReplies.values)
+        pendingAsyncCommandReplies.removeAll()
+        for reply in replies { reply.complete(-1) }
         videoColorMetadataPublishWorkItem?.cancel()
         videoColorMetadataPublishWorkItem = nil
         guard mpv != nil || renderContext != nil else {
@@ -1169,7 +1202,10 @@ public final class MPVMetalSampleBufferRenderer {
         preservingDisplayedImage: Bool
     ) {
         performOnMain {
-            guard self.mpv != nil else { return }
+            guard self.mpv != nil, !self.isStopping else { return }
+            let subtitleBarrier = self.externalSubtitles.beginGeneration()
+            self.pendingLoadSubmission?.cancel()
+            self.pendingLoadSubmission = nil
             self.isFileLoaded = false
             self.pendingSeek = nil
             self.beginNewLoadGeneration(removingDisplayedImage: !preservingDisplayedImage)
@@ -1182,23 +1218,41 @@ public final class MPVMetalSampleBufferRenderer {
             self.cachedDuration = 0
             self.setDisplayLayerExtendedDynamicRange(enabled: false)
             self.updateState(.loading)
-            self.updateHTTPHeaders(headers)
-            let target = url.isFileURL ? url.path : url.absoluteString
-            let loadIdentity = self.loadIdentityTracker.submit(clientGeneration: self.loadGeneration)
-            let replacedPlaylistEntryID = self.currentPlaylistEntryID()
-            let status = self.command(["loadfile", target, "replace"])
-            if status < 0 {
-                self.loadIdentityTracker.cancel(loadIdentity)
-                self.deferredLoadActions.cancel()
-                self.isAwaitingCurrentFileLoaded = false
-                self.reportError("loadfile failed status=\(status)")
-            } else {
-                if let playlistEntryID = self.currentPlaylistEntryID(),
-                   playlistEntryID != replacedPlaylistEntryID {
-                    self.loadIdentityTracker.bind(playlistEntryID: playlistEntryID, to: loadIdentity)
+            let loadIdentity = self.loadIdentityTracker.reserve(clientGeneration: self.loadGeneration)
+            if let subtitleBarrier {
+                let engineGeneration = self.engineGeneration
+                self.pendingLoadSubmission = Task { @MainActor [weak self] in
+                    _ = await subtitleBarrier.value()
+                    guard let self,
+                          !Task.isCancelled,
+                          !self.isStopping,
+                          self.engineGeneration == engineGeneration,
+                          self.loadIdentityTracker.isLatest(loadIdentity) else { return }
+                    self.pendingLoadSubmission = nil
+                    self.submitLoad(url, headers: headers, identity: loadIdentity)
                 }
-                self.requestForcedFrames(count: 2)
+            } else {
+                self.submitLoad(url, headers: headers, identity: loadIdentity)
             }
+        }
+    }
+
+    private func submitLoad(_ url: URL, headers: [String: String]?, identity: MPVLoadIdentityTracker.Identity) {
+        guard loadIdentityTracker.submit(identity) else { return }
+        updateHTTPHeaders(headers)
+        let target = url.isFileURL ? url.path : url.absoluteString
+        let replacedPlaylistEntryID = currentPlaylistEntryID()
+        let status = command(["loadfile", target, "replace"])
+        if status < 0 {
+            loadIdentityTracker.cancel(identity)
+            deferredLoadActions.cancel()
+            isAwaitingCurrentFileLoaded = false
+            reportError("loadfile failed status=\(status)")
+        } else {
+            if let playlistEntryID = currentPlaylistEntryID(), playlistEntryID != replacedPlaylistEntryID {
+                loadIdentityTracker.bind(playlistEntryID: playlistEntryID, to: identity)
+            }
+            requestForcedFrames(count: 2)
         }
     }
 
@@ -1357,8 +1411,7 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     public func setSubtitleTrack(id: Int) {
-        guard !deferLoadActionIfNeeded(.subtitleTrack(id)) else { return }
-        applySubtitleTrack(id)
+        externalSubtitles.select(externalSubtitles.selection(forTrackID: id))
     }
 
     public func disableSubtitles() {
@@ -1366,10 +1419,15 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true) {
-        guard !deferLoadActionIfNeeded(
-            .externalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
-        ) else { return }
-        applyExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
+        enqueueExternalSubtitles(MPVExternalSubtitleQueue.Batch(urls: urls, names: names, selectFirst: selectFirst))
+    }
+
+    func enqueueExternalSubtitles(_ batch: MPVExternalSubtitleQueue.Batch) {
+        externalSubtitles.enqueue(batch)
+    }
+
+    func restoreSubtitleSelectionIntent(_ intent: MPVExternalSubtitleQueue.SelectionIntent?) {
+        externalSubtitles.restoreSelectionIntent(intent)
     }
 
     public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) {
@@ -1389,10 +1447,6 @@ public final class MPVMetalSampleBufferRenderer {
                 applyVideoTrackSelection(selection)
             case .audioTrack(let id):
                 applyAudioTrack(id)
-            case .subtitleTrack(let id):
-                applySubtitleTrack(id)
-            case .externalSubtitles(let urls, let names, let selectFirst):
-                applyExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
             case .subtitleStyle(let style):
                 applySubtitleStyleImmediately(style)
             }
@@ -1410,17 +1464,6 @@ public final class MPVMetalSampleBufferRenderer {
 
     private func applySubtitleTrack(_ id: Int) {
         setStringProperty("sid", id < 0 ? "no" : "\(id)")
-        requestPausedPresentationRefresh()
-    }
-
-    private func applyExternalSubtitles(urls: [String], names: [String]?, selectFirst: Bool) {
-        for (index, url) in urls.enumerated() {
-            var args = ["sub-add", url, index == 0 && selectFirst ? "select" : "auto"]
-            if let names, names.indices.contains(index) {
-                args.append(names[index])
-            }
-            _ = command(args)
-        }
         requestPausedPresentationRefresh()
     }
 
@@ -1446,6 +1489,35 @@ public final class MPVMetalSampleBufferRenderer {
             }
         }
         return mpv_command(handle, &cargs)
+    }
+
+    private func submitAsyncCommand(_ args: [String]) -> MPVAsyncCommandReply {
+        guard let handle = mpv, !isStopping, !args.isEmpty else {
+            let reply = MPVAsyncCommandReply()
+            reply.complete(-1)
+            return reply
+        }
+        nextAsyncCommandRequestID &+= 1
+        let requestID = nextAsyncCommandRequestID
+        let generation = engineGeneration
+        let reply = MPVAsyncCommandReply { [weak self] in
+            guard let self,
+                  self.engineGeneration == generation,
+                  self.pendingAsyncCommandReplies[requestID] != nil,
+                  let activeHandle = self.mpv else { return }
+            mpv_abort_async_command(activeHandle, requestID)
+        }
+        pendingAsyncCommandReplies[requestID] = reply
+        var cargs = args.map { UnsafePointer<CChar>(strdup($0)) }
+        cargs.append(nil)
+        let status = mpv_command_async(handle, requestID, &cargs)
+        for pointer in cargs where pointer != nil {
+            free(UnsafeMutablePointer(mutating: pointer))
+        }
+        if status < 0 {
+            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.complete(status)
+        }
+        return reply
     }
 
     public func diagnosticsSnapshot() -> MPVMetalSampleBufferRendererDiagnostics {
@@ -1813,13 +1885,12 @@ public final class MPVMetalSampleBufferRenderer {
             isAwaitingCurrentFileLoaded = false
             refreshVideoColorMetadataCoherently()
             applyDeferredLoadActions(generation: loadGeneration)
+            externalSubtitles.setReady()
             if let pending = pendingSeek {
                 self.pendingSeek = nil
                 requestTimelineDiscontinuity(removingDisplayedImage: false)
                 _ = command(["seek", "\(pending)", "absolute+exact"])
             }
-            // Do not let render work observe FILE_LOADED until generation-scoped tracks,
-            // subtitles, style, and the pending seek are synchronously installed on mpv.
             enqueueRenderWork { [weak self] in
                 guard let self,
                       self.renderLifecycleFence.accepts(loadGeneration: loadedGeneration) else { return }
@@ -1862,6 +1933,8 @@ public final class MPVMetalSampleBufferRenderer {
                 return
             }
             onError?(message)
+        case .commandReply(let requestID, let error):
+            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.complete(error)
         case .shutdown:
             stop()
         }
@@ -4009,6 +4082,8 @@ public final class MPVMetalSampleBufferRenderer {
         _ = names
         _ = selectFirst
     }
+    func enqueueExternalSubtitles(_ batch: MPVExternalSubtitleQueue.Batch) { _ = batch }
+    func restoreSubtitleSelectionIntent(_ intent: MPVExternalSubtitleQueue.SelectionIntent?) { _ = intent }
     public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) { _ = style }
     @discardableResult public func command(_ args: [String]) -> Int32 { _ = args; return -1 }
     public func diagnosticsSnapshot() -> MPVMetalSampleBufferRendererDiagnostics {

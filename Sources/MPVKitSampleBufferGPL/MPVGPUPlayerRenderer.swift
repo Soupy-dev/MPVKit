@@ -428,8 +428,6 @@ private func copyMPVGPUObservedPropertyValue(
 private enum MPVGPUPlayerDeferredLoadAction {
     case videoTrack(String)
     case audioTrack(Int)
-    case subtitleTrack(Int)
-    case externalSubtitles(urls: [String], names: [String]?, selectFirst: Bool)
     case subtitleStyle(MPVMetalSampleBufferSubtitleStyle)
     case videoFilterChain(String)
 }
@@ -2532,10 +2530,24 @@ public final class MPVGPUPlayerRenderer {
     private var mpv: OpaquePointer?
     private var currentURL: URL?
     private var currentHeaders: [String: String]?
-    private var externalSubtitleURLs: [String] = []
-    private var externalSubtitleNames: [String]?
-    private var shouldSelectFirstExternalSubtitle = true
-    private var selectedSubtitleTrackID: Int?
+    private var isCompatibilitySubtitleSessionLoaded = false
+    private lazy var externalSubtitles = MPVExternalSubtitleQueue(
+        submit: { [weak self] args in
+            guard let self else {
+                let reply = MPVAsyncCommandReply()
+                reply.complete(-1)
+                return reply
+            }
+            return self.submitPrimaryAsyncCommand(args)
+        },
+        trackIDs: { [weak self] in self?.subtitleTracks().map(\.id) ?? [] },
+        selectedTrackID: { [weak self] in self?.currentSubtitleTrackID() ?? -1 },
+        applySelection: { [weak self] id in self?.applySubtitleTrack(id) },
+        didChange: { [weak self] in
+            self?.requestPausedSingleSessionVisualRefresh()
+            self?.emitDiagnostics()
+        }
+    )
     private var subtitleStyle: MPVMetalSampleBufferSubtitleStyle?
     private var compatibilityVideoSelection = MPVCompatibilityVideoSelectionState()
     private var cachedPosition: Double = 0
@@ -2578,7 +2590,7 @@ public final class MPVGPUPlayerRenderer {
     private var foregroundVideoValidationTimeoutTask: Task<Void, Never>?
     private var foregroundVideoValidationContinuation: CheckedContinuation<Bool, Never>?
     private var nextAsyncCommandRequestID: UInt64 = 0
-    private var pendingAsyncCommandReplies: [UInt64: CheckedContinuation<Int32, Never>] = [:]
+    private var pendingAsyncCommandReplies: [UInt64: MPVAsyncCommandReply] = [:]
     private var isPictureInPicturePrepared = false
     private var isPictureInPictureActive = false
     private var pictureInPicturePreparationGeneration: UInt64 = 0
@@ -2711,7 +2723,9 @@ public final class MPVGPUPlayerRenderer {
         let earlierShutdown = pendingSingleSessionShutdown
         let pump = eventPump
         let compatibilityRenderer = pictureInPictureRendererStorage
+        let commandReplies = Array(pendingAsyncCommandReplies.values)
         Task { @MainActor in
+            for reply in commandReplies { reply.complete(-1) }
             sink?.stop()
             await earlierShutdown?.value
             if let sink { await sink.waitUntilStopped() }
@@ -3327,6 +3341,8 @@ public final class MPVGPUPlayerRenderer {
 
     public func stop() {
         if isStopping { return }
+        _ = externalSubtitles.beginGeneration()
+        isCompatibilitySubtitleSessionLoaded = false
         cancelForegroundVideoValidation()
         guard isRunning || mpv != nil || eventPump != nil else {
             if state != .stopped { updateState(.stopped) }
@@ -3420,6 +3436,8 @@ public final class MPVGPUPlayerRenderer {
                 return
             }
             self.cancelForegroundVideoValidation()
+            let subtitleBarrier = self.externalSubtitles.beginGeneration()
+            self.isCompatibilitySubtitleSessionLoaded = false
             let mustWaitForHardwareDecoderRecovery =
                 self.activeHardwareDecoderRecoveryTransitionID != nil
             self.hardwareDecoderRecoveryInvalidationGeneration &+= 1
@@ -3479,11 +3497,6 @@ public final class MPVGPUPlayerRenderer {
             self.nativePictureInPictureProbeGate.beginLoad(sequence: loadIdentity.sequence)
             self.pendingNativePictureInPictureProbePrimeCount = nil
             self.deferredPrimaryLoadActions.beginGeneration(loadIdentity.sequence)
-            // These are media-item identities, unlike subtitle appearance and video filters.
-            self.externalSubtitleURLs = []
-            self.externalSubtitleNames = nil
-            self.shouldSelectFirstExternalSubtitle = true
-            self.selectedSubtitleTrackID = nil
             if let subtitleStyle = self.subtitleStyle {
                 _ = self.deferredPrimaryLoadActions.append(
                     .subtitleStyle(subtitleStyle),
@@ -3498,10 +3511,13 @@ public final class MPVGPUPlayerRenderer {
             }
             self.updateState(.loading)
             let shutdown = self.pendingSingleSessionShutdown
-            if mustWaitForHardwareDecoderRecovery || shutdown != nil {
+            if mustWaitForHardwareDecoderRecovery || shutdown != nil || subtitleBarrier != nil {
                 self.isPrimaryLoadSubmissionPending = true
                 let engineGeneration = self.engineGeneration
                 let submission = Task { @MainActor [weak self] in
+                    if let subtitleBarrier {
+                        _ = await subtitleBarrier.value()
+                    }
                     if mustWaitForHardwareDecoderRecovery {
                         await self?.waitForHardwareDecoderRecoveryTransition()
                     }
@@ -4108,37 +4124,49 @@ public final class MPVGPUPlayerRenderer {
     }
 
     private func commandPrimaryAsync(_ args: [String]) async -> Int32 {
-        guard let handle = mpv, !args.isEmpty else { return -1 }
-        nextAsyncCommandRequestID &+= 1
-        let requestID = nextAsyncCommandRequestID
+        guard !Task.isCancelled else { return -1 }
+        let reply = submitPrimaryAsyncCommand(args)
         return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                pendingAsyncCommandReplies[requestID] = continuation
-                var cargs = args.map { UnsafePointer<CChar>(strdup($0)) }
-                cargs.append(nil)
-                let status = mpv_command_async(handle, requestID, &cargs)
-                for pointer in cargs where pointer != nil {
-                    free(UnsafeMutablePointer(mutating: pointer))
-                }
-                if status < 0 {
-                    pendingAsyncCommandReplies.removeValue(forKey: requestID)?.resume(returning: status)
-                }
-            }
+            await reply.value()
         } onCancel: {
-            Task { @MainActor [weak self] in
-                guard let self,
-                      self.pendingAsyncCommandReplies[requestID] != nil,
-                      let handle = self.mpv else { return }
-                mpv_abort_async_command(handle, requestID)
-            }
+            Task { @MainActor in reply.abort() }
         }
     }
 
+    private func submitPrimaryAsyncCommand(_ args: [String]) -> MPVAsyncCommandReply {
+        guard let handle = mpv, !isStopping, !args.isEmpty else {
+            let reply = MPVAsyncCommandReply()
+            reply.complete(-1)
+            return reply
+        }
+        nextAsyncCommandRequestID &+= 1
+        let requestID = nextAsyncCommandRequestID
+        let generation = engineGeneration
+        let reply = MPVAsyncCommandReply { [weak self] in
+            guard let self,
+                  self.engineGeneration == generation,
+                  self.pendingAsyncCommandReplies[requestID] != nil,
+                  let activeHandle = self.mpv else { return }
+            mpv_abort_async_command(activeHandle, requestID)
+        }
+        pendingAsyncCommandReplies[requestID] = reply
+        var cargs = args.map { UnsafePointer<CChar>(strdup($0)) }
+        cargs.append(nil)
+        let status = mpv_command_async(handle, requestID, &cargs)
+        for pointer in cargs where pointer != nil {
+            free(UnsafeMutablePointer(mutating: pointer))
+        }
+        if status < 0 {
+            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.complete(status)
+        }
+        return reply
+    }
+
     private func resumePendingAsyncCommandReplies(with status: Int32) {
-        let continuations = Array(pendingAsyncCommandReplies.values)
+        let replies = Array(pendingAsyncCommandReplies.values)
         pendingAsyncCommandReplies.removeAll(keepingCapacity: false)
-        for continuation in continuations {
-            continuation.resume(returning: status)
+        for reply in replies {
+            reply.complete(status)
         }
     }
 
@@ -4250,9 +4278,10 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func setSubtitleTrack(id: Int) {
-        selectedSubtitleTrackID = id
-        guard !deferPrimaryLoadActionIfNeeded(.subtitleTrack(id)) else { return }
-        applySubtitleTrack(id)
+        externalSubtitles.select(externalSubtitles.selection(forTrackID: id))
+        if isCompatibilitySubtitleSessionLoaded {
+            pictureInPictureRenderer.restoreSubtitleSelectionIntent(externalSubtitles.selectionIntent)
+        }
     }
 
     public func disableSubtitles() {
@@ -4260,13 +4289,11 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true) {
-        externalSubtitleURLs = urls
-        externalSubtitleNames = names
-        shouldSelectFirstExternalSubtitle = selectFirst
-        guard !deferPrimaryLoadActionIfNeeded(
-            .externalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
-        ) else { return }
-        applyExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
+        let batch = MPVExternalSubtitleQueue.Batch(urls: urls, names: names, selectFirst: selectFirst)
+        externalSubtitles.enqueue(batch)
+        if isCompatibilitySubtitleSessionLoaded {
+            pictureInPictureRenderer.enqueueExternalSubtitles(batch)
+        }
     }
 
     public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) {
@@ -4289,10 +4316,6 @@ public final class MPVGPUPlayerRenderer {
                 _ = applyVideoTrackSelection(selection)
             case .audioTrack(let id):
                 applyAudioTrack(id)
-            case .subtitleTrack(let id):
-                applySubtitleTrack(id)
-            case .externalSubtitles(let urls, let names, let selectFirst):
-                applyExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
             case .subtitleStyle(let style):
                 applySubtitleStyleImmediately(style)
             case .videoFilterChain(let chain):
@@ -4348,25 +4371,6 @@ public final class MPVGPUPlayerRenderer {
 
     private func applySubtitleTrack(_ id: Int) {
         setStringProperty("sid", id < 0 ? "no" : "\(id)")
-        if selectedPictureInPictureBackend == .compatibilityDualSession,
-           isPictureInPicturePrepared || isPictureInPictureActive {
-            pictureInPictureRenderer.setSubtitleTrack(id: id)
-        }
-        requestPausedSingleSessionVisualRefresh()
-    }
-
-    private func applyExternalSubtitles(urls: [String], names: [String]?, selectFirst: Bool) {
-        for (index, url) in urls.enumerated() {
-            var args = ["sub-add", url, index == 0 && selectFirst ? "select" : "auto"]
-            if let names, names.indices.contains(index) {
-                args.append(names[index])
-            }
-            _ = commandPrimary(args)
-        }
-        if selectedPictureInPictureBackend == .compatibilityDualSession,
-           isPictureInPicturePrepared || isPictureInPictureActive {
-            pictureInPictureRenderer.loadExternalSubtitles(urls: urls, names: names, selectFirst: selectFirst)
-        }
         requestPausedSingleSessionVisualRefresh()
     }
 
@@ -4702,20 +4706,11 @@ public final class MPVGPUPlayerRenderer {
         if position.isFinite, position > 0 {
             pictureInPictureRenderer.seek(to: position)
         }
-        if let selectedSubtitleTrackID {
-            if selectedSubtitleTrackID < 0 {
-                pictureInPictureRenderer.disableSubtitles()
-            } else {
-                pictureInPictureRenderer.setSubtitleTrack(id: selectedSubtitleTrackID)
-            }
+        isCompatibilitySubtitleSessionLoaded = true
+        for batch in externalSubtitles.batches {
+            pictureInPictureRenderer.enqueueExternalSubtitles(batch)
         }
-        if !externalSubtitleURLs.isEmpty {
-            pictureInPictureRenderer.loadExternalSubtitles(
-                urls: externalSubtitleURLs,
-                names: externalSubtitleNames,
-                selectFirst: shouldSelectFirstExternalSubtitle
-            )
-        }
+        pictureInPictureRenderer.restoreSubtitleSelectionIntent(externalSubtitles.selectionIntent)
         if let subtitleStyle {
             pictureInPictureRenderer.applySubtitleStyle(subtitleStyle)
         }
@@ -5585,6 +5580,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     private func observeCompatibilityRendererStop() {
+        isCompatibilitySubtitleSessionLoaded = false
         compatibilityRendererRequiresStopWait = true
         compatibilityStopGeneration &+= 1
         let stopGeneration = compatibilityStopGeneration
@@ -5929,6 +5925,7 @@ public final class MPVGPUPlayerRenderer {
                 _ = command(["seek", "\(pendingSeekAfterPrimaryLoadSubmission)", "absolute+exact"])
             }
             applyDeferredPrimaryLoadActions(identity: identity)
+            externalSubtitles.setReady()
             updateState(isBuffering ? .loading : (isPaused ? .paused : .playing))
             emitDiagnostics()
             notifyVideoReconfigure(generation: identity.clientGeneration)
@@ -5985,7 +5982,7 @@ public final class MPVGPUPlayerRenderer {
             }
             onInlineHitchDiagnostic?(message)
         case .commandReply(let requestID, let error):
-            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.resume(returning: error)
+            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.complete(error)
         case .shutdown:
             stop()
         }
