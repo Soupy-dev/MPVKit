@@ -76,5 +76,6 @@ xcrun --sdk iphoneos clang \
     "$worktree/video/out/apple_pip_metal.m"
 
 bash "$repository_root/Scripts/check-avfoundation-recovery.sh" "$worktree"
+bash "$repository_root/Scripts/check-subtitle-cache.sh" "$worktree"
 
 echo "All libmpv patches apply cleanly to mpv v0.41.0."

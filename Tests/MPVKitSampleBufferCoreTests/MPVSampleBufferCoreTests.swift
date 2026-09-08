@@ -50,18 +50,19 @@ final class MPVExternalSubtitleQueueTests: XCTestCase {
     }
 
     @MainActor
-    func testFIFOOriginalFlagsNamesDuplicatesAndFirstContainerTrack() async throws {
+    func testFIFONamesAndFirstContainerTrackSelectOnlyAfterReply() async throws {
         let harness = SubtitleQueueHarness()
-        let first = MPVExternalSubtitleQueue.Batch(urls: ["same", "same"], names: ["First"], selectFirst: true)
+        let first = MPVExternalSubtitleQueue.Batch(urls: ["first", "second"], names: ["First"], selectFirst: true)
         harness.queue.enqueue(first)
         XCTAssertTrue(harness.commands.isEmpty)
         harness.queue.setReady()
         try await waitUntil { harness.commands.count == 1 }
-        XCTAssertEqual(harness.commands[0], ["sub-add", "same", "select", "First"])
+        XCTAssertEqual(harness.commands[0], ["sub-add", "first", "auto", "First"])
         harness.finish(0, adding: [11, 9])
+        XCTAssertEqual(harness.selected, 2)
         try await waitUntil { harness.commands.count == 2 }
         XCTAssertEqual(harness.selected, 11)
-        XCTAssertEqual(harness.commands[1], ["sub-add", "same", "auto"])
+        XCTAssertEqual(harness.commands[1], ["sub-add", "second", "auto"])
         harness.finish(1, adding: [12])
         try await waitUntil { harness.changes == 2 }
         XCTAssertEqual(harness.selected, 11)
@@ -70,18 +71,19 @@ final class MPVExternalSubtitleQueueTests: XCTestCase {
         try await waitUntil { harness.commands.count == 3 }
         harness.finish(2, adding: [15])
         try await waitUntil { harness.changes == 3 }
-        XCTAssertEqual(harness.commands[2], ["sub-add", "later", "select", "Second"])
+        XCTAssertEqual(harness.commands[2], ["sub-add", "later", "auto", "Second"])
         XCTAssertEqual(harness.selected, 15)
     }
 
     @MainActor
-    func testManualOffWinsOverAnAlreadySubmittedSelectCommand() async throws {
+    func testManualOffWinsWithoutTransientSelectionFromAnAlreadySubmittedLoad() async throws {
         let harness = SubtitleQueueHarness()
         harness.queue.setReady()
         harness.queue.enqueue(.init(urls: ["slow"], names: nil, selectFirst: true))
         try await waitUntil { harness.commands.count == 1 }
         harness.queue.select(.track(-1))
         harness.finish(0, adding: [3])
+        XCTAssertEqual(harness.selected, -1)
         try await waitUntil { harness.changes == 1 }
         XCTAssertEqual(harness.selected, -1)
     }
@@ -183,7 +185,7 @@ final class MPVExternalSubtitleQueueTests: XCTestCase {
     func testPiPReplayUsesLogicalTrackIdentityAfterPartialFailure() async throws {
         let primary = SubtitleQueueHarness()
         primary.queue.setReady()
-        let batch = MPVExternalSubtitleQueue.Batch(urls: ["same", "same"], names: nil, selectFirst: true)
+        let batch = MPVExternalSubtitleQueue.Batch(urls: ["first", "second"], names: nil, selectFirst: true)
         primary.queue.enqueue(batch)
         try await waitUntil { primary.commands.count == 1 }
         primary.finish(0, adding: [3])
@@ -305,7 +307,8 @@ final class MPVExternalSubtitleQueueTests: XCTestCase {
     func testReusedNativeIDGetsNewLogicalIdentityBeforeReply() async throws {
         let harness = SubtitleQueueHarness()
         harness.queue.setReady()
-        harness.queue.enqueue(.init(urls: ["old"], names: nil, selectFirst: true))
+        let old = MPVExternalSubtitleQueue.Batch(urls: ["old"], names: nil, selectFirst: true)
+        harness.queue.enqueue(old)
         try await waitUntil { harness.commands.count == 1 }
         harness.finish(0, adding: [3])
         try await waitUntil { harness.changes == 1 }
@@ -320,6 +323,126 @@ final class MPVExternalSubtitleQueueTests: XCTestCase {
         )
         harness.finish(1)
         try await waitUntil { harness.changes == 2 }
+        harness.queue.select(.external(batch: old.id, index: 0, stream: 0))
+        XCTAssertEqual(harness.selected, -1)
+        harness.queue.enqueue(.init(urls: ["old"], names: nil, selectFirst: true))
+        try await waitUntil { harness.commands.count == 3 }
+        harness.finish(2, adding: [4])
+        try await waitUntil { harness.changes == 3 }
+        XCTAssertEqual(harness.selected, 4)
+    }
+
+    @MainActor
+    func testRepeatedURLReusesLoadedTracksAndKeepsFirstTitle() async throws {
+        let harness = SubtitleQueueHarness()
+        harness.queue.setReady()
+        let batch = MPVExternalSubtitleQueue.Batch(urls: ["same", "same"], names: ["First", "Duplicate"], selectFirst: true)
+        harness.queue.enqueue(batch)
+        try await waitUntil { harness.commands.count == 1 }
+        harness.finish(0, adding: [3, 4])
+        try await waitUntil { harness.changes == 2 }
+        XCTAssertEqual(harness.commands, [["sub-add", "same", "auto", "First"]])
+        XCTAssertEqual(harness.selected, 3)
+        harness.queue.select(.external(batch: batch.id, index: 1, stream: 1))
+        XCTAssertEqual(harness.selected, 4)
+        harness.queue.select(.track(1))
+        harness.queue.enqueue(.init(urls: ["same"], names: ["Reselected"], selectFirst: true))
+        XCTAssertEqual(harness.selected, 3)
+        try await waitUntil { harness.changes == 3 }
+        XCTAssertEqual(harness.commands.count, 1)
+        XCTAssertEqual(harness.queue.batches.count, 2)
+    }
+
+    @MainActor
+    func testCachedSelectionAndEmbeddedChoiceDoNotWaitForAnotherNetworkReply() async throws {
+        let harness = SubtitleQueueHarness()
+        harness.queue.setReady()
+        harness.queue.enqueue(.init(urls: ["cached"], names: nil, selectFirst: true))
+        try await waitUntil { harness.commands.count == 1 }
+        harness.finish(0, adding: [3])
+        try await waitUntil { harness.changes == 1 }
+        harness.queue.enqueue(.init(urls: ["stalled"], names: nil, selectFirst: true))
+        try await waitUntil { harness.commands.count == 2 }
+        harness.queue.select(.track(1))
+        XCTAssertEqual(harness.selected, 1)
+        harness.queue.enqueue(.init(urls: ["cached"], names: nil, selectFirst: true))
+        XCTAssertEqual(harness.selected, 3)
+        XCTAssertFalse(harness.replies[1].isCompleted)
+        XCTAssertEqual(harness.aborts, 0)
+        harness.finish(1, adding: [4])
+        XCTAssertEqual(harness.selected, 3)
+        try await waitUntil { harness.changes == 3 }
+        XCTAssertEqual(harness.selected, 3)
+        XCTAssertEqual(harness.commands.count, 2)
+    }
+
+    @MainActor
+    func testFailedURLIsRetriedAndExactURLStringsRemainDistinct() async throws {
+        let harness = SubtitleQueueHarness()
+        harness.queue.setReady()
+        let urls = ["https://example.invalid/Sub.srt?token=A", "https://example.invalid/Sub.srt?token=A", "https://example.invalid/sub.srt?token=A", "https://example.invalid/Sub.srt?token=B"]
+        harness.queue.enqueue(.init(urls: urls, names: nil, selectFirst: true))
+        try await waitUntil { harness.commands.count == 1 }
+        harness.finish(0, status: -1)
+        try await waitUntil { harness.commands.count == 2 }
+        harness.finish(1, adding: [3])
+        try await waitUntil { harness.commands.count == 3 }
+        harness.finish(2, adding: [4])
+        try await waitUntil { harness.commands.count == 4 }
+        harness.finish(3, adding: [5])
+        try await waitUntil { harness.changes == 4 }
+        XCTAssertEqual(harness.commands.map { $0[1] }, urls)
+        XCTAssertEqual(harness.selected, 2)
+    }
+
+    @MainActor
+    func testRemovedTracksAndGenerationChangesInvalidateReuse() async throws {
+        let harness = SubtitleQueueHarness()
+        harness.queue.setReady()
+        harness.queue.enqueue(.init(urls: ["same"], names: nil, selectFirst: true))
+        try await waitUntil { harness.commands.count == 1 }
+        harness.finish(0, adding: [3, 4])
+        try await waitUntil { harness.changes == 1 }
+        harness.tracks.removeAll { $0 == 4 }
+        harness.queue.enqueue(.init(urls: ["same"], names: nil, selectFirst: true))
+        try await waitUntil { harness.commands.count == 2 }
+        harness.finish(1, adding: [5, 6])
+        try await waitUntil { harness.changes == 2 }
+        XCTAssertEqual(harness.selected, 5)
+        _ = harness.queue.beginGeneration()
+        harness.tracks = [1, 2]
+        harness.queue.enqueue(.init(urls: ["same"], names: nil, selectFirst: true))
+        harness.queue.setReady()
+        try await waitUntil { harness.commands.count == 3 }
+        harness.finish(2, adding: [3, 4])
+        try await waitUntil { harness.changes == 3 }
+        XCTAssertEqual(harness.selected, 3)
+    }
+
+    @MainActor
+    func testDuplicateReplayRecoversLogicalSelectionAfterFirstLoadFails() async throws {
+        let primary = SubtitleQueueHarness()
+        primary.queue.setReady()
+        let first = MPVExternalSubtitleQueue.Batch(urls: ["same"], names: nil, selectFirst: true)
+        let duplicate = MPVExternalSubtitleQueue.Batch(urls: ["same"], names: nil, selectFirst: false)
+        primary.queue.enqueue(first)
+        primary.queue.enqueue(duplicate)
+        try await waitUntil { primary.commands.count == 1 }
+        primary.finish(0, adding: [3, 4])
+        try await waitUntil { primary.changes == 2 }
+        primary.queue.select(primary.queue.selection(forTrackID: 4))
+        let compatibility = SubtitleQueueHarness()
+        for batch in primary.queue.batches { compatibility.queue.enqueue(batch) }
+        compatibility.queue.restoreSelectionIntent(primary.queue.selectionIntent)
+        compatibility.queue.setReady()
+        try await waitUntil { compatibility.commands.count == 1 }
+        compatibility.finish(0, status: -1)
+        try await waitUntil { compatibility.commands.count == 2 }
+        compatibility.finish(1, adding: [8, 9])
+        try await waitUntil { compatibility.changes == 2 }
+        XCTAssertEqual(primary.commands.count, 1)
+        XCTAssertEqual(primary.selected, 4)
+        XCTAssertEqual(compatibility.selected, 9)
     }
 }
 

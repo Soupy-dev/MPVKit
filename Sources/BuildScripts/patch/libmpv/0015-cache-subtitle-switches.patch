@@ -1,0 +1,573 @@
+diff --git a/demux/demux.c b/demux/demux.c
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -150,6 +150,10 @@
+     .get_sub_options = get_demux_sub_opts,
+ };
+ 
++#define SUBTITLE_CACHE_MAX_BYTES (4 * 1024 * 1024)
++#define SUBTITLE_CACHE_MAX_PACKETS 8192
++#define SUBTITLE_CACHE_MAX_TRACKS 32
++
+ struct demux_internal {
+     struct mp_log *log;
+     struct mpv_global *global;
+@@ -227,6 +231,17 @@
+     bool need_back_seek;        // back-step seek needs to be triggered
+     bool back_any_need_recheck; // at least 1 ds->back_need_recheck set
+ 
++    struct demux_packet *subtitle_cache_head;
++    struct demux_packet *subtitle_cache_tail;
++    size_t subtitle_cache_bytes;
++    int subtitle_cache_packets;
++    int subtitle_cache_tracks;
++    uint64_t subtitle_cache_generation;
++    double subtitle_cache_start;
++    double subtitle_cache_end;
++    bool subtitle_cache_enabled;
++    bool subtitle_cache_replaying;
++
+     bool tracks_switched;       // thread needs to inform demuxer of this
+ 
+     bool seeking;               // there's a seek queued
+@@ -370,6 +385,9 @@
+     void *wakeup_cb_ctx;
+ 
+     // demuxer state
++    bool subtitle_cache_eligible;
++    bool subtitle_cache_valid;
++    double subtitle_cache_pruned;
+     bool selected;          // user wants packets from this stream
+     bool eager;             // try to keep at least 1 packet queued
+                             // if false, this stream is disabled, or passively
+@@ -455,6 +473,93 @@
+ static void prune_old_packets(struct demux_internal *in);
+ static void dumper_close(struct demux_internal *in);
+ static void demux_convert_tags_charset(struct demuxer *demuxer);
++
++static bool subtitle_cache_codec(const char *codec)
++{
++    return codec && (!strcmp(codec, "ass") || !strcmp(codec, "ssa") ||
++                     !strcmp(codec, "subrip") || !strcmp(codec, "webvtt") ||
++                     !strcmp(codec, "mov_text") || !strcmp(codec, "text"));
++}
++
++static size_t subtitle_cache_packet_size(struct demux_packet *dp)
++{
++    size_t size = demux_packet_estimate_total_size(dp);
++    if (dp->avpacket && dp->avpacket->buf && dp->avpacket->buf->size > dp->len)
++        size += dp->avpacket->buf->size - dp->len;
++    return size;
++}
++
++static void remove_subtitle_cache_head(struct demux_internal *in)
++{
++    struct demux_packet *dp = in->subtitle_cache_head;
++    struct demux_stream *ds = in->streams[dp->stream]->ds;
++    ds->subtitle_cache_pruned = MP_PTS_MAX(ds->subtitle_cache_pruned,
++                                         dp->pts + dp->duration);
++    in->subtitle_cache_bytes -= subtitle_cache_packet_size(dp);
++    in->subtitle_cache_packets--;
++    in->subtitle_cache_head = dp->next;
++    if (!in->subtitle_cache_head)
++        in->subtitle_cache_tail = NULL;
++    demux_packet_pool_push(in->packet_pool, dp);
++}
++
++static void clear_subtitle_cache(struct demux_internal *in, bool from_start)
++{
++    in->subtitle_cache_generation++;
++    while (in->subtitle_cache_head)
++        remove_subtitle_cache_head(in);
++    in->subtitle_cache_start = from_start ? -DBL_MAX : MP_NOPTS_VALUE;
++    in->subtitle_cache_end = MP_NOPTS_VALUE;
++    for (int n = 0; n < in->num_streams; n++) {
++        struct demux_stream *ds = in->streams[n]->ds;
++        ds->subtitle_cache_pruned = MP_NOPTS_VALUE;
++        ds->subtitle_cache_valid = true;
++    }
++}
++
++static void cache_subtitle_packet(struct demux_stream *ds, struct demux_packet *dp)
++{
++    struct demux_internal *in = ds->in;
++    if (!in->subtitle_cache_enabled || in->subtitle_cache_start == MP_NOPTS_VALUE ||
++        in->subtitle_cache_replaying || in->seeking || in->back_demuxing)
++        return;
++    if (dp->segmented) {
++        clear_subtitle_cache(in, false);
++        return;
++    }
++    if (ds->type != STREAM_SUB && ds->selected) {
++        double ts = MP_PTS_OR_DEF(dp->dts, dp->pts);
++        if (ts != MP_NOPTS_VALUE && isfinite(ts))
++            in->subtitle_cache_end = MP_PTS_MAX(in->subtitle_cache_end, ts);
++        return;
++    }
++    if (!ds->subtitle_cache_eligible || !ds->subtitle_cache_valid)
++        return;
++    size_t size = subtitle_cache_packet_size(dp);
++    if (dp->pts == MP_NOPTS_VALUE || !isfinite(dp->pts) ||
++        !isfinite(dp->duration) || dp->duration < 0 ||
++        !isfinite(dp->pts + dp->duration) || size > SUBTITLE_CACHE_MAX_BYTES)
++    {
++        ds->subtitle_cache_valid = false;
++        return;
++    }
++    while (in->subtitle_cache_head &&
++           (in->subtitle_cache_packets >= SUBTITLE_CACHE_MAX_PACKETS ||
++            in->subtitle_cache_bytes > SUBTITLE_CACHE_MAX_BYTES - size))
++        remove_subtitle_cache_head(in);
++    struct demux_packet *copy = demux_copy_packet(in->packet_pool, dp);
++    if (!copy) {
++        ds->subtitle_cache_valid = false;
++        return;
++    }
++    if (in->subtitle_cache_tail)
++        in->subtitle_cache_tail->next = copy;
++    else
++        in->subtitle_cache_head = copy;
++    in->subtitle_cache_tail = copy;
++    in->subtitle_cache_bytes += size;
++    in->subtitle_cache_packets++;
++}
+ 
+ static uint64_t get_forward_buffered_bytes(struct demux_stream *ds)
+ {
+@@ -900,6 +1005,22 @@
+         }
+     }
+ 
++    if (ds->type != STREAM_SUB)
++        in->subtitle_cache_generation++;
++    if (ds->type != STREAM_SUB &&
++        (in->subtitle_cache_end != MP_NOPTS_VALUE ||
++         (in->subtitle_cache_start != MP_NOPTS_VALUE &&
++          in->subtitle_cache_start != -DBL_MAX)))
++        clear_subtitle_cache(in, false);
++
++    bool cache_enabled = any_av_streams && in->can_cache &&
++        !in->d_thread->ts_resets_possible &&
++        (in->d_thread->desc == &demuxer_desc_matroska ||
++         in->d_thread->desc == &demuxer_desc_lavf);
++    if (in->subtitle_cache_enabled && !cache_enabled)
++        clear_subtitle_cache(in, false);
++    in->subtitle_cache_enabled = cache_enabled;
++
+     if (!any_streams)
+         in->blocked = false;
+ 
+@@ -992,6 +1113,14 @@
+ 
+     if (!sh->codec->codec)
+         sh->codec->codec = "";
++
++    ds->subtitle_cache_eligible = sh->type == STREAM_SUB &&
++        subtitle_cache_codec(sh->codec->codec) &&
++        in->subtitle_cache_tracks < SUBTITLE_CACHE_MAX_TRACKS;
++    if (ds->subtitle_cache_eligible)
++        in->subtitle_cache_tracks++;
++    ds->subtitle_cache_valid = in->subtitle_cache_end == MP_NOPTS_VALUE;
++    ds->subtitle_cache_pruned = MP_NOPTS_VALUE;
+ 
+     if (sh->ff_index < 0)
+         sh->ff_index = sh->index;
+@@ -2007,6 +2136,8 @@
+     mp_assert(!dp->next);
+ 
+     struct demux_internal *in = ds->in;
++
++    cache_subtitle_packet(ds, dp);
+ 
+     in->after_seek = false;
+     in->after_seek_to_start = false;
+@@ -2435,6 +2566,9 @@
+     in->after_seek_to_start =
+         !(flags & (SEEK_FORWARD | SEEK_FACTOR)) &&
+         pts <= in->d_thread->start_time;
++
++    clear_subtitle_cache(in, in->after_seek_to_start);
++    in->tracks_switched = true;
+ 
+     for (int n = 0; n < in->num_streams; n++)
+         in->streams[n]->ds->queue->last_pos_fixup = -1;
+@@ -3365,6 +3499,8 @@
+         .highest_av_pts = MP_NOPTS_VALUE,
+         .seeking_in_progress = MP_NOPTS_VALUE,
+         .demux_ts = MP_NOPTS_VALUE,
++        .subtitle_cache_start = -DBL_MAX,
++        .subtitle_cache_end = MP_NOPTS_VALUE,
+         .owns_stream = !params->external_stream,
+     };
+     mp_mutex_init(&in->lock);
+@@ -3577,6 +3713,7 @@
+ 
+     mp_mutex_lock(&in->lock);
+     clear_reader_state(in, true);
++    clear_subtitle_cache(in, false);
+     for (int n = 0; n < in->num_ranges; n++)
+         clear_cached_range(in, in->ranges[n]);
+     free_empty_cached_ranges(in);
+@@ -4025,11 +4162,65 @@
+ }
+ 
+ // Called locked.
++static bool restore_cached_subtitles(struct demux_stream *ds, double ref_pts)
++{
++    struct demux_internal *in = ds->in;
++    double refresh_pts = ref_pts;
++    for (int n = 0; n < in->num_streams; n++) {
++        struct demux_stream *other = in->streams[n]->ds;
++        if (other->selected && other->type != STREAM_SUB)
++            refresh_pts = MP_PTS_MIN(refresh_pts, other->base_ts);
++    }
++    if (!ds->subtitle_cache_eligible || !ds->subtitle_cache_valid || ds->refreshing ||
++        !in->subtitle_cache_enabled || in->subtitle_cache_start == MP_NOPTS_VALUE ||
++        in->back_demuxing || in->seeking || ref_pts == MP_NOPTS_VALUE ||
++        !isfinite(ref_pts) || in->subtitle_cache_end == MP_NOPTS_VALUE ||
++        in->subtitle_cache_start > refresh_pts || in->subtitle_cache_end < ref_pts ||
++        (ds->subtitle_cache_pruned != MP_NOPTS_VALUE &&
++         ds->subtitle_cache_pruned >= ref_pts))
++        return false;
++    struct demux_packet *head = NULL;
++    struct demux_packet *tail = NULL;
++    for (struct demux_packet *dp = in->subtitle_cache_head; dp; dp = dp->next) {
++        if (dp->stream != ds->index || dp->pts + dp->duration < ref_pts)
++            continue;
++        struct demux_packet *copy = demux_copy_packet(in->packet_pool, dp);
++        if (!copy) {
++            demux_packet_pool_prepend(in->packet_pool, head, tail);
++            return false;
++        }
++        if (tail)
++            tail->next = copy;
++        else
++            head = copy;
++        tail = copy;
++    }
++    ds_clear_reader_queue_state(ds);
++    clear_queue(ds->queue);
++    double demux_ts = in->demux_ts;
++    bool eof = in->eof;
++    in->subtitle_cache_replaying = true;
++    while (head) {
++        struct demux_packet *dp = head;
++        head = dp->next;
++        dp->next = NULL;
++        add_packet_locked(ds->sh, dp);
++    }
++    in->subtitle_cache_replaying = false;
++    in->demux_ts = demux_ts;
++    in->eof = eof;
++    MP_VERBOSE(in, "restored cached subtitle track %d without seeking\n", ds->index);
++    return true;
++}
++
+ static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
+                           double ref_pts)
+ {
+     struct demux_stream *ds = stream->ds;
+     ref_pts = MP_ADD_PTS(ref_pts, -in->ts_offset);
++
++    if (restore_cached_subtitles(ds, ref_pts))
++        return;
+ 
+     if (in->back_demuxing)
+         ds->back_seek_pos = ref_pts;
+@@ -4112,6 +4303,62 @@
+     r = stream->ds->selected;
+     mp_mutex_unlock(&stream->ds->in->lock);
+     return r;
++}
++
++uint64_t demux_subtitle_cache_generation(struct demuxer *demuxer)
++{
++    struct demux_internal *in = demuxer->in;
++    mp_mutex_lock(&in->lock);
++    uint64_t generation = in->subtitle_cache_generation;
++    mp_mutex_unlock(&in->lock);
++    return generation;
++}
++
++void demux_set_subtitle_cache_start(struct demuxer *demuxer, double pts,
++                                    uint64_t generation)
++{
++    struct demux_internal *in = demuxer->in;
++    mp_mutex_lock(&in->lock);
++    if (generation == in->subtitle_cache_generation &&
++        in->subtitle_cache_enabled && !in->back_demuxing && isfinite(pts))
++        in->subtitle_cache_start = pts;
++    mp_mutex_unlock(&in->lock);
++}
++
++void demux_disable_subtitle_cache(struct sh_stream *stream)
++{
++    struct demux_internal *in = stream->ds->in;
++    mp_mutex_lock(&in->lock);
++    stream->ds->subtitle_cache_valid = false;
++    mp_mutex_unlock(&in->lock);
++}
++
++bool demux_stream_can_cache_subtitles(struct sh_stream *stream)
++{
++    if (!stream)
++        return false;
++    struct demux_stream *ds = stream->ds;
++    struct demux_internal *in = ds->in;
++    mp_mutex_lock(&in->lock);
++    bool available = ds->subtitle_cache_eligible && ds->subtitle_cache_valid &&
++                     in->subtitle_cache_enabled && !in->back_demuxing;
++    mp_mutex_unlock(&in->lock);
++    return available;
++}
++
++bool demux_stream_should_read(struct sh_stream *stream)
++{
++    if (!stream)
++        return false;
++    struct demux_stream *ds = stream->ds;
++    struct demux_internal *in = ds->in;
++    mp_mutex_lock(&in->lock);
++    bool read = ds->selected ||
++        (ds->subtitle_cache_eligible && ds->subtitle_cache_valid &&
++         in->subtitle_cache_enabled && in->subtitle_cache_start != MP_NOPTS_VALUE &&
++         !in->back_demuxing);
++    mp_mutex_unlock(&in->lock);
++    return read;
+ }
+ 
+ void demux_set_stream_wakeup_cb(struct sh_stream *sh,
+diff --git a/demux/demux.h b/demux/demux.h
+--- a/demux/demux.h
++++ b/demux/demux.h
+@@ -297,6 +297,12 @@
+ int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
+                                   struct demux_packet **out_pkt);
+ bool demux_stream_is_selected(struct sh_stream *stream);
++bool demux_stream_can_cache_subtitles(struct sh_stream *stream);
++bool demux_stream_should_read(struct sh_stream *stream);
++uint64_t demux_subtitle_cache_generation(struct demuxer *demuxer);
++void demux_set_subtitle_cache_start(struct demuxer *demuxer, double pts,
++                                    uint64_t generation);
++void demux_disable_subtitle_cache(struct sh_stream *stream);
+ void demux_set_stream_wakeup_cb(struct sh_stream *sh,
+                                 void (*cb)(void *ctx), void *ctx);
+ struct demux_packet *demux_read_any_packet(struct demuxer *demuxer);
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -594,7 +594,7 @@
+     for (int n = start; n < priv->num_streams; n++) {
+         struct sh_stream *stream = priv->streams[n]->sh;
+         AVStream *st = priv->avfc->streams[n];
+-        bool selected = stream && demux_stream_is_selected(stream) &&
++        bool selected = stream && demux_stream_should_read(stream) &&
+                         !stream->attached_picture;
+         st->discard = selected ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+     }
+@@ -1243,7 +1243,7 @@
+     struct sh_stream *stream = info->sh;
+     AVStream *st = priv->avfc->streams[pkt->stream_index];
+ 
+-    if (!demux_stream_is_selected(stream)) {
++    if (!demux_stream_should_read(stream)) {
+         av_packet_free(&pkt);
+         return true; // don't signal EOF if skipping a packet
+     }
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -215,6 +215,7 @@
+     int v_skip_to_keyframe, a_skip_to_keyframe;
+     int a_skip_preroll;
+     int subtitle_preroll;
++    int subtitle_cache_preroll;
+ 
+     bool index_has_durations;
+ 
+@@ -3020,7 +3021,7 @@
+     struct sh_stream *stream = track->stream;
+     bool use_this_block = tc >= mkv_d->skip_to_timecode;
+ 
+-    if (!demux_stream_is_selected(stream))
++    if (!demux_stream_should_read(stream))
+         return 0;
+ 
+     current_pts = tc / 1e9 - track->codec_delay;
+@@ -3038,17 +3039,19 @@
+         if (mkv_d->a_skip_to_keyframe)
+             use_this_block &= keyframe;
+     } else if (track->type == MATROSKA_TRACK_SUBTITLE) {
+-        if (!use_this_block && mkv_d->subtitle_preroll) {
++        if (!use_this_block) {
++            bool selected = demux_stream_is_selected(stream);
++            int *preroll = selected ? &mkv_d->subtitle_preroll
++                                    : &mkv_d->subtitle_cache_preroll;
+             int64_t end_time = block_info->timecode + block_info->duration;
+             if (!block_info->duration)
+                 end_time = INT64_MAX;
+-            use_this_block = end_time > mkv_d->skip_to_timecode;
+-            if (use_this_block) {
+-                if (mkv_d->subtitle_preroll) {
+-                    mkv_d->subtitle_preroll--;
++            if (end_time > mkv_d->skip_to_timecode) {
++                if (*preroll) {
++                    (*preroll)--;
++                    use_this_block = true;
+                 } else {
+-                    // This could overflow the demuxer queue.
+-                    use_this_block = 0;
++                    demux_disable_subtitle_cache(stream);
+                 }
+             }
+         }
+@@ -3056,6 +3059,7 @@
+             if (block_info->num_laces > 1) {
+                 MP_WARN(demuxer, "Subtitles use Matroska "
+                        "lacing. This is abnormal and not supported.\n");
++                demux_disable_subtitle_cache(stream);
+                 use_this_block = 0;
+             }
+         }
+@@ -3073,8 +3077,10 @@
+ 
+             bstr block = {data->data, data->size};
+             bstr nblock = demux_mkv_decode(demuxer->log, track, block, 1);
+-            if (!nblock.len)
++            if (!nblock.len) {
++                demux_disable_subtitle_cache(stream);
+                 break;
++            }
+ 
+             if (block.start != nblock.start || block.len != nblock.len) {
+                 // (avoidable copy of the entire data)
+@@ -3082,8 +3088,10 @@
+             } else {
+                 dp = new_demux_packet_from_buf(demuxer->packet_pool, data);
+             }
+-            if (!dp)
++            if (!dp) {
++                demux_disable_subtitle_cache(stream);
+                 break;
++            }
+ 
+             dp->pos = filepos;
+             /* If default_duration is 0, assume no pts value is known
+@@ -3393,10 +3401,12 @@
+ }
+ 
+ static struct mkv_index *seek_with_cues(struct demuxer *demuxer, int seek_id,
+-                                        int64_t target_timecode, int flags)
++                                        int64_t target_timecode, int flags,
++                                        bool *seek_succeeded)
+ {
+     struct mkv_demuxer *mkv_d = demuxer->priv;
+     struct mkv_index *index = NULL;
++    *seek_succeeded = false;
+ 
+     int64_t min_diff = INT64_MIN;
+     for (size_t i = 0; i < mkv_d->num_indexes; i++) {
+@@ -3461,9 +3471,45 @@
+         }
+ 
+         mkv_d->cluster_end = 0;
+-        stream_seek(demuxer->stream, seek_pos);
++        *seek_succeeded = stream_seek(demuxer->stream, seek_pos);
+     }
+     return index;
++}
++
++static double subtitle_cache_seek_start(struct mkv_demuxer *mkv_d,
++                                         struct mkv_index *index, int seek_id)
++{
++    if (!mkv_d->index_complete || !index || seek_id < 0 ||
++        index->tnum != seek_id || index->timecode < 0 || !mkv_d->tc_scale)
++        return MP_NOPTS_VALUE;
++    double secs = mkv_d->opts->subtitle_preroll_secs;
++    if (mkv_d->index_has_durations)
++        secs = MPMAX(secs, mkv_d->opts->subtitle_preroll_secs_index);
++    double pre_f = secs * 1e9 / mkv_d->tc_scale;
++    if (!isfinite(pre_f) || pre_f < 0 || pre_f >= (double)INT64_MAX)
++        return MP_NOPTS_VALUE;
++    int64_t pre = pre_f;
++    int64_t last_tc = -1;
++    uint64_t last_pos = 0;
++    int64_t first_tc = -1;
++    bool found_index = false;
++    for (size_t n = 0; n < mkv_d->num_indexes; n++) {
++        struct mkv_index *cur = &mkv_d->indexes[n];
++        if (cur->tnum != seek_id)
++            continue;
++        if (cur->timecode < 0 || cur->timecode < last_tc || cur->filepos < last_pos)
++            return MP_NOPTS_VALUE;
++        last_tc = cur->timecode;
++        last_pos = cur->filepos;
++        found_index |= cur == index;
++        if (first_tc < 0 && cur->timecode >= index->timecode &&
++            cur->timecode - index->timecode >= pre)
++            first_tc = cur->timecode;
++    }
++    if (!found_index || first_tc < 0)
++        return MP_NOPTS_VALUE;
++    double pts = first_tc * (double)mkv_d->tc_scale / 1e9 + 1.0;
++    return isfinite(pts) ? pts : MP_NOPTS_VALUE;
+ }
+ 
+ static void demux_mkv_seek(demuxer_t *demuxer, double seek_pts, int flags)
+@@ -3473,9 +3519,12 @@
+     uint64_t v_tnum = -1;
+     uint64_t a_tnum = -1;
+     bool st_active[STREAM_TYPE_COUNT] = {0};
++    bool cache_subtitles = false;
++    uint64_t cache_generation = demux_subtitle_cache_generation(demuxer);
+     mkv_seek_reset(demuxer);
+     for (int i = 0; i < mkv_d->num_tracks; i++) {
+         mkv_track_t *track = mkv_d->tracks[i];
++        cache_subtitles |= demux_stream_can_cache_subtitles(track->stream);
+         if (demux_stream_is_selected(track->stream)) {
+             st_active[track->stream->type] = true;
+             if (track->type == MATROSKA_TRACK_VIDEO)
+@@ -3486,6 +3535,7 @@
+     }
+ 
+     mkv_d->subtitle_preroll = NUM_SUB_PREROLL_PACKETS;
++    mkv_d->subtitle_cache_preroll = NUM_SUB_PREROLL_PACKETS;
+     int preroll_opt = mkv_d->opts->subtitle_preroll;
+     if (preroll_opt == 1 || (preroll_opt == 2 && mkv_d->index_has_durations))
+         flags |= SEEK_HR;
+@@ -3498,19 +3548,32 @@
+ 
+     if (!(flags & SEEK_FACTOR)) {       /* time in secs */
+         mkv_index_t *index = NULL;
++        bool seek_succeeded = false;
+ 
+         seek_pts = MPMAX(seek_pts, 0);
+         int64_t target_timecode = seek_pts * 1e9 + 0.5;
+ 
++        int seek_id = st_active[STREAM_VIDEO] ? v_tnum : a_tnum;
+         if (create_index_until(demuxer, target_timecode) >= 0) {
+-            int seek_id = st_active[STREAM_VIDEO] ? v_tnum : a_tnum;
+-            index = seek_with_cues(demuxer, seek_id, target_timecode, flags);
++            index = seek_with_cues(demuxer, seek_id, target_timecode, flags,
++                                   &seek_succeeded);
+             if (!index)
+-                index = seek_with_cues(demuxer, -1, target_timecode, flags);
++                index = seek_with_cues(demuxer, -1, target_timecode, flags,
++                                       &seek_succeeded);
+         }
+ 
+         if (!index)
+             stream_seek(demuxer->stream, old_pos);
++        if (seek_succeeded && !(flags & SEEK_FORWARD)) {
++            double cache_start = MP_NOPTS_VALUE;
++            if (flags & SEEK_HR) {
++                cache_start = seek_pts + 1.0;
++            } else if (cache_subtitles && seek_pts > demuxer->start_time) {
++                cache_start = subtitle_cache_seek_start(mkv_d, index, seek_id);
++            }
++            if (cache_start != MP_NOPTS_VALUE)
++                demux_set_subtitle_cache_start(demuxer, cache_start, cache_generation);
++        }
+ 
+         if (flags & SEEK_FORWARD) {
+             mkv_d->skip_to_timecode = target_timecode;

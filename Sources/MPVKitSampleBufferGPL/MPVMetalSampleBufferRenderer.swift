@@ -723,6 +723,8 @@ public final class MPVMetalSampleBufferRenderer {
     private var pendingLoadSubmission: Task<Void, Never>?
     private var nextAsyncCommandRequestID: UInt64 = 0
     private var pendingAsyncCommandReplies: [UInt64: MPVAsyncCommandReply] = [:]
+    private var currentSubtitleMediaURL: URL?
+    private var currentSubtitleMediaHeaders: [String: String]?
     private lazy var externalSubtitles = MPVExternalSubtitleQueue(
         submit: { [weak self] args in
             guard let self else {
@@ -740,7 +742,8 @@ public final class MPVMetalSampleBufferRenderer {
             if let self {
                 self.onDiagnostics?(self.diagnosticsSnapshot())
             }
-        }
+        },
+        preparation: MPVExternalSubtitlePreparation()
     )
     private var scheduledRenderWorkItem: DispatchWorkItem?
     private var demandScheduler = MPVFrameDemandScheduler()
@@ -1204,6 +1207,8 @@ public final class MPVMetalSampleBufferRenderer {
         performOnMain {
             guard self.mpv != nil, !self.isStopping else { return }
             let subtitleBarrier = self.externalSubtitles.beginGeneration()
+            self.currentSubtitleMediaURL = url
+            self.currentSubtitleMediaHeaders = headers
             self.pendingLoadSubmission?.cancel()
             self.pendingLoadSubmission = nil
             self.isFileLoaded = false
@@ -1418,8 +1423,11 @@ public final class MPVMetalSampleBufferRenderer {
         setSubtitleTrack(id: -1)
     }
 
-    public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true) {
-        enqueueExternalSubtitles(MPVExternalSubtitleQueue.Batch(urls: urls, names: names, selectFirst: selectFirst))
+    public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true,
+                                      headersByURL: [String: [String: String]]? = nil) {
+        let requests = externalSubtitleRequests(urls: urls, headersByURL: headersByURL)
+        let batch = MPVExternalSubtitleQueue.Batch(urls: urls, names: names, selectFirst: selectFirst, requests: requests)
+        enqueueExternalSubtitles(batch)
     }
 
     func enqueueExternalSubtitles(_ batch: MPVExternalSubtitleQueue.Batch) {
@@ -1428,6 +1436,30 @@ public final class MPVMetalSampleBufferRenderer {
 
     func restoreSubtitleSelectionIntent(_ intent: MPVExternalSubtitleQueue.SelectionIntent?) {
         externalSubtitles.restoreSelectionIntent(intent)
+    }
+
+    public func prefetchExternalSubtitles(urls: [String], headersByURL: [String: [String: String]]? = nil,
+                                          allowsCellularAccess: Bool = false) {
+        externalSubtitles.prefetch(externalSubtitleRequests(urls: Array(urls.prefix(4)), headersByURL: headersByURL)
+            .map { .init(request: $0, allowsCellularAccess: allowsCellularAccess) })
+    }
+
+    public func currentExternalSubtitleURL() -> String? {
+        externalSubtitles.currentExternalSubtitleURL()
+    }
+
+    private func externalSubtitleRequests(urls: [String], headersByURL: [String: [String: String]]?)
+        -> [MPVExternalSubtitleRequest] {
+        let unsupported = ["cookies-file", "http-proxy", "tls-ca-file", "tls-cert-file", "tls-key-file", "stream-lavf-o"]
+            .contains { !(getStringProperty($0) ?? "").isEmpty }
+            || getStringProperty("cookies") == "yes"
+        let userAgent = getStringProperty("user-agent")
+        let referrer = getStringProperty("referrer")
+        return urls.map {
+            .make(url: $0, headersByURL: headersByURL, mediaURL: currentSubtitleMediaURL,
+                  mediaHeaders: currentSubtitleMediaHeaders, userAgent: userAgent, referrer: referrer,
+                  permitsPreparation: !unsupported)
+        }
     }
 
     public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) {
@@ -4077,11 +4109,21 @@ public final class MPVMetalSampleBufferRenderer {
     public func setAudioTrack(id: Int) { _ = id }
     public func setSubtitleTrack(id: Int) { _ = id }
     public func disableSubtitles() {}
-    public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true) {
+    public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true,
+                                      headersByURL: [String: [String: String]]? = nil) {
         _ = urls
         _ = names
         _ = selectFirst
+        _ = headersByURL
     }
+    public func prefetchExternalSubtitles(urls: [String], headersByURL: [String: [String: String]]? = nil,
+                                          allowsCellularAccess: Bool = false) {
+        _ = urls
+        _ = headersByURL
+        _ = allowsCellularAccess
+    }
+    public func currentExternalSubtitleURL() -> String? { nil }
+
     func enqueueExternalSubtitles(_ batch: MPVExternalSubtitleQueue.Batch) { _ = batch }
     func restoreSubtitleSelectionIntent(_ intent: MPVExternalSubtitleQueue.SelectionIntent?) { _ = intent }
     public func applySubtitleStyle(_ style: MPVMetalSampleBufferSubtitleStyle) { _ = style }

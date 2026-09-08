@@ -43,12 +43,22 @@ package final class MPVExternalSubtitleQueue {
         package let urls: [String]
         package let names: [String]?
         package let selectFirst: Bool
+        package let requests: [MPVExternalSubtitleRequest]
+        package var assets: [MPVExternalSubtitleRequest: MPVPreparedExternalSubtitle] = [:]
+        package var preparationSource: MPVExternalSubtitlePreparation.Source?
 
-        package init(urls: [String], names: [String]?, selectFirst: Bool) {
+        package static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.id == rhs.id && lhs.urls == rhs.urls && lhs.names == rhs.names
+                && lhs.selectFirst == rhs.selectFirst && lhs.requests == rhs.requests
+        }
+
+        package init(urls: [String], names: [String]?, selectFirst: Bool,
+                     requests: [MPVExternalSubtitleRequest]? = nil) {
             id = UUID()
             self.urls = urls
             self.names = names
             self.selectFirst = selectFirst
+            self.requests = requests?.count == urls.count ? requests ?? [] : urls.map { .init(url: $0) }
         }
     }
 
@@ -66,8 +76,10 @@ package final class MPVExternalSubtitleQueue {
         let batch: Batch
         let index: Int
 
-        var arguments: [String] {
-            var result = ["sub-add", batch.urls[index], index == 0 && batch.selectFirst ? "select" : "auto"]
+        var request: MPVExternalSubtitleRequest { batch.requests[index] }
+
+        func arguments(nativeURL: String) -> [String] {
+            var result = ["sub-add", nativeURL, "auto"]
             if let names = batch.names, names.indices.contains(index) {
                 result.append(names[index])
             }
@@ -79,18 +91,32 @@ package final class MPVExternalSubtitleQueue {
         let generation: UInt64
         let command: Command
         let previousTrackIDs: Set<Int>
+        let reusedTrackIDs: [Int]?
+        let asset: MPVPreparedExternalSubtitle?
         let reply: MPVAsyncCommandReply
     }
 
-    package private(set) var batches: [Batch] = []
+    private var storedBatches: [Batch] = []
+    package var batches: [Batch] {
+        storedBatches.map { batch in
+            var snapshot = batch
+            snapshot.preparationSource = preparation?.source()
+            for request in batch.requests {
+                if let asset = preparation?.prepared(request) { snapshot.assets[request] = asset }
+            }
+            return snapshot
+        }
+    }
     package private(set) var selectionIntent: SelectionIntent?
     private var generation: UInt64 = 0
     private var ready = false
     private var commands: [Command] = []
-    private var commandIndex = 0
     private var inFlight: Submission?
     private var worker: Task<Void, Never>?
     private var trackSelections: [Int: Selection] = [:]
+    private var loadedTrackIDsByURL: [MPVExternalSubtitleRequest: [Int]] = [:]
+    private let preparation: MPVExternalSubtitlePreparation?
+    private var prefetchCandidates: [MPVExternalSubtitlePreparation.Candidate] = []
     private let submit: ([String]) -> MPVAsyncCommandReply
     private let trackIDs: () -> [Int]
     private let selectedTrackID: () -> Int
@@ -102,13 +128,16 @@ package final class MPVExternalSubtitleQueue {
         trackIDs: @escaping () -> [Int],
         selectedTrackID: @escaping () -> Int,
         applySelection: @escaping (Int) -> Void,
-        didChange: @escaping () -> Void
+        didChange: @escaping () -> Void,
+        preparation: MPVExternalSubtitlePreparation? = nil
     ) {
         self.submit = submit
         self.trackIDs = trackIDs
         self.selectedTrackID = selectedTrackID
         self.applySelection = applySelection
         self.didChange = didChange
+        self.preparation = preparation
+        preparation?.didPrepare = { [weak self] in self?.startWorkerIfNeeded() }
     }
 
     @discardableResult
@@ -116,9 +145,11 @@ package final class MPVExternalSubtitleQueue {
         generation &+= 1
         ready = false
         commands.removeAll()
-        commandIndex = 0
-        batches.removeAll()
+        storedBatches.removeAll()
+        prefetchCandidates.removeAll()
+        preparation?.reset()
         trackSelections.removeAll()
+        loadedTrackIDsByURL.removeAll()
         selectionIntent = nil
         let reply = inFlight?.reply
         reply?.abort()
@@ -133,12 +164,46 @@ package final class MPVExternalSubtitleQueue {
 
     package func enqueue(_ batch: Batch) {
         guard !batch.urls.isEmpty else { return }
-        batches.append(batch)
+        var storedBatch = batch
+        storedBatch.assets = [:]
+        storedBatch.preparationSource = nil
+        storedBatches.append(storedBatch)
+        preparation?.seed(batch.assets, source: batch.preparationSource, requests: batch.requests)
+        preparation?.retry(batch.requests)
         if batch.selectFirst {
-            selectionIntent = SelectionIntent(batchID: batch.id, committed: selectionIntent?.committed)
+            let cached = ready && loadedTrackIDs(for: batch.requests[0], availableIDs: Set(trackIDs())) != nil
+            selectionIntent = SelectionIntent(
+                batchID: batch.id,
+                committed: cached ? .external(batch: batch.id, index: 0, stream: 0) : selectionIntent?.committed
+            )
+            if cached { reconcileSelection() }
         }
-        commands.append(contentsOf: batch.urls.indices.map { Command(batch: batch, index: $0) })
+        commands.append(contentsOf: batch.urls.indices.map { Command(batch: storedBatch, index: $0) })
+        updatePreparationPlan()
         startWorkerIfNeeded()
+    }
+
+    package func prefetch(_ candidates: [MPVExternalSubtitlePreparation.Candidate]) {
+        prefetchCandidates = Array(candidates.prefix(4))
+        updatePreparationPlan()
+    }
+
+    private func updatePreparationPlan() {
+        let availableIDs = ready ? Set(trackIDs()) : []
+        let pending = commands.filter { loadedTrackIDs(for: $0.request, availableIDs: availableIDs) == nil }
+        let wanted = pending.first { $0.batch.id == selectionIntent?.batchID && $0.index == 0 }
+        let foreground = wanted.map { MPVExternalSubtitlePreparation.Candidate(request: $0.request, allowsCellularAccess: true, allowsConstrainedNetworkAccess: true) }
+        let background = pending.map { MPVExternalSubtitlePreparation.Candidate(request: $0.request, allowsCellularAccess: true, allowsConstrainedNetworkAccess: true) }
+        preparation?.setPlan(foreground: foreground, background: background + prefetchCandidates)
+    }
+
+    package func currentExternalSubtitleURL() -> String? {
+        let id = selectedTrackID()
+        guard id >= 0, trackIDs().contains(id),
+              case .external(let batchID, let index, _) = selection(forTrackID: id),
+              let batch = storedBatches.first(where: { $0.id == batchID }),
+              batch.urls.indices.contains(index) else { return nil }
+        return batch.urls[index]
     }
 
     package func selection(forTrackID id: Int) -> Selection {
@@ -152,16 +217,18 @@ package final class MPVExternalSubtitleQueue {
 
     package func select(_ selection: Selection) {
         selectionIntent = SelectionIntent(batchID: nil, committed: selection)
+        updatePreparationPlan()
         reconcileSelection()
     }
 
     package func restoreSelectionIntent(_ intent: SelectionIntent?) {
         selectionIntent = intent
+        updatePreparationPlan()
         reconcileSelection()
     }
 
     private func startWorkerIfNeeded() {
-        guard ready, worker == nil, commandIndex < commands.count else { return }
+        guard ready, worker == nil, !commands.isEmpty else { return }
         worker = Task { @MainActor [weak self] in
             while let submission = self?.submitNext() {
                 let status = await submission.reply.value()
@@ -172,23 +239,48 @@ package final class MPVExternalSubtitleQueue {
     }
 
     private func submitNext() -> Submission? {
-        guard ready, commandIndex < commands.count else { return nil }
-        let command = commands[commandIndex]
-        commandIndex += 1
+        guard ready, !commands.isEmpty else { return nil }
+        var index = 0
+        if let preparation,
+           let foreground = commands.firstIndex(where: { $0.batch.id == selectionIntent?.batchID && $0.index == 0 }),
+           preparation.prepared(commands[foreground].request) != nil || preparation.failed(commands[foreground].request) {
+            index = foreground
+        }
+        let command = commands[index]
+        let asset = preparation?.prepared(command.request)
+        let preparationFailed = preparation?.failed(command.request) == true
+        let availableIDs = Set(trackIDs())
+        let reused = loadedTrackIDs(for: command.request, availableIDs: availableIDs)
+        guard preparation == nil || asset != nil || preparationFailed || reused != nil else { return nil }
+        commands.remove(at: index)
         if let intent = selectionIntent, intent.committed == nil {
             selectionIntent = SelectionIntent(
                 batchID: intent.batchID,
                 committed: selection(forTrackID: selectedTrackID())
             )
         }
-        let previousTrackIDs = Set(trackIDs())
+        let previousTrackIDs = availableIDs
+        let reusedTrackIDs = reused
+        let reply: MPVAsyncCommandReply
+        if reusedTrackIDs != nil {
+            reply = MPVAsyncCommandReply()
+            reply.complete(0)
+        } else if preparationFailed {
+            reply = MPVAsyncCommandReply()
+            reply.complete(-1)
+        } else {
+            reply = submit(command.arguments(nativeURL: asset?.nativeURL ?? command.request.url))
+        }
         let submission = Submission(
             generation: generation,
             command: command,
             previousTrackIDs: previousTrackIDs,
-            reply: submit(command.arguments)
+            reusedTrackIDs: reusedTrackIDs,
+            asset: asset,
+            reply: reply
         )
         inFlight = submission
+        updatePreparationPlan()
         return submission
     }
 
@@ -197,25 +289,30 @@ package final class MPVExternalSubtitleQueue {
         guard submission.generation == generation else { return }
         let command = submission.command
         if status >= 0 {
-            let addedIDs = trackIDs().filter { !submission.previousTrackIDs.contains($0) }
-            for (stream, id) in addedIDs.enumerated() {
-                trackSelections[id] = .external(batch: command.batch.id, index: command.index, stream: stream)
+            let addedIDs = submission.reusedTrackIDs
+                ?? trackIDs().filter { !submission.previousTrackIDs.contains($0) }
+            if submission.reusedTrackIDs == nil, !addedIDs.isEmpty {
+                if addedIDs.contains(where: { trackSelections[$0] != nil }) {
+                    let reusedIDs = Set(addedIDs)
+                    loadedTrackIDsByURL = loadedTrackIDsByURL.filter { $0.value.allSatisfy { !reusedIDs.contains($0) } }
+                }
+                loadedTrackIDsByURL[command.request] = addedIDs
+                for (stream, id) in addedIDs.enumerated() {
+                    trackSelections[id] = .external(batch: command.batch.id, index: command.index, stream: stream)
+                }
             }
             if command.index == 0,
                command.batch.selectFirst,
                selectionIntent?.batchID == command.batch.id,
-               let firstID = addedIDs.first {
+               !addedIDs.isEmpty {
                 selectionIntent = SelectionIntent(
                     batchID: command.batch.id,
-                    committed: selection(forTrackID: firstID)
+                    committed: .external(batch: command.batch.id, index: command.index, stream: 0)
                 )
             }
         }
         reconcileSelection()
-        if commandIndex == commands.count {
-            commands.removeAll(keepingCapacity: true)
-            commandIndex = 0
-        }
+        updatePreparationPlan()
         didChange()
     }
 
@@ -224,13 +321,24 @@ package final class MPVExternalSubtitleQueue {
         switch selection {
         case .track(let id):
             applySelection(id)
-        case .external:
-            if let id = trackSelections.first(where: { $0.value == selection })?.key {
+        case .external(let batchID, let index, let stream):
+            if let batch = storedBatches.first(where: { $0.id == batchID }),
+               batch.urls.indices.contains(index),
+               let ids = loadedTrackIDs(for: batch.requests[index], availableIDs: Set(trackIDs())),
+               ids.indices.contains(stream) {
+                let id = ids[stream]
                 applySelection(id)
             } else {
                 applySelection(-1)
             }
         }
+    }
+
+    private func loadedTrackIDs(for url: MPVExternalSubtitleRequest, availableIDs: Set<Int>) -> [Int]? {
+        guard let ids = loadedTrackIDsByURL[url],
+              !ids.isEmpty,
+              ids.allSatisfy(availableIDs.contains) else { return nil }
+        return ids
     }
 }
 
