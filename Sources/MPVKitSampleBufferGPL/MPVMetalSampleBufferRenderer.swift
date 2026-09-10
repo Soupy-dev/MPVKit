@@ -120,6 +120,8 @@ public struct MPVMetalSampleBufferTrack: Equatable, Sendable {
     public let title: String
     public let language: String
     public let codec: String
+    public let audioChannelLayout: String
+    public let audioChannelCount: Int
     public let selected: Bool
 }
 
@@ -129,19 +131,31 @@ public struct MPVMetalSampleBufferSubtitleStyle: @unchecked Sendable {
     public var strokeWidth: CGFloat
     public var fontSize: CGFloat
     public var isVisible: Bool
+    public var position: CGFloat?
+    public var verticalMargin: CGFloat?
+    public var assOverride: String?
+    public var captionBackground: Bool?
 
     public init(
         foregroundColor: CGColor,
         strokeColor: CGColor,
         strokeWidth: CGFloat,
         fontSize: CGFloat,
-        isVisible: Bool
+        isVisible: Bool,
+        position: CGFloat? = nil,
+        verticalMargin: CGFloat? = nil,
+        assOverride: String? = nil,
+        captionBackground: Bool? = nil
     ) {
         self.foregroundColor = foregroundColor
         self.strokeColor = strokeColor
         self.strokeWidth = strokeWidth
         self.fontSize = fontSize
         self.isVisible = isVisible
+        self.position = position
+        self.verticalMargin = verticalMargin
+        self.assOverride = assOverride
+        self.captionBackground = captionBackground
     }
 }
 
@@ -746,6 +760,7 @@ public final class MPVMetalSampleBufferRenderer {
         preparation: MPVExternalSubtitlePreparation()
     )
     private var scheduledRenderWorkItem: DispatchWorkItem?
+    private var scheduledRenderToken: UInt64 = 0
     private var demandScheduler = MPVFrameDemandScheduler()
     private var legacyPrimeBudget = MPVLegacyPrimeBudget(capacity: 2)
     private var poolExhaustionDropCount = 0
@@ -1507,6 +1522,23 @@ public final class MPVMetalSampleBufferRenderer {
         setStringProperty("sub-border-size", "\(strokeWidth)")
         setStringProperty("sub-color", mpvColorString(style.foregroundColor))
         setStringProperty("sub-border-color", mpvColorString(style.strokeColor))
+        if let position = style.position, position.isFinite {
+            setStringProperty("sub-pos", "\(max(0, min(position, 100)))")
+        }
+        if let margin = style.verticalMargin, margin.isFinite {
+            let pixels = Int(max(0, min(margin, 720)).rounded())
+            setStringProperty("sub-margin-y", "\(pixels)")
+            setStringProperty("sub-ass-style-overrides", margin < 34 ? "MarginV=\(pixels)" : "")
+        }
+        if let assOverride = style.assOverride,
+           ["no", "yes", "scale", "force", "strip"].contains(assOverride) {
+            setStringProperty("sub-ass-override", assOverride)
+        }
+        if let captionBackground = style.captionBackground {
+            setStringProperty("sub-border-style", captionBackground ? "background-box" : "outline-and-shadow")
+            setStringProperty("sub-back-color", captionBackground ? "0.0/0.0/0.0/0.75" : "0.0/0.0/0.0/0.0")
+            setStringProperty("sub-shadow-offset", "0")
+        }
         requestPausedPresentationRefresh()
     }
 
@@ -2243,12 +2275,13 @@ public final class MPVMetalSampleBufferRenderer {
             0,
             demandScheduler.lastWorkTime + interval - ProcessInfo.processInfo.systemUptime
         )
-        var workItem: DispatchWorkItem!
-        workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            if self.scheduledRenderWorkItem === workItem {
-                self.scheduledRenderWorkItem = nil
-            }
+        scheduledRenderToken &+= 1
+        let token = scheduledRenderToken
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.scheduledRenderToken == token,
+                  self.scheduledRenderWorkItem != nil else { return }
+            self.scheduledRenderWorkItem = nil
             self.processRenderDemand(
                 engineGeneration: engineGeneration,
                 loadGeneration: loadGeneration
@@ -3985,6 +4018,8 @@ public final class MPVMetalSampleBufferRenderer {
             var title = ""
             var lang = ""
             var codec = ""
+            var audioChannelLayout = ""
+            var audioChannelCount = 0
             var selected = false
             for entryIndex in 0..<Int(map.pointee.num) {
                 guard let keyPointer = map.pointee.keys[entryIndex] else { continue }
@@ -4001,6 +4036,10 @@ public final class MPVMetalSampleBufferRenderer {
                     if value.format == MPV_FORMAT_STRING, let string = value.u.string { lang = String(cString: string) }
                 case "codec":
                     if value.format == MPV_FORMAT_STRING, let string = value.u.string { codec = String(cString: string) }
+                case "demux-channels":
+                    if value.format == MPV_FORMAT_STRING, let string = value.u.string { audioChannelLayout = String(cString: string) }
+                case "demux-channel-count":
+                    if value.format == MPV_FORMAT_INT64 { audioChannelCount = Int(clamping: value.u.int64) }
                 case "selected":
                     if value.format == MPV_FORMAT_FLAG { selected = value.u.flag != 0 }
                 default:
@@ -4014,6 +4053,8 @@ public final class MPVMetalSampleBufferRenderer {
                 title: title.isEmpty ? "Track \(id)" : title,
                 language: lang,
                 codec: codec,
+                audioChannelLayout: audioChannelLayout,
+                audioChannelCount: audioChannelCount,
                 selected: selected
             ))
         }
@@ -4021,8 +4062,9 @@ public final class MPVMetalSampleBufferRenderer {
     }
 
     private func mpvColorString(_ color: CGColor) -> String {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return "#FFFFFFFF" }
         let converted = color.converted(
-            to: CGColorSpace(name: CGColorSpace.sRGB)!,
+            to: colorSpace,
             intent: .defaultIntent,
             options: nil
         ) ?? color
@@ -4033,10 +4075,10 @@ public final class MPVMetalSampleBufferRenderer {
         let alpha = components.indices.contains(3) ? components[3] : 1
         return String(
             format: "#%02X%02X%02X%02X",
+            Int(max(0, min(1, alpha)) * 255),
             Int(max(0, min(1, red)) * 255),
             Int(max(0, min(1, green)) * 255),
-            Int(max(0, min(1, blue)) * 255),
-            Int(max(0, min(1, alpha)) * 255)
+            Int(max(0, min(1, blue)) * 255)
         )
     }
 

@@ -945,6 +945,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
     private var pendingResizeSize: CGSize?
     private var resizeTask: Task<Void, Never>?
+    private var isEndingPictureInPicture = false
     private var nativeReconfigurationInProgress = false
     private var targetPreparationInProgress = false
     private var sampleConstructionInProgress = false
@@ -1054,6 +1055,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
             throw MPVApplePictureInPictureSinkError.nativeCall("prepare", -5)
         }
         activeGeneration = generation
+        isEndingPictureInPicture = false
         advanceNativeGeneration()
         timelineEpoch &+= 1
         currentMode = Self.modeWarmup
@@ -1108,19 +1110,30 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
     }
 
     func begin() throws {
-        guard activeGeneration != nil else {
+        guard activeGeneration != nil, !isEndingPictureInPicture else {
             throw MPVApplePictureInPictureSinkError.stopped
         }
-        let status = api.setMode(handle, Self.modeOffscreen, nativeGeneration)
-        guard status == 0 else {
-            throw MPVApplePictureInPictureSinkError.nativeCall("set offscreen mode", status)
+        if !nativeReconfigurationInProgress {
+            let status = api.setMode(handle, Self.modeOffscreen, nativeGeneration)
+            guard status == 0 else {
+                throw MPVApplePictureInPictureSinkError.nativeCall("set offscreen mode", status)
+            }
         }
         currentMode = Self.modeOffscreen
         refillTargetsIfPossible()
     }
 
     func end(restoringInlinePlayback: Bool) async -> Bool {
-        guard activeGeneration != nil else { return !restoringInlinePlayback }
+        guard let generation = activeGeneration, !isEndingPictureInPicture else {
+            return !restoringInlinePlayback
+        }
+        let operationGeneration = stopOperationGeneration
+        isEndingPictureInPicture = true
+        pendingResizeSize = nil
+        await resizeTask?.value
+        guard activeGeneration == generation,
+              stopOperationGeneration == operationGeneration,
+              !isStopInProgress else { return !restoringInlinePlayback }
         currentMode = restoringInlinePlayback ? Self.modeRestore : Self.modeInline
         advanceNativeGeneration()
         let restoreGeneration = nativeGeneration
@@ -1151,6 +1164,7 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
 
     func updateRenderSize(_ size: CGSize) {
         guard activeGeneration != nil,
+              !isEndingPictureInPicture,
               size.width.isFinite,
               size.height.isFinite,
               size.width > 1,
@@ -1401,7 +1415,6 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
         }
         let operationGeneration = stopOperationGeneration
         pendingResizeSize = nil
-        let mode = currentMode
         let retiringPool = pixelBufferPool
         do {
             // Allocate the replacement generation immediately. The old pool remains retained by
@@ -1472,14 +1485,13 @@ private final class MPVApplePictureInPictureSink: MPVSingleSessionPictureInPictu
 
         do {
             try installCallback()
-            let status = api.setMode(handle, mode, nativeGeneration)
+            let status = api.setMode(handle, currentMode, nativeGeneration)
             guard status == 0 else {
                 throw MPVApplePictureInPictureSinkError.nativeCall(
                     "restore mode after resize",
                     status
                 )
             }
-            currentMode = mode
             nativeReconfigurationInProgress = false
             resizeTask = nil
             forceNextTargetSubmission = true
@@ -4409,6 +4421,23 @@ public final class MPVGPUPlayerRenderer {
         setStringProperty("sub-border-size", "\(strokeWidth)")
         setStringProperty("sub-color", mpvColorString(style.foregroundColor))
         setStringProperty("sub-border-color", mpvColorString(style.strokeColor))
+        if let position = style.position, position.isFinite {
+            setStringProperty("sub-pos", "\(max(0, min(position, 100)))")
+        }
+        if let margin = style.verticalMargin, margin.isFinite {
+            let pixels = Int(max(0, min(margin, 720)).rounded())
+            setStringProperty("sub-margin-y", "\(pixels)")
+            setStringProperty("sub-ass-style-overrides", margin < 34 ? "MarginV=\(pixels)" : "")
+        }
+        if let assOverride = style.assOverride,
+           ["no", "yes", "scale", "force", "strip"].contains(assOverride) {
+            setStringProperty("sub-ass-override", assOverride)
+        }
+        if let captionBackground = style.captionBackground {
+            setStringProperty("sub-border-style", captionBackground ? "background-box" : "outline-and-shadow")
+            setStringProperty("sub-back-color", captionBackground ? "0.0/0.0/0.0/0.75" : "0.0/0.0/0.0/0.0")
+            setStringProperty("sub-shadow-offset", "0")
+        }
         if selectedPictureInPictureBackend == .compatibilityDualSession,
            isPictureInPicturePrepared || isPictureInPictureActive {
             pictureInPictureRenderer.applySubtitleStyle(style)
@@ -6252,6 +6281,8 @@ public final class MPVGPUPlayerRenderer {
             var title = ""
             var lang = ""
             var codec = ""
+            var audioChannelLayout = ""
+            var audioChannelCount = 0
             var selected = false
             for entryIndex in 0..<Int(map.pointee.num) {
                 guard let keyPointer = map.pointee.keys[entryIndex] else { continue }
@@ -6268,6 +6299,10 @@ public final class MPVGPUPlayerRenderer {
                     if value.format == MPV_FORMAT_STRING, let string = value.u.string { lang = String(cString: string) }
                 case "codec":
                     if value.format == MPV_FORMAT_STRING, let string = value.u.string { codec = String(cString: string) }
+                case "demux-channels":
+                    if value.format == MPV_FORMAT_STRING, let string = value.u.string { audioChannelLayout = String(cString: string) }
+                case "demux-channel-count":
+                    if value.format == MPV_FORMAT_INT64 { audioChannelCount = Int(clamping: value.u.int64) }
                 case "selected":
                     if value.format == MPV_FORMAT_FLAG { selected = value.u.flag != 0 }
                 default:
@@ -6281,6 +6316,8 @@ public final class MPVGPUPlayerRenderer {
                 title: title.isEmpty ? "Track \(id)" : title,
                 language: lang,
                 codec: codec,
+                audioChannelLayout: audioChannelLayout,
+                audioChannelCount: audioChannelCount,
                 selected: selected
             ))
         }
@@ -6377,8 +6414,9 @@ public final class MPVGPUPlayerRenderer {
     }
 
     private func mpvColorString(_ color: CGColor) -> String {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return "#FFFFFFFF" }
         let converted = color.converted(
-            to: CGColorSpace(name: CGColorSpace.sRGB)!,
+            to: colorSpace,
             intent: .defaultIntent,
             options: nil
         ) ?? color
@@ -6389,10 +6427,10 @@ public final class MPVGPUPlayerRenderer {
         let alpha = components.indices.contains(3) ? components[3] : 1
         return String(
             format: "#%02X%02X%02X%02X",
+            Int(max(0, min(1, alpha)) * 255),
             Int(max(0, min(1, red)) * 255),
             Int(max(0, min(1, green)) * 255),
-            Int(max(0, min(1, blue)) * 255),
-            Int(max(0, min(1, alpha)) * 255)
+            Int(max(0, min(1, blue)) * 255)
         )
     }
 
