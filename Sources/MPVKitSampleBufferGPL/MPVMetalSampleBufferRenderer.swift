@@ -199,6 +199,42 @@ import AppKit
 import UIKit
 #endif
 
+func mpvShouldDiscardPrematureEOFCache(
+    handle: OpaquePointer?,
+    mediaURL: URL?,
+    target: Double,
+    duration: Double
+) -> Bool {
+    guard let handle,
+          let scheme = mediaURL?.scheme?.lowercased(),
+          scheme == "http" || scheme == "https",
+          target.isFinite, duration.isFinite, target < duration - 1 else { return false }
+    var seekable: Int32 = 0
+    guard mpv_get_property(handle, "seekable", MPV_FORMAT_FLAG, &seekable) >= 0,
+          seekable != 0 else { return false }
+    var node = mpv_node()
+    guard mpv_get_property(handle, "demuxer-cache-state", MPV_FORMAT_NODE, &node) >= 0 else { return false }
+    defer { mpv_free_node_contents(&node) }
+    guard node.format == MPV_FORMAT_NODE_MAP, let list = node.u.list else { return false }
+    var reachedEOF = false
+    var cacheEnd: Double?
+    for index in 0..<Int(list.pointee.num) {
+        guard let key = list.pointee.keys[index] else { continue }
+        let value = list.pointee.values[index]
+        switch String(cString: key) {
+        case "eof" where value.format == MPV_FORMAT_FLAG:
+            reachedEOF = value.u.flag != 0
+        case "cache-end" where value.format == MPV_FORMAT_DOUBLE:
+            cacheEnd = value.u.double_
+        default:
+            break
+        }
+    }
+    return MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+        target: target, duration: duration, cacheEnd: cacheEnd, reachedEOF: reachedEOF
+    )
+}
+
 private final class MPVMetalSampleBufferCallbackToken: @unchecked Sendable {
     enum Kind {
         case render
@@ -1309,9 +1345,17 @@ public final class MPVMetalSampleBufferRenderer {
                 self.pendingSeek = clamped
                 return
             }
+            self.discardPrematureEOFCacheIfNeeded(beforeSeekingTo: clamped)
             _ = self.command(["seek", "\(clamped)", "absolute+exact"])
             self.requestForcedFrames(count: 2)
         }
+    }
+
+    private func discardPrematureEOFCacheIfNeeded(beforeSeekingTo target: Double) {
+        guard mpvShouldDiscardPrematureEOFCache(
+            handle: mpv, mediaURL: currentSubtitleMediaURL, target: target, duration: cachedDuration
+        ) else { return }
+        _ = command(["drop-buffers"])
     }
 
     public func seek(by seconds: Double) {

@@ -1,6 +1,25 @@
 import CoreGraphics
 import Foundation
 
+package enum MPVPrematureEOFSeekRecovery {
+    package static func shouldDiscardCache(
+        target: Double,
+        duration: Double,
+        cacheEnd: Double?,
+        reachedEOF: Bool
+    ) -> Bool {
+        guard reachedEOF,
+              target.isFinite,
+              duration.isFinite,
+              let cacheEnd,
+              cacheEnd.isFinite,
+              cacheEnd >= 0,
+              target > cacheEnd + 1,
+              target < duration - 1 else { return false }
+        return true
+    }
+}
+
 @MainActor
 package final class MPVAsyncCommandReply {
     private var result: Int32?

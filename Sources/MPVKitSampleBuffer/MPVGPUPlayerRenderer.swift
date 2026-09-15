@@ -3680,6 +3680,7 @@ public final class MPVGPUPlayerRenderer {
                 self.pendingSeekAfterPrimaryLoadSubmission = clamped
                 return
             }
+            self.discardPrematureEOFCacheIfNeeded(beforeSeekingTo: clamped)
             _ = self.command(["seek", "\(clamped)", "absolute+exact"])
             if self.selectedPictureInPictureBackend == .compatibilityDualSession,
                self.isPictureInPicturePrepared || self.isPictureInPictureActive {
@@ -3687,6 +3688,14 @@ public final class MPVGPUPlayerRenderer {
             }
             self.updateSingleSessionTimeline(discontinuity: true)
         }
+    }
+
+    private func discardPrematureEOFCacheIfNeeded(beforeSeekingTo target: Double) {
+        guard mpvShouldDiscardPrematureEOFCache(
+            handle: mpv, mediaURL: currentURL, target: target, duration: cachedDuration
+        ) else { return }
+        let status = command(["drop-buffers"])
+        onInlineHitchDiagnostic?("[MPVKitSeekRecovery] discarded premature EOF cache target=\(target) status=\(status)")
     }
 
     public func seek(by seconds: Double) {

@@ -1,6 +1,43 @@
 import XCTest
 @testable import MPVKitSampleBufferCore
 
+final class MPVPrematureEOFSeekRecoveryTests: XCTestCase {
+    func testSkipBeyondTruncatedCacheRequiresAFreshDemuxerSeek() {
+        XCTAssertTrue(MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+            target: 143.51, duration: 1469.05, cacheEnd: 104.063, reachedEOF: true
+        ))
+    }
+
+    func testOrdinaryBufferingAndCachedSeeksKeepTheirBuffers() {
+        XCTAssertFalse(MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+            target: 143.51, duration: 1469.05, cacheEnd: 104.063, reachedEOF: false
+        ))
+        for target in [0.0, 55, 104, 104.5] {
+            XCTAssertFalse(MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+                target: target, duration: 1469.05, cacheEnd: 104.063, reachedEOF: true
+            ))
+        }
+    }
+
+    func testRealEndOfMediaAndUnknownBoundsKeepTheirBuffers() {
+        for target in [1468.5, 1469.05, 1500, Double.nan, .infinity] {
+            XCTAssertFalse(MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+                target: target, duration: 1469.05, cacheEnd: 104.063, reachedEOF: true
+            ))
+        }
+        for duration in [0.0, 143, Double.nan, .infinity] {
+            XCTAssertFalse(MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+                target: 143.51, duration: duration, cacheEnd: 104.063, reachedEOF: true
+            ))
+        }
+        for cacheEnd: Double? in [nil, -1, .nan, .infinity, 1469.05] {
+            XCTAssertFalse(MPVPrematureEOFSeekRecovery.shouldDiscardCache(
+                target: 143.51, duration: 1469.05, cacheEnd: cacheEnd, reachedEOF: true
+            ))
+        }
+    }
+}
+
 @MainActor
 private final class SubtitleQueueHarness {
     var commands: [[String]] = []
