@@ -3312,12 +3312,13 @@ public final class MPVGPUPlayerRenderer {
         setOption("video-sync", "audio", handle: handle)
         setOption("framedrop", "vo", handle: handle)
         setOption("interpolation", "no", handle: handle)
-        #if os(tvOS)
-        // AudioUnit can open but remain silent on recent Dolby/Atmos HDMI routes. The
-        // AVSampleBufferAudioRenderer-backed output handles those routes and AudioUnit remains a
-        // fallback. Hosts can still override this through additionalMPVOptions.
+        #if os(macOS)
+        setOption("ao", "avfoundation,coreaudio", handle: handle)
+        #else
         setOption("ao", "avfoundation,audiounit", handle: handle)
         #endif
+        setOption("apple-compressed-audio", "yes", handle: handle)
+        setOption("audio-spdif", "eac3", handle: handle)
         setOption("target-colorspace-hint", options.enablesTargetColorspaceHint ? "yes" : "no", handle: handle)
         setOption("subs-match-os-language", "yes", handle: handle)
         setOption("sub-auto", "fuzzy", handle: handle)

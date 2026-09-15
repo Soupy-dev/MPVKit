@@ -1,0 +1,732 @@
+diff --git a/audio/decode/ad_spdif.c b/audio/decode/ad_spdif.c
+--- a/audio/decode/ad_spdif.c
++++ b/audio/decode/ad_spdif.c
+@@ -35,6 +35,7 @@
+ #include "filters/f_decoder_wrapper.h"
+ #include "filters/filter_internal.h"
+ #include "options/options.h"
++#include "options/m_config.h"
+ 
+ #define OUTBUF_SIZE 65536
+ 
+@@ -48,6 +49,11 @@
+     uint8_t          out_buffer[OUTBUF_SIZE];
+     bool             need_close;
+     bool             use_dts_hd;
++    bool             apple_eac3;
++    int              eac3_bytes;
++    int              eac3_samples;
++    double           eac3_pts;
++    uint8_t          eac3_data[24568];
+     struct mp_aframe *fmt;
+     int              sstride;
+     struct mp_aframe_pool *pool;
+@@ -175,6 +181,24 @@
+     int c_rate = 0;
+     determine_codec_params(da, pkt, &profile, &c_rate);
+     MP_VERBOSE(da, "In: profile=%d samplerate=%d\n", profile, c_rate);
++
++#if HAVE_AVFOUNDATION
++    struct MPOpts *opts = mp_get_config_group(spdif_ctx, da->global, &mp_opt_root);
++    bool apple_compressed_audio = opts->apple_compressed_audio;
++    talloc_free(opts);
++    if (apple_compressed_audio && spdif_ctx->codec_id == AV_CODEC_ID_EAC3) {
++        spdif_ctx->apple_eac3 = true;
++        spdif_ctx->fmt = mp_aframe_create();
++        talloc_steal(spdif_ctx, spdif_ctx->fmt);
++        struct mp_chmap chmap;
++        mp_chmap_from_channels(&chmap, 2);
++        mp_aframe_set_chmap(spdif_ctx->fmt, &chmap);
++        mp_aframe_set_format(spdif_ctx->fmt, AF_FORMAT_S_EAC3);
++        mp_aframe_set_rate(spdif_ctx->fmt, 192000);
++        spdif_ctx->sstride = mp_aframe_get_sstride(spdif_ctx->fmt);
++        return 0;
++    }
++#endif
+ 
+     AVFormatContext *lavf_ctx  = avformat_alloc_context();
+     if (!lavf_ctx)
+@@ -303,8 +327,16 @@
+     if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
+         return;
+ 
++    struct demux_packet *mpkt = NULL;
++    struct mp_aframe *out = NULL;
++    double pts = MP_NOPTS_VALUE;
+     struct mp_frame inframe = mp_pin_out_read(da->ppins[0]);
+     if (inframe.type == MP_FRAME_EOF) {
++        if (spdif_ctx->apple_eac3 && spdif_ctx->eac3_samples) {
++            pts = spdif_ctx->eac3_pts;
++            mp_pin_out_unread(da->ppins[0], inframe);
++            goto done;
++        }
+         mp_pin_in_write(da->ppins[1], inframe);
+         return;
+     } else if (inframe.type != MP_FRAME_PACKET) {
+@@ -315,9 +347,8 @@
+         return;
+     }
+ 
+-    struct demux_packet *mpkt = inframe.data;
+-    struct mp_aframe *out = NULL;
+-    double pts = mpkt->pts;
++    mpkt = inframe.data;
++    pts = mpkt->pts;
+ 
+     if (!spdif_ctx->avpkt) {
+         spdif_ctx->avpkt = av_packet_alloc();
+@@ -325,11 +356,58 @@
+     }
+     mp_set_av_packet(spdif_ctx->avpkt, mpkt, NULL);
+     spdif_ctx->avpkt->pts = spdif_ctx->avpkt->dts = 0;
+-    if (!spdif_ctx->lavf_ctx) {
++    if (!spdif_ctx->lavf_ctx && !spdif_ctx->apple_eac3) {
+         if (init_filter(da) < 0)
+             goto done;
+         mp_assert(spdif_ctx->avpkt);
+-        mp_assert(spdif_ctx->lavf_ctx);
++        mp_assert(spdif_ctx->lavf_ctx || spdif_ctx->apple_eac3);
++    }
++
++    if (spdif_ctx->apple_eac3) {
++        const uint8_t *bytes = mpkt->buffer;
++        size_t size = mpkt->len;
++        static const int blocks[] = {1, 2, 3, 6};
++        if (size < 7 || (size & 1) || size > sizeof(spdif_ctx->eac3_data) - spdif_ctx->eac3_bytes ||
++            bytes[0] != 0x0b || bytes[1] != 0x77 || (bytes[4] >> 6) != 0)
++            goto done;
++        int samples = blocks[(bytes[4] >> 4) & 3] * 256;
++        if (spdif_ctx->eac3_samples && pts != MP_NOPTS_VALUE &&
++            spdif_ctx->eac3_pts != MP_NOPTS_VALUE &&
++            fabs(pts - spdif_ctx->eac3_pts - spdif_ctx->eac3_samples / 48000.0) > 1.0 / 48000)
++            goto done;
++        if (!spdif_ctx->eac3_samples)
++            spdif_ctx->eac3_pts = pts;
++        if (spdif_ctx->eac3_samples + samples > 1536)
++            goto done;
++        memcpy(spdif_ctx->eac3_data + spdif_ctx->eac3_bytes, bytes, size);
++        spdif_ctx->eac3_bytes += size;
++        spdif_ctx->eac3_samples += samples;
++        if (spdif_ctx->eac3_samples < 1536) {
++            talloc_free(mpkt);
++            return;
++        }
++        out = mp_aframe_new_ref(spdif_ctx->fmt);
++        if (mp_aframe_pool_allocate(spdif_ctx->pool, out, 6144) < 0) {
++            TA_FREEP(&out);
++            goto done;
++        }
++        uint8_t **data = mp_aframe_get_data_rw(out);
++        if (!data) {
++            TA_FREEP(&out);
++            goto done;
++        }
++        memset(data[0], 0, 24576);
++        const uint8_t preamble[] = {0x72, 0xf8, 0x1f, 0x4e, 0x15, 0};
++        memcpy(data[0], preamble, sizeof(preamble));
++        data[0][6] = spdif_ctx->eac3_bytes & 255;
++        data[0][7] = spdif_ctx->eac3_bytes >> 8;
++        for (int i = 0; i < spdif_ctx->eac3_bytes; i += 2) {
++            data[0][i + 8] = spdif_ctx->eac3_data[i + 1];
++            data[0][i + 9] = spdif_ctx->eac3_data[i];
++        }
++        mp_aframe_set_pts(out, spdif_ctx->eac3_pts);
++        spdif_ctx->eac3_bytes = spdif_ctx->eac3_samples = 0;
++        goto done;
+     }
+ 
+     spdif_ctx->out_buffer_len  = 0;
+@@ -357,6 +435,21 @@
+     mp_aframe_set_pts(out, pts);
+ 
+ done:
++    if (spdif_ctx->apple_eac3 && !out && spdif_ctx->fmt) {
++        out = mp_aframe_new_ref(spdif_ctx->fmt);
++        if (mp_aframe_pool_allocate(spdif_ctx->pool, out, 6144) >= 0) {
++            uint8_t **data = mp_aframe_get_data_rw(out);
++            if (data) {
++                memset(data[0], 0, 24576);
++                mp_aframe_set_pts(out, pts);
++            } else {
++                TA_FREEP(&out);
++            }
++        } else {
++            TA_FREEP(&out);
++        }
++        spdif_ctx->eac3_bytes = spdif_ctx->eac3_samples = 0;
++    }
+     talloc_free(mpkt);
+     if (out) {
+         mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
+@@ -419,11 +512,18 @@
+     return list;
+ }
+ 
++static void ad_spdif_reset(struct mp_filter *filter)
++{
++    struct spdifContext *context = filter->priv;
++    context->eac3_bytes = context->eac3_samples = 0;
++}
++
+ static const struct mp_filter_info ad_spdif_filter = {
+     .name = "ad_spdif",
+     .priv_size = sizeof(struct spdifContext),
+     .process = ad_spdif_process,
+     .destroy = ad_spdif_destroy,
++    .reset = ad_spdif_reset,
+ };
+ 
+ static struct mp_decoder *create(struct mp_filter *parent,
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -379,6 +379,11 @@
+ }
+ 
+ // Request that the player core destroys and recreates the AO. Fully thread-safe.
++void ao_request_pcm_fallback(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_PCM_FALLBACK);
++}
++
+ void ao_request_reload(struct ao *ao)
+ {
+     ao_add_events(ao, AO_EVENT_RELOAD);
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -43,6 +43,7 @@
+ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
++    AO_EVENT_PCM_FALLBACK = 4,
+ };
+ 
+ enum {
+@@ -105,6 +106,7 @@
+ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
++void ao_request_pcm_fallback(struct ao *ao);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -30,6 +30,8 @@
+ #import <CoreAudioTypes/CoreAudioTypes.h>
+ #import <CoreFoundation/CoreFoundation.h>
+ #import <CoreMedia/CoreMedia.h>
++#import <AudioToolbox/AudioToolbox.h>
++#include "ao_avfoundation_eac3.h"
+ 
+ 
+ @interface AVObserver : NSObject {
+@@ -47,6 +49,9 @@
+     CMAudioFormatDescriptionRef format_description;
+     AVObserver *observer;
+     int64_t end_time_av;
++    bool compressed_eac3;
++    int compressed_channels;
++    bool failed;
+ };
+ 
+ static int64_t CMTimeGetNanoseconds(CMTime time)
+@@ -70,7 +75,9 @@
+     CMSampleBufferRef sample_buffer = NULL;
+     OSStatus err;
+ 
+-    int request_sample_count = samplerate / 10;
++    if (p->failed)
++        return;
++    int request_sample_count = p->compressed_eac3 ? MPV_APPLE_EAC3_CARRIER_SAMPLES : samplerate / 10;
+     int buffer_size = request_sample_count * sstride;
+     void *data[] = {CFAllocatorAllocate(NULL, buffer_size, 0)};
+     if (!data[0]) {
+@@ -92,6 +99,26 @@
+         goto finish;
+     }
+ 
++    if (p->compressed_eac3) {
++        struct mpv_apple_eac3_packet packet;
++        if (!mpv_apple_eac3_unpack(data[0], real_sample_count * sstride, &packet))
++            goto error;
++        if (p->compressed_channels && p->compressed_channels != packet.channels)
++            goto error;
++        p->compressed_channels = packet.channels;
++        if (!p->format_description) {
++            p->format_description = mpv_apple_eac3_format(&packet);
++            if (!p->format_description)
++                goto error;
++        }
++        if (CMBlockBufferCreateWithMemoryBlock(NULL, NULL, packet.size, NULL, NULL,
++                0, packet.size, 0, &block_buffer) != noErr ||
++            CMBlockBufferReplaceDataBytes(packet.data, block_buffer, 0, packet.size) != noErr ||
++            CMAudioSampleBufferCreateReadyWithPacketDescriptions(NULL, block_buffer,
++                p->format_description, packet.packet_count, CMTimeFromNanoseconds(end_time_av),
++                packet.packets, &sample_buffer) != noErr)
++            goto error;
++    } else {
+     if ((err = CMBlockBufferCreateWithMemoryBlock(
+         NULL,
+         data[0],
+@@ -131,7 +158,10 @@
+         goto error;
+     }
+ 
++    }
+     [p->renderer enqueueSampleBuffer:sample_buffer];
++    if (p->renderer.status == AVQueuedSampleBufferRenderingStatusFailed)
++        goto error;
+ 
+     time_delta = CMTimeGetNanoseconds(CMTimeMake(real_sample_count, samplerate));
+     p->end_time_av = end_time_av + time_delta;
+@@ -139,7 +169,12 @@
+     goto finish;
+ 
+ error:
+-    ao_request_reload(ao);
++    p->failed = true;
++    [p->renderer stopRequestingMediaData];
++    if (p->compressed_eac3)
++        ao_request_pcm_fallback(ao);
++    else
++        ao_request_reload(ao);
+ finish:
+     if (data[0]) CFAllocatorDeallocate(NULL, data[0]);
+     if (block_buffer) CFRelease(block_buffer);
+@@ -211,6 +246,22 @@
+     }
+     return self;
+ }
++- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
++    change:(NSDictionary *)change context:(void *)context {
++    if (![keyPath isEqualToString:@"status"] ||
++        [(AVSampleBufferAudioRenderer *)object status] != AVQueuedSampleBufferRenderingStatusFailed)
++        return;
++    @synchronized (self) {
++        if (!ao || reloadRequested)
++            return;
++        reloadRequested = YES;
++        struct priv *p = ao->priv;
++        if (p->compressed_eac3)
++            ao_request_pcm_fallback(ao);
++        else
++            ao_request_reload(ao);
++    }
++}
+ - (void)invalidate {
+     @synchronized (self) {
+         ao = NULL;
+@@ -232,14 +283,18 @@
+ {
+     struct priv *p = ao->priv;
+     AudioChannelLayout *layout = NULL;
++    p->compressed_eac3 = ao->format == AF_FORMAT_S_EAC3 && ao->samplerate == 192000 && ao->channels.num == 2;
+ 
+ #if TARGET_OS_IPHONE
+     AVAudioSession *instance = AVAudioSession.sharedInstance;
+-    NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
+-    NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
+     [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+     [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++    if (@available(tvOS 15.0, iOS 15.0, *)) {
++        [instance setSupportsMultichannelContent:p->compressed_eac3 || ao->channels.num > 2 error:nil];
++    }
+     [instance setActive:YES error:nil];
++    NSInteger maxChannels = MAX(1, instance.maximumOutputNumberOfChannels);
++    NSInteger prefChannels = p->compressed_eac3 ? maxChannels : MIN(maxChannels, ao->channels.num);
+     [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
+ #endif
+ 
+@@ -247,6 +302,9 @@
+         MP_FATAL(ao, "failed to create audio renderer\n");
+         MP_VERBOSE(ao, "AVSampleBufferAudioRenderer failed to initialize\n");
+         goto error;
++    }
++    if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *)) {
++        p->renderer.allowedAudioSpatializationFormats = AVAudioSpatializationFormatMonoStereoAndMultichannel;
+     }
+     if ((p->synchronizer = [[AVSampleBufferRenderSynchronizer alloc] init]) == nil) {
+         MP_FATAL(ao, "failed to create rendering synchronizer\n");
+@@ -276,7 +334,7 @@
+     }
+ #endif
+ 
+-    if (af_fmt_is_spdif(ao->format)) {
++    if (af_fmt_is_spdif(ao->format) && !p->compressed_eac3) {
+         MP_FATAL(ao, "avfoundation does not support SPDIF\n");
+ #if HAVE_COREAUDIO
+         MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
+@@ -284,6 +342,7 @@
+         goto error;
+     }
+ 
++    if (!p->compressed_eac3) {
+     // AVSampleBufferAudioRenderer only supports interleaved formats
+     ao->format = af_fmt_from_planar(ao->format);
+     if (af_fmt_is_planar(ao->format)) {
+@@ -314,10 +373,13 @@
+     talloc_free(layout);
+     layout = NULL;
+ 
++    }
++
+     // AVSampleBufferAudioRenderer read ahead aggressively
+     ao->device_buffer = ao->samplerate * 2;
+ 
+     p->observer = [[AVObserver alloc] initWithAO:ao];
++    [p->renderer addObserver:p->observer forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:NULL];
+     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+ #if HAVE_MACOS_12_FEATURES
+     if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *)) {
+@@ -325,6 +387,11 @@
+     }
+ #endif
+     [center addObserver:p->observer selector:@selector(handleRestartNotification:) name:AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification object:p->renderer];
++#if TARGET_OS_IPHONE
++    if (@available(tvOS 15.0, iOS 15.0, *)) {
++        [center addObserver:p->observer selector:@selector(handleRestartNotification:) name:AVAudioSessionSpatialPlaybackCapabilitiesChangedNotification object:AVAudioSession.sharedInstance];
++    }
++#endif
+ 
+     return CONTROL_OK;
+ 
+@@ -349,6 +416,7 @@
+ {
+     struct priv *p = ao->priv;
+ 
++    [p->renderer removeObserver:p->observer forKeyPath:@"status"];
+     [p->observer invalidate];
+     [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+     stop(ao);
+@@ -356,7 +424,7 @@
+     [p->renderer release];
+     [p->synchronizer release];
+     dispatch_release(p->queue);
+-    CFRelease(p->format_description);
++    if (p->format_description) CFRelease(p->format_description);
+ 
+     [p->observer release];
+ 
+diff --git a/audio/out/ao_avfoundation_eac3.h b/audio/out/ao_avfoundation_eac3.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ao_avfoundation_eac3.h
+@@ -0,0 +1,174 @@
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <libavformat/avformat.h>
++#include <libavutil/intreadwrite.h>
++
++#define MPV_APPLE_EAC3_BURST_BYTES 24576
++#define MPV_APPLE_EAC3_CARRIER_SAMPLES 6144
++
++struct mpv_apple_eac3_packet {
++    uint8_t data[MPV_APPLE_EAC3_BURST_BYTES - 8];
++    size_t size;
++    AudioStreamPacketDescription packets[6];
++    int packet_count;
++    int channels;
++    int sample_rate;
++};
++
++static bool mpv_apple_eac3_unpack(const uint8_t *burst, size_t size,
++                                  struct mpv_apple_eac3_packet *out)
++{
++    if (!burst || !out || size != MPV_APPLE_EAC3_BURST_BYTES ||
++        AV_RL16(burst) != 0xf872 || AV_RL16(burst + 2) != 0x4e1f ||
++        AV_RL16(burst + 4) != 0x15)
++        return false;
++    size_t payload = AV_RL16(burst + 6);
++    if (payload < 7 || payload > sizeof(out->data) || (payload & 1))
++        return false;
++    memset(out, 0, sizeof(*out));
++    out->size = payload;
++    for (size_t i = 0; i < payload; i += 2) {
++        out->data[i] = burst[i + 9];
++        out->data[i + 1] = burst[i + 8];
++    }
++    size_t offset = 0;
++    int total_samples = 0;
++    static const int channel_counts[] = {2, 1, 2, 3, 3, 4, 4, 5};
++    static const int blocks[] = {1, 2, 3, 6};
++    while (offset < payload) {
++        const uint8_t *frame = out->data + offset;
++        if (payload - offset < 7 || AV_RB16(frame) != 0x0b77)
++            return false;
++        size_t frame_size = ((((unsigned)frame[2] & 7) << 8) | frame[3]) * 2 + 2;
++        int stream_type = frame[2] >> 6;
++        int substream_id = (frame[2] >> 3) & 7;
++        int bsid = frame[5] >> 3;
++        if (frame_size < 7 || frame_size > payload - offset || stream_type == 3 ||
++            substream_id != 0 || bsid <= 10 || bsid > 16 || (frame[4] >> 6) != 0)
++            return false;
++        int samples = blocks[(frame[4] >> 4) & 3] * 256;
++        if (stream_type == 1) {
++            if (!out->packet_count || samples != out->packets[out->packet_count - 1].mVariableFramesInPacket)
++                return false;
++            out->packets[out->packet_count - 1].mDataByteSize += (UInt32)frame_size;
++        } else {
++            int channels = channel_counts[(frame[4] >> 1) & 7] + (frame[4] & 1);
++            if (out->packet_count >= 6 || (out->channels && channels != out->channels))
++                return false;
++            out->channels = channels;
++            out->sample_rate = 48000;
++            out->packets[out->packet_count++] = (AudioStreamPacketDescription) {
++                .mStartOffset = offset,
++                .mVariableFramesInPacket = samples,
++                .mDataByteSize = (UInt32)frame_size,
++            };
++            total_samples += samples;
++        }
++        offset += frame_size;
++    }
++    return total_samples == 1536 && out->packet_count > 0;
++}
++
++static const uint8_t *mpv_apple_eac3_cookie(const uint8_t *bytes, size_t length,
++                                           int depth, size_t *cookie_size)
++{
++    if (depth > 8)
++        return NULL;
++    for (size_t offset = 0; offset + 8 <= length;) {
++        uint32_t size = AV_RB32(bytes + offset);
++        if (size < 8 || size > length - offset)
++            return NULL;
++        const uint8_t *type = bytes + offset + 4;
++        if (!memcmp(type, "dec3", 4)) {
++            if (size < 11 || size > 128)
++                return NULL;
++            *cookie_size = size;
++            return bytes + offset;
++        }
++        size_t prefix = 0;
++        if (!memcmp(type, "moov", 4) || !memcmp(type, "trak", 4) ||
++            !memcmp(type, "mdia", 4) || !memcmp(type, "minf", 4) || !memcmp(type, "stbl", 4))
++            prefix = 8;
++        else if (!memcmp(type, "stsd", 4))
++            prefix = 16;
++        else if (!memcmp(type, "ec-3", 4))
++            prefix = 36;
++        if (prefix && size > prefix) {
++            const uint8_t *found = mpv_apple_eac3_cookie(bytes + offset + prefix,
++                size - prefix, depth + 1, cookie_size);
++            if (found)
++                return found;
++        }
++        offset += size;
++    }
++    return NULL;
++}
++
++static CMAudioFormatDescriptionRef mpv_apple_eac3_format(const struct mpv_apple_eac3_packet *input)
++{
++    AVFormatContext *mux = NULL;
++    AVPacket *packet = NULL;
++    uint8_t *bytes = NULL;
++    CMAudioFormatDescriptionRef result = NULL;
++    if (avformat_alloc_output_context2(&mux, NULL, "mp4", NULL) < 0 || !mux)
++        goto done;
++    AVStream *stream = avformat_new_stream(mux, NULL);
++    if (!stream || avio_open_dyn_buf(&mux->pb) < 0)
++        goto done;
++    stream->time_base = (AVRational){1, input->sample_rate};
++    stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
++    stream->codecpar->codec_id = AV_CODEC_ID_EAC3;
++    stream->codecpar->sample_rate = input->sample_rate;
++    stream->codecpar->frame_size = 1536;
++    av_channel_layout_default(&stream->codecpar->ch_layout, input->channels);
++    if (avformat_write_header(mux, NULL) < 0)
++        goto done;
++    packet = av_packet_alloc();
++    if (!packet)
++        goto done;
++    int64_t pts = 0;
++    for (int i = 0; i < input->packet_count; i++) {
++        AudioStreamPacketDescription description = input->packets[i];
++        if (av_new_packet(packet, description.mDataByteSize) < 0)
++            goto done;
++        memcpy(packet->data, input->data + description.mStartOffset, description.mDataByteSize);
++        packet->pts = packet->dts = pts;
++        packet->duration = description.mVariableFramesInPacket;
++        packet->stream_index = 0;
++        pts += packet->duration;
++        if (av_write_frame(mux, packet) < 0)
++            goto done;
++        av_packet_unref(packet);
++    }
++    if (av_write_trailer(mux) < 0)
++        goto done;
++    int length = avio_close_dyn_buf(mux->pb, &bytes);
++    mux->pb = NULL;
++    if (length < 12 || length > 262144)
++        goto done;
++    size_t cookie_size = 0;
++    const uint8_t *cookie = mpv_apple_eac3_cookie(bytes, length, 0, &cookie_size);
++    if (cookie) {
++        AudioStreamBasicDescription asbd = {
++            .mSampleRate = input->sample_rate,
++            .mFormatID = kAudioFormatEnhancedAC3,
++            .mFramesPerPacket = 0,
++            .mChannelsPerFrame = input->channels,
++        };
++        OSStatus status = CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd,
++            0, NULL, cookie_size, cookie, NULL, &result);
++        if (status != noErr)
++            result = NULL;
++    }
++done:
++    av_packet_free(&packet);
++    if (mux && mux->pb) {
++        avio_close_dyn_buf(mux->pb, &bytes);
++        mux->pb = NULL;
++    }
++    av_free(bytes);
++    avformat_free_context(mux);
++    return result;
++}
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -828,6 +828,9 @@
+ features += {'coreaudio': coreaudio.found()}
+ if features['coreaudio']
+     dependencies += coreaudio
++    if not features['cocoa']
++        sources += files('osdep/utils-mac.c')
++    endif
+     sources += files('audio/out/ao_coreaudio.c',
+                      'audio/out/ao_coreaudio_exclusive.c',
+                      'audio/out/ao_coreaudio_properties.c')
+diff --git a/options/options.c b/options/options.c
+--- a/options/options.c
++++ b/options/options.c
+@@ -675,6 +675,7 @@
+ 
+     {"audio-samplerate", OPT_INT(force_srate), .flags = UPDATE_AUDIO,
+         M_RANGE(0, 16*48000)},
++    {"apple-compressed-audio", OPT_BOOL(apple_compressed_audio), .flags = UPDATE_AD},
+     {"audio-channels", OPT_CHANNELS(audio_output_channels), .flags = UPDATE_AUDIO},
+     {"audio-format", OPT_AUDIOFORMAT(audio_output_format), .flags = UPDATE_AUDIO},
+     {"speed", OPT_DOUBLE(playback_speed), M_RANGE(0.01, 100.0)},
+diff --git a/options/options.h b/options/options.h
+--- a/options/options.h
++++ b/options/options.h
+@@ -331,6 +331,7 @@
+     char *screenshot_dir;
+     bool screenshot_sw;
+ 
++    bool apple_compressed_audio;
+     struct m_channels audio_output_channels;
+     int audio_output_format;
+     int force_srate;
+diff --git a/player/audio.c b/player/audio.c
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -48,6 +48,32 @@
+ 
+ static void ao_process(struct mp_filter *f);
+ 
++static bool apple_compressed_audio_allowed(struct MPContext *mpctx)
++{
++    struct MPOpts *opts = mpctx->opts;
++    struct track *track = mpctx->ao_chain ? mpctx->ao_chain->track : NULL;
++    return opts->apple_compressed_audio && track && track->stream &&
++        track->stream->codec->samplerate == 48000 && opts->playback_speed == 1.0 &&
++        opts->playback_pitch == 1.0 &&
++        (opts->audio_output_channels.num_chmaps != 1 || opts->audio_output_channels.chmaps[0].num > 2) &&
++        (!opts->af_settings || !opts->af_settings[0].name);
++}
++
++static bool update_apple_compressed_audio(struct MPContext *mpctx)
++{
++    struct ao_chain *chain = mpctx->ao_chain;
++    if (!chain || !chain->track || !chain->track->stream ||
++        !chain->track->stream->codec->codec ||
++        strcmp(chain->track->stream->codec->codec, "eac3") != 0 ||
++        (!mpctx->opts->apple_compressed_audio && !chain->apple_compressed_selected) ||
++        chain->apple_compressed_selected == apple_compressed_audio_allowed(mpctx))
++        return false;
++    issue_refresh_seek(mpctx, MPSEEK_EXACT);
++    uninit_audio_chain(mpctx);
++    reinit_audio_chain(mpctx);
++    return true;
++}
++
+ static void update_speed_filters(struct MPContext *mpctx)
+ {
+     struct ao_chain *ao_c = mpctx->ao_chain;
+@@ -106,6 +132,8 @@
+ 
+ int reinit_audio_filters(struct MPContext *mpctx)
+ {
++    if (update_apple_compressed_audio(mpctx))
++        return mpctx->ao_chain ? 1 : -1;
+     struct ao_chain *ao_c = mpctx->ao_chain;
+     if (!ao_c)
+         return 0;
+@@ -199,7 +227,8 @@
+     mpctx->audio_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
+     mpctx->video_speed = mpctx->opts->playback_speed * mpctx->speed_factor_v;
+ 
+-    update_speed_filters(mpctx);
++    if (!update_apple_compressed_audio(mpctx))
++        update_speed_filters(mpctx);
+ }
+ 
+ static bool has_video_track(struct MPContext *mpctx)
+@@ -527,8 +556,13 @@
+     if (!track->dec)
+         goto init_error;
+ 
+-    if (track->ao_c)
+-        mp_decoder_wrapper_set_spdif_flag(track->dec, true);
++    if (track->ao_c) {
++        bool apple_eac3 = mpctx->opts->apple_compressed_audio &&
++            track->stream->codec->codec && strcmp(track->stream->codec->codec, "eac3") == 0;
++        track->ao_c->apple_compressed_selected = apple_eac3 && apple_compressed_audio_allowed(mpctx);
++        mp_decoder_wrapper_set_spdif_flag(track->dec,
++            !apple_eac3 || track->ao_c->apple_compressed_selected);
++    }
+ 
+     if (!mp_decoder_wrapper_reinit(track->dec))
+         goto init_error;
+@@ -898,8 +932,22 @@
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
+-    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
++    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_PCM_FALLBACK)) {
++        struct ao_chain *chain = mpctx->ao_chain;
++        if (chain && chain->track && chain->track->dec) {
++            MP_WARN(mpctx, "Apple compressed audio unavailable; falling back to PCM\n");
++            chain->spdif_passthrough = false;
++            chain->spdif_failed = false;
++            mp_decoder_wrapper_set_spdif_flag(chain->track->dec, false);
++            if (!mp_decoder_wrapper_reinit(chain->track->dec)) {
++                error_on_track(mpctx, chain->track);
++                return;
++            }
++            reload_audio_output(mpctx);
++        }
++    } else if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD)) {
+         reload_audio_output(mpctx);
++    }
+ 
+     update_throttle(mpctx);
+ 
+diff --git a/player/core.h b/player/core.h
+--- a/player/core.h
++++ b/player/core.h
+@@ -182,6 +182,7 @@
+     struct MPContext *mpctx;
+ 
+     bool spdif_passthrough, spdif_failed;
++    bool apple_compressed_selected;
+ 
+     struct mp_output_chain *filter;
+ 

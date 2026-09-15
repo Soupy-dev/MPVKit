@@ -980,11 +980,13 @@ public final class MPVMetalSampleBufferRenderer {
         setOption("vd-lavc-dr", "no")
         setOption("video-sync", "audio")
         setOption("framedrop", "vo")
-        #if os(tvOS)
-        // Prefer the AVFoundation output on tvOS because recent Dolby/Atmos HDMI routes can leave
-        // AudioUnit open but silent. AudioUnit remains the fallback for older route combinations.
+        #if os(macOS)
+        setOption("ao", "avfoundation,coreaudio")
+        #else
         setOption("ao", "avfoundation,audiounit")
         #endif
+        setOption("apple-compressed-audio", "yes")
+        setOption("audio-spdif", "eac3")
         setOption("dither-depth", "auto")
         setOption("target-colorspace-hint", "yes")
         setOption("sub-auto", "fuzzy")

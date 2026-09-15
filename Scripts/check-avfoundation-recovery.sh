@@ -17,22 +17,34 @@ interface = re.search(r'@interface AVObserver\b.*?@end', source, re.S).group()
 implementation = re.search(r'@implementation AVObserver\b.*?@end', source, re.S).group()
 prefix = r'''
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <dispatch/dispatch.h>
 #include <assert.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 
+struct priv { bool compressed_eac3; };
 struct ao {
+    struct priv *priv;
+    atomic_int fallbacks;
     atomic_int reloads;
     atomic_bool paused;
 };
 #define MP_WARN(...) ((void)0)
 #define MP_VERBOSE(...) ((void)0)
+static void ao_request_pcm_fallback(struct ao *ao) {
+    atomic_fetch_add(&ao->fallbacks, 1);
+}
 static void ao_request_reload(struct ao *ao) {
     atomic_fetch_add(&ao->reloads, 1);
 }
 '''
 suffix = r'''
+@interface FailedAudioRenderer : AVSampleBufferAudioRenderer
+@end
+@implementation FailedAudioRenderer
+- (AVQueuedSampleBufferRenderingStatus)status { return AVQueuedSampleBufferRenderingStatusFailed; }
+@end
 int main(void) {
     @autoreleasepool {
         struct ao playing = {0};
@@ -81,7 +93,22 @@ int main(void) {
             [observer handleRestartNotification:notification];
         });
         [observer release];
-        puts("AVFoundation recovery: notification queue, duplicate coalescing, paused playback, concurrent retirement and stale notifications passed.");
+        for (int compressed = 0; compressed < 2; compressed++) {
+            struct priv configuration = {.compressed_eac3 = compressed};
+            struct ao failure = {.priv = &configuration};
+            observer = [[AVObserver alloc] initWithAO:&failure];
+            FailedAudioRenderer *renderer = [[FailedAudioRenderer alloc] init];
+            dispatch_apply(256, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t index) {
+                [observer observeValueForKeyPath:@"status" ofObject:renderer change:@{} context:NULL];
+            });
+            assert(atomic_load(&failure.fallbacks) == compressed);
+            assert(atomic_load(&failure.reloads) == !compressed);
+            [observer invalidate];
+            [observer observeValueForKeyPath:@"status" ofObject:renderer change:@{} context:NULL];
+            [observer release];
+            [renderer release];
+        }
+        puts("AVFoundation recovery: notification queue, duplicate coalescing, paused playback, concurrent retirement, stale notifications and renderer failure fallback passed.");
     }
     return 0;
 }
@@ -90,5 +117,5 @@ pathlib.Path(sys.argv[2]).write_text(prefix + interface + '\n' + implementation 
 PY
 
 xcrun --sdk macosx clang -fno-objc-arc -fblocks -fsanitize=address \
-    -framework Foundation "$temporary_root/recovery.m" -o "$temporary_root/recovery"
+    -framework Foundation -framework AVFoundation "$temporary_root/recovery.m" -o "$temporary_root/recovery"
 "$temporary_root/recovery"
