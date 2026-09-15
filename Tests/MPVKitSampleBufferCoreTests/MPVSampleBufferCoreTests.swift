@@ -1,6 +1,56 @@
 import XCTest
 @testable import MPVKitSampleBufferCore
 
+final class MPVPlaybackEndGateTests: XCTestCase {
+    func testRecoveredPlaybackCanReachEOFWithoutStaleResumeRearmingAnotherLoad() {
+        var gate = MPVPlaybackEndGate()
+        let old = MPVLoadIdentityTracker.Identity(sequence: 1, clientGeneration: 4)
+        let current = MPVLoadIdentityTracker.Identity(sequence: 2, clientGeneration: 5)
+        XCTAssertTrue(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true))
+        gate.playbackResumed(identity: old, latestIdentity: current)
+        XCTAssertFalse(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true))
+        gate.playbackResumed(identity: current, latestIdentity: current)
+        XCTAssertTrue(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true))
+        XCTAssertFalse(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true))
+    }
+
+    func testUnknownAndMultipartPlaylistsNeverEndTheLogicalEpisodeEarly() {
+        var gate = MPVPlaybackEndGate()
+        let current = MPVLoadIdentityTracker.Identity(sequence: 1, clientGeneration: 4)
+        for count: Int64? in [nil, 0, 2, 3] {
+            XCTAssertFalse(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true, playlistEntryCount: count))
+        }
+        XCTAssertTrue(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true, playlistEntryCount: 1))
+    }
+
+    func testEndRequiresReadyCurrentLoadAndRealEOF() {
+        var gate = MPVPlaybackEndGate()
+        let old = MPVLoadIdentityTracker.Identity(sequence: 1, clientGeneration: 7)
+        let current = MPVLoadIdentityTracker.Identity(sequence: 2, clientGeneration: 7)
+        XCTAssertFalse(gate.claim(identity: nil, latestIdentity: current, reachedEOF: true, isReady: true))
+        XCTAssertFalse(gate.claim(identity: old, latestIdentity: current, reachedEOF: true, isReady: true))
+        XCTAssertFalse(gate.claim(identity: current, latestIdentity: current, reachedEOF: false, isReady: true))
+        XCTAssertFalse(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: false))
+        XCTAssertTrue(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true))
+        XCTAssertFalse(gate.claim(identity: current, latestIdentity: current, reachedEOF: true, isReady: true))
+    }
+
+    func testEOFPropertyAndEndEventDeliverOnceAcrossReplacementAndTeardown() {
+        var tracker = MPVLoadIdentityTracker()
+        var gate = MPVPlaybackEndGate()
+        let first = tracker.submit(clientGeneration: 0)
+        XCTAssertEqual(tracker.didStart(playlistEntryID: 10), first)
+        XCTAssertTrue(gate.claim(identity: first, latestIdentity: tracker.latestIdentity, reachedEOF: true, isReady: true))
+        XCTAssertFalse(gate.claim(identity: tracker.didEnd(playlistEntryID: 10), latestIdentity: tracker.latestIdentity, reachedEOF: true, isReady: true))
+        tracker.reset()
+        XCTAssertFalse(gate.claim(identity: first, latestIdentity: tracker.latestIdentity, reachedEOF: true, isReady: true))
+        let replacement = tracker.submit(clientGeneration: 0)
+        XCTAssertEqual(tracker.didStart(playlistEntryID: 10), replacement)
+        XCTAssertFalse(gate.claim(identity: first, latestIdentity: tracker.latestIdentity, reachedEOF: true, isReady: true))
+        XCTAssertTrue(gate.claim(identity: tracker.didEnd(playlistEntryID: 10), latestIdentity: tracker.latestIdentity, reachedEOF: true, isReady: true))
+    }
+}
+
 final class MPVPrematureEOFSeekRecoveryTests: XCTestCase {
     func testSkipBeyondTruncatedCacheRequiresAFreshDemuxerSeek() {
         XCTAssertTrue(MPVPrematureEOFSeekRecovery.shouldDiscardCache(

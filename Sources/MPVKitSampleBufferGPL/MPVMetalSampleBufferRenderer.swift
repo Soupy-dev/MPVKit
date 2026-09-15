@@ -135,6 +135,7 @@ public struct MPVMetalSampleBufferSubtitleStyle: @unchecked Sendable {
     public var verticalMargin: CGFloat?
     public var assOverride: String?
     public var captionBackground: Bool?
+    public var delaySeconds: Double
 
     public init(
         foregroundColor: CGColor,
@@ -145,7 +146,8 @@ public struct MPVMetalSampleBufferSubtitleStyle: @unchecked Sendable {
         position: CGFloat? = nil,
         verticalMargin: CGFloat? = nil,
         assOverride: String? = nil,
-        captionBackground: Bool? = nil
+        captionBackground: Bool? = nil,
+        delaySeconds: Double = 0
     ) {
         self.foregroundColor = foregroundColor
         self.strokeColor = strokeColor
@@ -156,6 +158,7 @@ public struct MPVMetalSampleBufferSubtitleStyle: @unchecked Sendable {
         self.verticalMargin = verticalMargin
         self.assOverride = assOverride
         self.captionBackground = captionBackground
+        self.delaySeconds = delaySeconds.isFinite ? max(-60, min(delaySeconds, 60)) : 0
     }
 }
 
@@ -310,7 +313,7 @@ private enum MPVMetalSampleBufferEvent: Sendable {
     case startFile(playlistEntryID: Int64)
     case fileLoaded(playlistEntryID: Int64?)
     case videoReconfigure(playlistEntryID: Int64?)
-    case endFile(playlistEntryID: Int64)
+    case endFile(playlistEntryID: Int64, reachedEOF: Bool)
     case propertyChange(String, value: MPVMetalObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
     case commandReply(requestID: UInt64, error: Int32)
@@ -367,7 +370,7 @@ private func copyMPVMetalSampleBufferEvent(
         if activePlaylistEntryID == playlistEntryID {
             activePlaylistEntryID = nil
         }
-        return .endFile(playlistEntryID: playlistEntryID)
+        return .endFile(playlistEntryID: playlistEntryID, reachedEOF: endFile.reason == MPV_END_FILE_REASON_EOF)
     case MPV_EVENT_PROPERTY_CHANGE:
         guard let data = event.data else { return nil }
         let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
@@ -744,8 +747,10 @@ public final class MPVMetalSampleBufferRenderer {
     public let displayLayer: AVSampleBufferDisplayLayer
     public var currentTime: Double { cachedPosition }
     public var duration: Double { cachedDuration }
+    public var currentLoadGeneration: UInt64 { loadGeneration }
     public var onFrame: ((MPVMetalSampleBufferFrame) -> Void)?
     public var onStateChange: ((MPVMetalSampleBufferRendererState) -> Void)?
+    public var onPlaybackEndForGeneration: ((UInt64) -> Void)?
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVMetalSampleBufferRendererDiagnostics) -> Void)?
 
@@ -767,6 +772,7 @@ public final class MPVMetalSampleBufferRenderer {
     private var loadGeneration: UInt64 = 0
     private let renderLifecycleFence = MPVRenderLifecycleFence()
     private var publishedRenderDiagnostics = MPVMetalSampleBufferRenderDiagnosticsSnapshot()
+    private var playbackEndGate = MPVPlaybackEndGate()
     private var loadIdentityTracker = MPVLoadIdentityTracker()
     private var deferredLoadActions = MPVGenerationDeferredActions<MPVMetalSampleBufferDeferredLoadAction>()
     private var isAwaitingCurrentFileLoaded = false
@@ -1561,6 +1567,8 @@ public final class MPVMetalSampleBufferRenderer {
     private func applySubtitleStyleImmediately(_ style: MPVMetalSampleBufferSubtitleStyle) {
         let fontSize = style.fontSize.isFinite ? max(1, Int(style.fontSize)) : 36
         let strokeWidth = style.strokeWidth.isFinite ? max(0, style.strokeWidth) : 0
+        let delay = style.delaySeconds.isFinite ? max(-60, min(style.delaySeconds, 60)) : 0
+        setStringProperty("sub-delay", "\(delay)")
         setStringProperty("sub-visibility", style.isVisible ? "yes" : "no")
         setStringProperty("sub-font-size", "\(fontSize)")
         setStringProperty("sub-border-size", "\(strokeWidth)")
@@ -1927,6 +1935,7 @@ public final class MPVMetalSampleBufferRenderer {
             ("estimated-vf-fps", MPV_FORMAT_DOUBLE),
             ("speed", MPV_FORMAT_DOUBLE),
             ("pause", MPV_FORMAT_FLAG),
+            ("eof-reached", MPV_FORMAT_FLAG),
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("track-list", MPV_FORMAT_NONE),
             ("sid", MPV_FORMAT_NONE),
@@ -2014,8 +2023,9 @@ public final class MPVMetalSampleBufferRenderer {
             refreshVideoSize()
             refreshVideoColorMetadataCoherently()
             requestForcedFrames(count: 2)
-        case .endFile(let playlistEntryID):
-            _ = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
+        case .endFile(let playlistEntryID, let reachedEOF):
+            let identity = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
+            if reachedEOF { notifyPlaybackEnd(identity: identity) }
         case .propertyChange(let name, let value, let playlistEntryID):
             if !MPVLoadPropertyFence.shouldAccept(
                 property: name,
@@ -2028,6 +2038,14 @@ public final class MPVMetalSampleBufferRenderer {
             guard eventBelongsToCurrentLoad(playlistEntryID, allowsUnscopedEvent: true) else {
                 eventStaleGenerationDropCount += 1
                 return
+            }
+            if name == "eof-reached", case .flag(let reachedEOF) = value, let playlistEntryID {
+                let identity = loadIdentityTracker.identity(forPlaylistEntryID: playlistEntryID)
+                if reachedEOF {
+                    notifyPlaybackEnd(identity: identity)
+                } else {
+                    playbackEndGate.playbackResumed(identity: identity, latestIdentity: loadIdentityTracker.latestIdentity)
+                }
             }
             refreshProperty(named: name, value: value)
         case .logError(let message, let playlistEntryID):
@@ -2057,6 +2075,18 @@ public final class MPVMetalSampleBufferRenderer {
             return false
         }
         return loadIdentityTracker.isLatest(identity) && identity.clientGeneration == loadGeneration
+    }
+
+    private func notifyPlaybackEnd(identity: MPVLoadIdentityTracker.Identity?) {
+        guard !isStopping, identity?.clientGeneration == loadGeneration,
+              playbackEndGate.claim(
+                identity: identity,
+                latestIdentity: loadIdentityTracker.latestIdentity,
+                reachedEOF: true,
+                isReady: isFileLoaded && !isAwaitingCurrentFileLoaded,
+                playlistEntryCount: getInt64Property("playlist-count")
+              ), let identity else { return }
+        onPlaybackEndForGeneration?(identity.clientGeneration)
     }
 
     private func refreshProperty(named name: String, value: MPVMetalObservedPropertyValue) {
@@ -4145,8 +4175,10 @@ public final class MPVMetalSampleBufferRenderer {
     public let displayLayer: AVSampleBufferDisplayLayer
     public var currentTime: Double { 0 }
     public var duration: Double { 0 }
+    public var currentLoadGeneration: UInt64 { 0 }
     public var onFrame: ((MPVMetalSampleBufferFrame) -> Void)?
     public var onStateChange: ((MPVMetalSampleBufferRendererState) -> Void)?
+    public var onPlaybackEndForGeneration: ((UInt64) -> Void)?
     public var onError: ((String) -> Void)?
     public var onDiagnostics: ((MPVMetalSampleBufferRendererDiagnostics) -> Void)?
 

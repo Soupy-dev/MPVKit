@@ -303,7 +303,7 @@ private enum MPVGPUPlayerEvent: Sendable {
     case startFile(playlistEntryID: Int64)
     case fileLoaded(playlistEntryID: Int64?)
     case videoReconfigure(playlistEntryID: Int64?)
-    case endFile(playlistEntryID: Int64, error: String?)
+    case endFile(playlistEntryID: Int64, reachedEOF: Bool, error: String?)
     case propertyChange(String, value: MPVGPUObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
     case inlineHitchDiagnostic(String, playlistEntryID: Int64?)
@@ -528,7 +528,7 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
             let error = endFile.reason == MPV_END_FILE_REASON_ERROR
                 ? String(cString: mpv_error_string(endFile.error))
                 : nil
-            return .endFile(playlistEntryID: playlistEntryID, error: error)
+            return .endFile(playlistEntryID: playlistEntryID, reachedEOF: endFile.reason == MPV_END_FILE_REASON_EOF, error: error)
         case MPV_EVENT_PROPERTY_CHANGE:
             guard let data = event.data else { return nil }
             let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
@@ -2490,6 +2490,7 @@ public final class MPVGPUPlayerRenderer {
     /// Requests that the host-owned AVPictureInPictureController end PiP after both native and
     /// compatibility rendering have failed for the current load.
     public var onPictureInPictureStopRequested: ((String) -> Void)?
+    public var onPlaybackEndForGeneration: ((UInt64) -> Void)?
     public var onError: ((String) -> Void)?
     public var onInlineHitchDiagnostic: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?
@@ -2532,6 +2533,7 @@ public final class MPVGPUPlayerRenderer {
     /// Main-actor owned during life; `deinit` exclusively transfers it into the async drain task.
     nonisolated(unsafe) private var singleSessionPictureInPictureSink: MPVSingleSessionPictureInPictureSink?
     private var eventPump: MPVGPUPlayerEventPump?
+    private var playbackEndGate = MPVPlaybackEndGate()
     private var loadIdentityTracker = MPVLoadIdentityTracker()
     private var currentPrimaryLoadIdentity: MPVLoadIdentityTracker.Identity?
     private var hasSubmittedCurrentPrimaryLoad = false
@@ -4425,6 +4427,8 @@ public final class MPVGPUPlayerRenderer {
     private func applySubtitleStyleImmediately(_ style: MPVMetalSampleBufferSubtitleStyle) {
         let fontSize = style.fontSize.isFinite ? max(1, Int(style.fontSize)) : 36
         let strokeWidth = style.strokeWidth.isFinite ? max(0, style.strokeWidth) : 0
+        let delay = style.delaySeconds.isFinite ? max(-60, min(style.delaySeconds, 60)) : 0
+        setStringProperty("sub-delay", "\(delay)")
         setStringProperty("sub-visibility", style.isVisible ? "yes" : "no")
         setStringProperty("sub-font-size", "\(fontSize)")
         setStringProperty("sub-border-size", "\(strokeWidth)")
@@ -5953,6 +5957,7 @@ public final class MPVGPUPlayerRenderer {
             ("duration", MPV_FORMAT_DOUBLE),
             ("time-pos", MPV_FORMAT_DOUBLE),
             ("pause", MPV_FORMAT_FLAG),
+            ("eof-reached", MPV_FORMAT_FLAG),
             ("paused-for-cache", MPV_FORMAT_FLAG),
             ("seeking", MPV_FORMAT_FLAG),
             ("speed", MPV_FORMAT_DOUBLE),
@@ -6013,8 +6018,9 @@ public final class MPVGPUPlayerRenderer {
                 }
             }
             resumeNativePictureInPictureProbeIfReady(pendingNativeProbeGeneration)
-        case .endFile(let playlistEntryID, let error):
+        case .endFile(let playlistEntryID, let reachedEOF, let error):
             let identity = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
+            if reachedEOF { notifyPlaybackEnd(identity: identity) }
             if let error, let identity, loadIdentityTracker.isLatest(identity) {
                 onError?("playback ended with error: \(error)")
             }
@@ -6030,6 +6036,14 @@ public final class MPVGPUPlayerRenderer {
                     awaitingFileLoaded: isAwaitingPrimaryFileLoaded
                 ) else { return }
                 generation = loadIdentityTracker.latestIdentity?.clientGeneration ?? 0
+            }
+            if name == "eof-reached", case .flag(let reachedEOF) = value, let playlistEntryID {
+                let identity = currentLoadIdentity(for: playlistEntryID)
+                if reachedEOF {
+                    notifyPlaybackEnd(identity: identity)
+                } else {
+                    playbackEndGate.playbackResumed(identity: identity, latestIdentity: loadIdentityTracker.latestIdentity)
+                }
             }
             refreshProperty(named: name, value: value, generation: generation)
         case .logError(let message, let playlistEntryID):
@@ -6059,6 +6073,19 @@ public final class MPVGPUPlayerRenderer {
               loadIdentityTracker.isLatest(identity),
               identity == currentPrimaryLoadIdentity else { return nil }
         return identity
+    }
+
+    private func notifyPlaybackEnd(identity: MPVLoadIdentityTracker.Identity?) {
+        guard !isStopping,
+              identity == currentPrimaryLoadIdentity,
+              playbackEndGate.claim(
+                identity: identity,
+                latestIdentity: loadIdentityTracker.latestIdentity,
+                reachedEOF: true,
+                isReady: !isAwaitingPrimaryFileLoaded,
+                playlistEntryCount: getInt64Property("playlist-count")
+              ), let identity else { return }
+        onPlaybackEndForGeneration?(identity.clientGeneration)
     }
 
     private func refreshProperty(
@@ -6479,6 +6506,7 @@ public final class MPVGPUPlayerRenderer {
     public var onStateChange: ((MPVGPUPlayerRendererState) -> Void)?
     public var onPictureInPictureStateChange: ((MPVPictureInPictureState) -> Void)?
     public var onPictureInPictureStopRequested: ((String) -> Void)?
+    public var onPlaybackEndForGeneration: ((UInt64) -> Void)?
     public var onError: ((String) -> Void)?
     public var onInlineHitchDiagnostic: ((String) -> Void)?
     public var onDiagnostics: ((MPVGPUPlayerRendererDiagnostics) -> Void)?

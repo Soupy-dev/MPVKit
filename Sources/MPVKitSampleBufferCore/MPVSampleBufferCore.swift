@@ -940,6 +940,35 @@ public struct MPVLoadIdentityTracker: Sendable {
     }
 }
 
+public struct MPVPlaybackEndGate: Sendable {
+    private var deliveredIdentity: MPVLoadIdentityTracker.Identity?
+
+    public init() {}
+
+    public mutating func claim(
+        identity: MPVLoadIdentityTracker.Identity?,
+        latestIdentity: MPVLoadIdentityTracker.Identity?,
+        reachedEOF: Bool,
+        isReady: Bool,
+        playlistEntryCount: Int64? = 1
+    ) -> Bool {
+        guard reachedEOF, isReady, playlistEntryCount == 1, let identity,
+              identity == latestIdentity,
+              deliveredIdentity != identity else { return false }
+        deliveredIdentity = identity
+        return true
+    }
+
+    public mutating func playbackResumed(
+        identity: MPVLoadIdentityTracker.Identity?,
+        latestIdentity: MPVLoadIdentityTracker.Identity?
+    ) {
+        guard let identity, identity == latestIdentity,
+              deliveredIdentity == identity else { return }
+        deliveredIdentity = nil
+    }
+}
+
 /// Stores load-sensitive work until the matching generation reaches `FILE_LOADED`.
 /// Beginning a replacement atomically discards the superseded generation's actions; a stale
 /// completion cannot drain or erase actions queued for the new generation.
