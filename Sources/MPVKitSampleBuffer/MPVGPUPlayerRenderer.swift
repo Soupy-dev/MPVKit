@@ -307,7 +307,7 @@ private enum MPVGPUPlayerEvent: Sendable {
     case propertyChange(String, value: MPVGPUObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
     case inlineHitchDiagnostic(String, playlistEntryID: Int64?)
-    case commandReply(requestID: UInt64, error: Int32)
+    case asyncReply(requestID: UInt64, error: Int32)
     case shutdown
 }
 
@@ -554,8 +554,8 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
                 trimmed,
                 playlistEntryID: activePlaylistEntryID
             )
-        case MPV_EVENT_COMMAND_REPLY:
-            return .commandReply(requestID: event.reply_userdata, error: event.error)
+        case MPV_EVENT_COMMAND_REPLY, MPV_EVENT_GET_PROPERTY_REPLY:
+            return .asyncReply(requestID: event.reply_userdata, error: event.error)
         case MPV_EVENT_SHUTDOWN:
             return .shutdown
         default:
@@ -2604,8 +2604,8 @@ public final class MPVGPUPlayerRenderer {
     nonisolated(unsafe) private var foregroundVideoValidationContext: UnsafeMutableRawPointer?
     private var foregroundVideoValidationTimeoutTask: Task<Void, Never>?
     private var foregroundVideoValidationContinuation: CheckedContinuation<Bool, Never>?
-    private var nextAsyncCommandRequestID: UInt64 = 0
-    private var pendingAsyncCommandReplies: [UInt64: MPVAsyncCommandReply] = [:]
+    private var nextAsyncRequestID: UInt64 = 0
+    private var pendingAsyncReplies: [UInt64: MPVAsyncCommandReply] = [:]
     private var isPictureInPicturePrepared = false
     private var isPictureInPictureActive = false
     private var pictureInPicturePreparationGeneration: UInt64 = 0
@@ -2738,9 +2738,9 @@ public final class MPVGPUPlayerRenderer {
         let earlierShutdown = pendingSingleSessionShutdown
         let pump = eventPump
         let compatibilityRenderer = pictureInPictureRendererStorage
-        let commandReplies = Array(pendingAsyncCommandReplies.values)
+        let asyncReplies = Array(pendingAsyncReplies.values)
         Task { @MainActor in
-            for reply in commandReplies { reply.complete(-1) }
+            for reply in asyncReplies { reply.complete(-1) }
             sink?.stop()
             await earlierShutdown?.value
             if let sink { await sink.waitUntilStopped() }
@@ -3162,7 +3162,7 @@ public final class MPVGPUPlayerRenderer {
         // the same client event stream while no decoder exists. Only then activate an epoch and
         // synchronously reselect, so a queued pre-suspension VIDEO_RECONFIG cannot be tagged as
         // output from the new decoder and a replacement load cannot overtake the reselect.
-        let fenceStatus = await commandPrimaryAsync(["get_property", "vid"])
+        let fenceStatus = await fencePrimaryVideoSelectionAsync()
         guard activeHardwareDecoderRecoveryTransitionID == transitionID else {
             return .cancelled
         }
@@ -3371,7 +3371,7 @@ public final class MPVGPUPlayerRenderer {
         activeHardwareDecoderRecoveryEpoch = nil
         activeHardwareDecoderRecoveryGeneration = nil
         hardwareDecoderRecoveryProof.reset()
-        resumePendingAsyncCommandReplies(with: -1)
+        resumePendingAsyncReplies(with: -1)
         pendingPrimaryLoadSubmission?.cancel()
         pendingPrimaryLoadSubmission = nil
         isPrimaryLoadSubmissionPending = false
@@ -4158,23 +4158,38 @@ public final class MPVGPUPlayerRenderer {
         }
     }
 
+    private func fencePrimaryVideoSelectionAsync() async -> Int32 {
+        guard !Task.isCancelled, let handle = mpv, !isStopping else { return -1 }
+        nextAsyncRequestID &+= 1
+        let requestID = nextAsyncRequestID
+        let reply = MPVAsyncCommandReply()
+        pendingAsyncReplies[requestID] = reply
+        let status = "vid".withCString {
+            mpv_get_property_async(handle, requestID, $0, MPV_FORMAT_STRING)
+        }
+        if status < 0 {
+            pendingAsyncReplies.removeValue(forKey: requestID)?.complete(status)
+        }
+        return await reply.value()
+    }
+
     private func submitPrimaryAsyncCommand(_ args: [String]) -> MPVAsyncCommandReply {
         guard let handle = mpv, !isStopping, !args.isEmpty else {
             let reply = MPVAsyncCommandReply()
             reply.complete(-1)
             return reply
         }
-        nextAsyncCommandRequestID &+= 1
-        let requestID = nextAsyncCommandRequestID
+        nextAsyncRequestID &+= 1
+        let requestID = nextAsyncRequestID
         let generation = engineGeneration
         let reply = MPVAsyncCommandReply { [weak self] in
             guard let self,
                   self.engineGeneration == generation,
-                  self.pendingAsyncCommandReplies[requestID] != nil,
+                  self.pendingAsyncReplies[requestID] != nil,
                   let activeHandle = self.mpv else { return }
             mpv_abort_async_command(activeHandle, requestID)
         }
-        pendingAsyncCommandReplies[requestID] = reply
+        pendingAsyncReplies[requestID] = reply
         var cargs = args.map { UnsafePointer<CChar>(strdup($0)) }
         cargs.append(nil)
         let status = mpv_command_async(handle, requestID, &cargs)
@@ -4182,14 +4197,14 @@ public final class MPVGPUPlayerRenderer {
             free(UnsafeMutablePointer(mutating: pointer))
         }
         if status < 0 {
-            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.complete(status)
+            pendingAsyncReplies.removeValue(forKey: requestID)?.complete(status)
         }
         return reply
     }
 
-    private func resumePendingAsyncCommandReplies(with status: Int32) {
-        let replies = Array(pendingAsyncCommandReplies.values)
-        pendingAsyncCommandReplies.removeAll(keepingCapacity: false)
+    private func resumePendingAsyncReplies(with status: Int32) {
+        let replies = Array(pendingAsyncReplies.values)
+        pendingAsyncReplies.removeAll(keepingCapacity: false)
         for reply in replies {
             reply.complete(status)
         }
@@ -6061,8 +6076,8 @@ public final class MPVGPUPlayerRenderer {
                 return
             }
             onInlineHitchDiagnostic?(message)
-        case .commandReply(let requestID, let error):
-            pendingAsyncCommandReplies.removeValue(forKey: requestID)?.complete(error)
+        case .asyncReply(let requestID, let error):
+            pendingAsyncReplies.removeValue(forKey: requestID)?.complete(error)
         case .shutdown:
             stop()
         }
