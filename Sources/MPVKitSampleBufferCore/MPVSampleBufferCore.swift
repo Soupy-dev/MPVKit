@@ -432,6 +432,47 @@ public enum MPVDrawablePixelLimit {
     }
 }
 
+package enum MPVIntelMacRenderPolicy {
+    package static func deviceLossMessage(prefix: String, level: String, message: String) -> String? {
+        guard level == "error" || level == "fatal",
+              prefix == "vo/gpu-next" || prefix.hasPrefix("vo/gpu-next/") else { return nil }
+        let normalized = message.lowercased()
+        guard ["vk_error_device_lost", "metal device lost", "gpu device lost"]
+            .contains(where: normalized.contains) else { return nil }
+        return "GPU device lost. Retry playback to continue."
+    }
+
+    package static func supportsInlineGPU(supportsMac1: Bool, supportsMac2: Bool) -> Bool {
+        supportsMac1 || supportsMac2
+    }
+
+    package static func drawableSize(
+        requested: CGSize,
+        maximumDimension: CGFloat,
+        maximumPixelCount: Int
+    ) -> CGSize? {
+        guard requested.width.isFinite,
+              requested.height.isFinite,
+              requested.width > 1,
+              requested.height > 1,
+              maximumDimension.isFinite,
+              maximumDimension >= 2,
+              maximumPixelCount >= 4 else { return nil }
+        let dimensionScale = min(
+            1,
+            maximumDimension / requested.width,
+            maximumDimension / requested.height
+        )
+        var width = requested.width * dimensionScale
+        var height = requested.height * dimensionScale
+        let pixelScale = min(1, sqrt(Double(maximumPixelCount) / Double(width * height)))
+        width = floor(width * pixelScale)
+        height = floor(height * pixelScale)
+        guard width >= 2, height >= 2 else { return nil }
+        return CGSize(width: width, height: height)
+    }
+}
+
 public struct MPVInlineDrawableLayout: Equatable, Sendable {
     public let contentsScale: CGFloat
     public let drawableSize: CGSize
@@ -546,6 +587,31 @@ public enum MPVPictureInPictureRenderSizePolicy {
         let proposedAspect = Double(proposed.width / proposed.height)
         let relativeAspectChange = abs(proposedAspect - currentAspect) / max(currentAspect, proposedAspect)
         return relativeAspectChange > max(0, aspectTolerance)
+    }
+}
+
+package enum MPVForegroundVideoValidationPolicy {
+    package static func canValidate(
+        decoder: String,
+        allowsSoftwareDecoding: Bool,
+        hasSelectedVideo: Bool
+    ) -> Bool {
+        if MPVVideoToolboxDecodePolicy.isEngaged(decoder) { return true }
+        let normalized = decoder.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return allowsSoftwareDecoding && hasSelectedVideo && normalized == "no"
+    }
+
+    package static func isHealthy(
+        decoder: String,
+        allowsSoftwareDecoding: Bool,
+        hasSelectedVideo: Bool,
+        presentedFreshFrame: Bool
+    ) -> Bool {
+        presentedFreshFrame && canValidate(
+            decoder: decoder,
+            allowsSoftwareDecoding: allowsSoftwareDecoding,
+            hasSelectedVideo: hasSelectedVideo
+        )
     }
 }
 

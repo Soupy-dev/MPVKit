@@ -191,7 +191,7 @@ public enum MPVMetalSampleBufferRendererError: Error, LocalizedError, Equatable 
     }
 }
 
-#if os(iOS) || os(tvOS) || (os(macOS) && arch(arm64))
+#if os(iOS) || os(tvOS) || (os(macOS) && (arch(arm64) || arch(x86_64)))
 import Darwin
 import Libmpv
 @preconcurrency import Metal
@@ -238,6 +238,9 @@ func mpvShouldDiscardPrematureEOFCache(
     )
 }
 
+#endif
+
+#if os(iOS) || os(tvOS) || (os(macOS) && arch(arm64))
 private final class MPVMetalSampleBufferCallbackToken: @unchecked Sendable {
     enum Kind {
         case render
@@ -4227,6 +4230,8 @@ public final class MPVMetalSampleBufferRenderer {
     public func currentAudioTrackID() -> Int { -1 }
     public func currentSubtitleTrackID() -> Int { -1 }
     public func setAudioTrack(id: Int) { _ = id }
+    func setVideoTrackSelection(_ selection: String) { _ = selection }
+    func currentVideoTrackSelection() -> String { "no" }
     public func setSubtitleTrack(id: Int) { _ = id }
     public func disableSubtitles() {}
     public func loadExternalSubtitles(urls: [String], names: [String]? = nil, selectFirst: Bool = true,

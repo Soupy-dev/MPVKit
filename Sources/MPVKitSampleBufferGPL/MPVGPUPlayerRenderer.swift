@@ -254,6 +254,11 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer, @unchecked Sendable {
 
     public override init(layer: Any) {
         super.init(layer: layer)
+        #if os(macOS) && arch(x86_64)
+        if let source = layer as? MPVGPUPlayerMetalLayer {
+            intelDrawablePixelLimit = source.intelDrawablePixelLimit
+        }
+        #endif
     }
 
     public required init?(coder: NSCoder) {
@@ -267,9 +272,132 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer, @unchecked Sendable {
                   newValue.height.isFinite,
                   newValue.width > 1,
                   newValue.height > 1 else { return }
+            #if os(macOS) && arch(x86_64)
+            intelGeometryLock.lock()
+            defer { intelGeometryLock.unlock() }
+            guard let bounded = intelBoundedDrawableSize(newValue) else { return }
+            super.drawableSize = bounded
+            #else
             super.drawableSize = newValue
+            #endif
         }
     }
+
+    #if os(macOS) && arch(x86_64)
+    private let intelGeometryLock = NSRecursiveLock()
+    private var intelIsUpdatingGeometry = false
+    private var intelConfiguredPixelLimit = 8_294_400
+
+    var intelDrawablePixelLimit: Int {
+        get {
+            intelGeometryLock.lock()
+            defer { intelGeometryLock.unlock() }
+            return intelConfiguredPixelLimit
+        }
+        set {
+            withIntelGeometryUpdate {
+                self.intelConfiguredPixelLimit = MPVDrawablePixelLimit.resolved(
+                    configured: newValue, platformMaximum: 8_294_400
+                )
+                if let scale = self.intelBoundedScale(bounds: super.bounds.size, requested: super.contentsScale) {
+                    super.contentsScale = scale
+                }
+            }
+        }
+    }
+
+    public override var bounds: CGRect {
+        get { super.bounds }
+        set {
+            guard newValue.width.isFinite, newValue.height.isFinite,
+                  newValue.width >= 0, newValue.height >= 0 else { return }
+            withIntelGeometryUpdate {
+                if newValue.width > 1, newValue.height > 1 {
+                    guard let scale = self.intelBoundedScale(bounds: newValue.size, requested: super.contentsScale) else { return }
+                    super.contentsScale = min(super.contentsScale, scale)
+                }
+                super.bounds = newValue
+            }
+        }
+    }
+
+    public override var frame: CGRect {
+        get { super.frame }
+        set {
+            guard newValue.width.isFinite, newValue.height.isFinite,
+                  newValue.width >= 0, newValue.height >= 0 else { return }
+            withIntelGeometryUpdate {
+                if newValue.width > 1, newValue.height > 1 {
+                    guard let scale = self.intelBoundedScale(bounds: newValue.size, requested: super.contentsScale) else { return }
+                    super.contentsScale = min(super.contentsScale, scale)
+                }
+                super.frame = newValue
+            }
+        }
+    }
+
+    public override var contentsScale: CGFloat {
+        get { super.contentsScale }
+        set {
+            guard newValue.isFinite, newValue > 0 else { return }
+            withIntelGeometryUpdate {
+                if super.bounds.width > 1, super.bounds.height > 1 {
+                    guard let scale = self.intelBoundedScale(bounds: super.bounds.size, requested: newValue) else { return }
+                    super.contentsScale = scale
+                } else {
+                    super.contentsScale = newValue
+                }
+            }
+        }
+    }
+
+    private func withIntelGeometryUpdate(_ update: () -> Void) {
+        intelGeometryLock.lock()
+        defer { intelGeometryLock.unlock() }
+        guard !intelIsUpdatingGeometry else { update(); return }
+        intelIsUpdatingGeometry = true
+        defer { intelIsUpdatingGeometry = false }
+        let previousDrawable = super.drawableSize
+        update()
+        if let bounded = intelBoundedDrawableSize(super.drawableSize)
+            ?? intelBoundedDrawableSize(previousDrawable) {
+            super.drawableSize = bounded
+        }
+    }
+
+    private func intelBoundedScale(bounds: CGSize, requested: CGFloat) -> CGFloat? {
+        let requestedSize = CGSize(width: bounds.width * requested, height: bounds.height * requested)
+        if requested.isFinite, requested > 0,
+           requestedSize.width.isFinite, requestedSize.height.isFinite,
+           requestedSize.width > 1, requestedSize.height > 1,
+           requestedSize.width <= intelMaximumTextureDimension,
+           requestedSize.height <= intelMaximumTextureDimension,
+           requestedSize.width * requestedSize.height <= CGFloat(intelConfiguredPixelLimit) {
+            return requested
+        }
+        guard let maximum = intelBoundedDrawableSize(requestedSize) else { return nil }
+        return MPVInlineDrawableLayout.resolved(
+            bounds: bounds,
+            presentationScale: requested,
+            maximumDrawableSize: maximum
+        )?.contentsScale
+    }
+
+    private var intelMaximumTextureDimension: CGFloat {
+        if let device, device.supportsFamily(.mac1) || device.supportsFamily(.mac2) || device.supportsFamily(.apple3) {
+            return 16_384
+        }
+        return 8_192
+    }
+
+    private func intelBoundedDrawableSize(_ requested: CGSize) -> CGSize? {
+        MPVIntelMacRenderPolicy.drawableSize(
+            requested: requested,
+            maximumDimension: intelMaximumTextureDimension,
+            maximumPixelCount: intelConfiguredPixelLimit
+        )
+    }
+    #endif
 
     #if !os(tvOS)
     @available(iOS 16.0, macOS 10.15, macCatalyst 16.0, visionOS 1.0, *)
@@ -289,7 +417,7 @@ public final class MPVGPUPlayerMetalLayer: CAMetalLayer, @unchecked Sendable {
     #endif
 }
 
-#if os(iOS) || os(tvOS) || (os(macOS) && arch(arm64))
+#if os(iOS) || os(tvOS) || (os(macOS) && (arch(arm64) || arch(x86_64)))
 import Libmpv
 import Metal
 import CoreMedia
@@ -542,6 +670,15 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
             guard let log = event.data?.assumingMemoryBound(to: mpv_event_log_message.self) else { return nil }
             let text = log.pointee.text.map { String(cString: $0) } ?? ""
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            #if os(macOS) && arch(x86_64)
+            if let message = MPVIntelMacRenderPolicy.deviceLossMessage(
+                prefix: log.pointee.prefix.map { String(cString: $0) } ?? "",
+                level: log.pointee.level.map { String(cString: $0) } ?? "",
+                message: trimmed
+            ) {
+                return .logError(message, playlistEntryID: activePlaylistEntryID)
+            }
+            #endif
             guard let category = mpvGPUInlineDiagnosticCategory(trimmed) else { return nil }
             let now = DispatchTime.now().uptimeNanoseconds
             if let last = lastForwardedInlineDiagnosticUptimeNanosecondsByCategory[category],
@@ -2464,15 +2601,32 @@ public final class MPVGPUPlayerRenderer {
             return "MoltenVK 1.4 is disabled on A12-class iPads due to an upstream GPU device-loss regression"
         }
         #endif
+        #if os(macOS) && arch(x86_64)
+        guard MPVIntelMacRenderPolicy.supportsInlineGPU(
+            supportsMac1: device.supportsFamily(.mac1),
+            supportsMac2: device.supportsFamily(.mac2)
+        ) else {
+            return "the GPU does not support the Mac Metal family"
+        }
+        #else
         guard device.supportsFamily(.apple4) else {
             return "the GPU predates Apple family 4"
         }
+        #endif
         return nil
 #endif
     }
 
     public static var isSupported: Bool {
         inlineGPUUnavailableReason == nil
+    }
+
+    public static var supportsPictureInPicture: Bool {
+        #if os(macOS) && arch(x86_64)
+        return false
+        #else
+        return true
+        #endif
     }
 
     public static let singleSessionPictureInPictureUnavailableReason =
@@ -2761,6 +2915,9 @@ public final class MPVGPUPlayerRenderer {
             guard resolvedScale.isFinite, resolvedScale > 0 else { return }
 
             self.inlineResizeRequestCount += 1
+            #if os(macOS) && arch(x86_64)
+            self.applyIntelInlineLayerLayout(bounds: bounds, presentationScale: resolvedScale)
+            #else
             #if os(tvOS)
             let layout = self.resolvedInlineDrawableLayout(
                 bounds: bounds.size,
@@ -2816,6 +2973,7 @@ public final class MPVGPUPlayerRenderer {
                 deadline: .now() + self.resolvedInlineResizeDebounceInterval,
                 execute: workItem
             )
+            #endif
         }
     }
 
@@ -2893,7 +3051,8 @@ public final class MPVGPUPlayerRenderer {
     /// later token-zero presentation is fenced to a higher native VO frame ID. Paused or buffering
     /// playback keeps the validation latch for `play()` rather than manufacturing decoder activity.
     public func validateForegroundVideoAfterSystemResume(
-        timeout: TimeInterval = 0.75
+        timeout: TimeInterval = 0.75,
+        allowsSoftwareDecoding: Bool = false
     ) async -> MPVGPUPlayerForegroundVideoValidation {
         guard isRunning,
               !isStopping,
@@ -2936,7 +3095,12 @@ public final class MPVGPUPlayerRenderer {
         }
 
         let decoder = refreshCurrentHardwareDecoder()
-        guard MPVVideoToolboxDecodePolicy.isEngaged(decoder) else {
+        let expectedVideoTrackID = allowsSoftwareDecoding ? currentVideoTrackID() : -1
+        guard MPVForegroundVideoValidationPolicy.canValidate(
+            decoder: decoder,
+            allowsSoftwareDecoding: allowsSoftwareDecoding,
+            hasSelectedVideo: expectedVideoTrackID >= 0
+        ) else {
             return .decoderUnavailable(current: decoder)
         }
         guard !isPaused, !isBuffering else {
@@ -3034,7 +3198,15 @@ public final class MPVGPUPlayerRenderer {
             }
             return .inlinePresentationTimedOut(decoder: confirmedDecoder)
         }
-        guard MPVVideoToolboxDecodePolicy.isEngaged(confirmedDecoder) else {
+        let hasSameSelectedVideo = allowsSoftwareDecoding
+            && expectedVideoTrackID >= 0
+            && currentVideoTrackID() == expectedVideoTrackID
+        guard MPVForegroundVideoValidationPolicy.isHealthy(
+            decoder: confirmedDecoder,
+            allowsSoftwareDecoding: allowsSoftwareDecoding,
+            hasSelectedVideo: hasSameSelectedVideo,
+            presentedFreshFrame: presented
+        ) else {
             return .decoderUnavailable(current: confirmedDecoder)
         }
         return .healthy(decoder: confirmedDecoder)
@@ -3743,6 +3915,11 @@ public final class MPVGPUPlayerRenderer {
     /// Prepares the selected PiP backend and returns only after a valid, current-generation frame
     /// has reached the AVSampleBufferDisplayLayer.
     public func preparePictureInPicture() async throws {
+        guard Self.supportsPictureInPicture else {
+            throw MPVGPUPlayerRendererError.pictureInPictureUnavailable(
+                "MPV picture in picture is unavailable on Intel Macs"
+            )
+        }
         cancelForegroundVideoValidation()
         guard !isStopping else { throw MPVGPUPlayerRendererError.teardownInProgress }
         guard isRunning else { throw MPVGPUPlayerRendererError.rendererNotRunning }
@@ -3833,7 +4010,8 @@ public final class MPVGPUPlayerRenderer {
     /// is already ready; new hosts should await `preparePictureInPicture()`.
     @available(*, deprecated, message: "Use preparePictureInPicture() async throws")
     public func prepareForPictureInPictureStart(primeFrameCount: Int = 8) -> Bool {
-        guard !isStopping,
+        guard Self.supportsPictureInPicture,
+              !isStopping,
               isRunning,
               currentURL != nil,
               activeHardwareDecoderRecoveryTransitionID == nil,
@@ -3868,6 +4046,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func beginPictureInPicture() {
+        guard Self.supportsPictureInPicture else { return }
         cancelForegroundVideoValidation()
         guard !isPrimaryLoadSubmissionPending else { return }
         let generation = pictureInPicturePreparationGeneration
@@ -4666,7 +4845,11 @@ public final class MPVGPUPlayerRenderer {
         inlineLayer.framebufferOnly = true
         #if os(macOS)
         inlineLayer.backgroundColor = NSColor.black.cgColor
+        #if arch(x86_64)
+        applyIntelInlineLayerLayout(bounds: inlineLayer.bounds, presentationScale: presentationScale)
+        #else
         inlineLayer.contentsScale = presentationScale
+        #endif
         #else
         inlineLayer.backgroundColor = UIColor.black.cgColor
         #if os(tvOS)
@@ -5757,7 +5940,9 @@ public final class MPVGPUPlayerRenderer {
     }
 
     private var resolvedMaximumInlineDrawablePixelCount: Int {
-        #if os(macOS)
+        #if os(macOS) && arch(x86_64)
+        let platformMaximum = 8_294_400
+        #elseif os(macOS)
         let platformMaximum = 14_745_600
         #else
         let platformMaximum = 8_294_400
@@ -5804,6 +5989,14 @@ public final class MPVGPUPlayerRenderer {
               requestedSize.height.isFinite,
               requestedSize.width > 1,
               requestedSize.height > 1 else { return nil }
+        #if os(macOS) && arch(x86_64)
+        let device = inlineLayer.device ?? MTLCreateSystemDefaultDevice()
+        return MPVIntelMacRenderPolicy.drawableSize(
+            requested: requestedSize,
+            maximumDimension: Self.maximumTextureDimension2D(for: device),
+            maximumPixelCount: resolvedMaximumInlineDrawablePixelCount
+        )
+        #else
         let device = MTLCreateSystemDefaultDevice()
         let maximumDimension = Self.maximumTextureDimension2D(for: device)
         var width = min(requestedSize.width, maximumDimension)
@@ -5816,6 +6009,7 @@ public final class MPVGPUPlayerRenderer {
             height *= scale
         }
         return CGSize(width: max(2, floor(width)), height: max(2, floor(height)))
+        #endif
     }
 
     /// Metal does not expose a `maxTextureDimension2D` property in the public Apple SDK.
@@ -5827,6 +6021,38 @@ public final class MPVGPUPlayerRenderer {
         }
         return 8_192
     }
+
+    #if os(macOS) && arch(x86_64)
+    private func applyIntelInlineLayerLayout(bounds: CGRect, presentationScale: CGFloat) {
+        (inlineLayer as? MPVGPUPlayerMetalLayer)?.intelDrawablePixelLimit = resolvedMaximumInlineDrawablePixelCount
+        guard let maximum = validatedInlineDrawableSize(CGSize(
+            width: bounds.width * presentationScale,
+            height: bounds.height * presentationScale
+        )), let layout = MPVInlineDrawableLayout.resolved(
+            bounds: bounds.size,
+            presentationScale: presentationScale,
+            maximumDrawableSize: maximum
+        ) else { return }
+        let previous = inlineLayer.drawableSize
+        inlineResizeWorkItem?.cancel()
+        inlineResizeWorkItem = nil
+        pendingInlineDrawableSize = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let hostOwnsLayerGeometry = (inlineLayer.delegate as? NSView)?.layer === inlineLayer
+        if !hostOwnsLayerGeometry {
+            inlineLayer.contentsScale = min(inlineLayer.contentsScale, layout.contentsScale)
+            inlineLayer.frame = bounds
+        }
+        inlineLayer.contentsScale = layout.contentsScale
+        inlineLayer.drawableSize = layout.drawableSize
+        CATransaction.commit()
+        if previous != inlineLayer.drawableSize {
+            inlineResizeApplicationCount += 1
+        }
+        emitDiagnostics()
+    }
+    #endif
 
     private func applyPendingInlineDrawableSize() {
         inlineResizeWorkItem = nil
@@ -6510,6 +6736,7 @@ public final class MPVGPUPlayerRenderer {
 @MainActor
 public final class MPVGPUPlayerRenderer {
     public static let isSupported = false
+    public static let supportsPictureInPicture = false
     public static let inlineGPUUnavailableReason: String? = "the native macOS renderer requires Apple Silicon"
     public static let singleSessionPictureInPictureUnavailableReason =
         "native gpu-next IOSurface sink symbols or required runtime capabilities are unavailable"
@@ -6573,9 +6800,11 @@ public final class MPVGPUPlayerRenderer {
     public func inlineRenderPasses(includeRedraw: Bool = false) -> [MPVGPUPlayerRenderPass] { _ = includeRedraw; return [] }
     public func refreshCurrentHardwareDecoder() -> String { "" }
     public func validateForegroundVideoAfterSystemResume(
-        timeout: TimeInterval = 0.75
+        timeout: TimeInterval = 0.75,
+        allowsSoftwareDecoding: Bool = false
     ) async -> MPVGPUPlayerForegroundVideoValidation {
         _ = timeout
+        _ = allowsSoftwareDecoding
         return .unavailable
     }
     @discardableResult

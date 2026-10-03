@@ -1,6 +1,143 @@
 import XCTest
 @testable import MPVKitSampleBufferCore
 
+final class MPVIntelMacRenderPolicyTests: XCTestCase {
+    func testDeviceLossRequiresTrustedRendererErrorAndReturnsOnlyConstantText() {
+        for prefix in ["vo/gpu-next", "vo/gpu-next/libplacebo", "vo/gpu-next/vulkan/libplacebo"] {
+            XCTAssertEqual(MPVIntelMacRenderPolicy.deviceLossMessage(
+                prefix: prefix, level: "error", message: "vkQueueSubmit failed: VK_ERROR_DEVICE_LOST https://secret.invalid/token"
+            ), "GPU device lost. Retry playback to continue.")
+        }
+        for prefix in ["ffmpeg", "demux", "player", "vo/gpu-next-untrusted", "script/vo/gpu-next"] {
+            XCTAssertNil(MPVIntelMacRenderPolicy.deviceLossMessage(
+                prefix: prefix, level: "error", message: "VK_ERROR_DEVICE_LOST"
+            ))
+        }
+        for level in ["info", "warn", "debug", "trace", ""] {
+            XCTAssertNil(MPVIntelMacRenderPolicy.deviceLossMessage(
+                prefix: "vo/gpu-next", level: level, message: "VK_ERROR_DEVICE_LOST"
+            ))
+        }
+        XCTAssertNil(MPVIntelMacRenderPolicy.deviceLossMessage(
+            prefix: "vo/gpu-next", level: "error", message: "Failed to open media"
+        ))
+    }
+
+    func testInlineGPURequiresMacFamilySupport() {
+        XCTAssertTrue(MPVIntelMacRenderPolicy.supportsInlineGPU(supportsMac1: true, supportsMac2: false))
+        XCTAssertTrue(MPVIntelMacRenderPolicy.supportsInlineGPU(supportsMac1: false, supportsMac2: true))
+        XCTAssertTrue(MPVIntelMacRenderPolicy.supportsInlineGPU(supportsMac1: true, supportsMac2: true))
+        XCTAssertFalse(MPVIntelMacRenderPolicy.supportsInlineGPU(supportsMac1: false, supportsMac2: false))
+    }
+
+    func testDrawableSizePreservesWideAndPortraitAspectWithinTextureAndAreaLimits() throws {
+        for requested in [CGSize(width: 32_768, height: 8_192), CGSize(width: 8_192, height: 32_768)] {
+            let result = try XCTUnwrap(MPVIntelMacRenderPolicy.drawableSize(
+                requested: requested,
+                maximumDimension: 8_192,
+                maximumPixelCount: 8_294_400
+            ))
+            XCTAssertLessThanOrEqual(result.width, 8_192)
+            XCTAssertLessThanOrEqual(result.height, 8_192)
+            XCTAssertLessThanOrEqual(result.width * result.height, 8_294_400)
+            XCTAssertEqual(result.width / result.height, requested.width / requested.height, accuracy: 0.002)
+        }
+    }
+
+    func testDrawableSizeKeepsOrdinaryWindowSizeAndDoesNotUpscale() {
+        let requested = CGSize(width: 1_280, height: 720)
+        XCTAssertEqual(MPVIntelMacRenderPolicy.drawableSize(
+            requested: requested,
+            maximumDimension: 16_384,
+            maximumPixelCount: 8_294_400
+        ), requested)
+    }
+
+    func testDrawableSizeRejectsNonFiniteMinimizedAndUnrepresentableSurfaces() {
+        for requested in [
+            CGSize.zero,
+            CGSize(width: 1, height: 720),
+            CGSize(width: -1, height: 720),
+            CGSize(width: CGFloat.nan, height: 720),
+            CGSize(width: 1_280, height: CGFloat.infinity),
+            CGSize(width: CGFloat.greatestFiniteMagnitude, height: 2)
+        ] {
+            XCTAssertNil(MPVIntelMacRenderPolicy.drawableSize(
+                requested: requested,
+                maximumDimension: 8_192,
+                maximumPixelCount: 8_294_400
+            ))
+        }
+        XCTAssertNil(MPVIntelMacRenderPolicy.drawableSize(
+            requested: CGSize(width: 1_280, height: 720),
+            maximumDimension: .nan,
+            maximumPixelCount: 8_294_400
+        ))
+        XCTAssertNil(MPVIntelMacRenderPolicy.drawableSize(
+            requested: CGSize(width: 1_280, height: 720),
+            maximumDimension: 8_192,
+            maximumPixelCount: 3
+        ))
+    }
+}
+
+final class MPVForegroundVideoValidationPolicyTests: XCTestCase {
+    func testSoftwareDecoderRequiresExplicitOptInAndSelectedVideo() {
+        XCTAssertFalse(MPVForegroundVideoValidationPolicy.canValidate(
+            decoder: "no", allowsSoftwareDecoding: false, hasSelectedVideo: true
+        ))
+        XCTAssertFalse(MPVForegroundVideoValidationPolicy.canValidate(
+            decoder: "no", allowsSoftwareDecoding: true, hasSelectedVideo: false
+        ))
+        XCTAssertTrue(MPVForegroundVideoValidationPolicy.canValidate(
+            decoder: " NO ", allowsSoftwareDecoding: true, hasSelectedVideo: true
+        ))
+    }
+
+    func testUnknownAndUnavailableDecoderValuesNeverProveSoftwareDecoding() {
+        for decoder in ["", " ", "auto", "software", "unknown", "vaapi"] {
+            XCTAssertFalse(MPVForegroundVideoValidationPolicy.isHealthy(
+                decoder: decoder,
+                allowsSoftwareDecoding: true,
+                hasSelectedVideo: true,
+                presentedFreshFrame: true
+            ))
+        }
+    }
+
+    func testHealthyResultRequiresFreshInlinePresentationAndRechecksTrackSelection() {
+        XCTAssertFalse(MPVForegroundVideoValidationPolicy.isHealthy(
+            decoder: "no", allowsSoftwareDecoding: true, hasSelectedVideo: true, presentedFreshFrame: false
+        ))
+        XCTAssertFalse(MPVForegroundVideoValidationPolicy.isHealthy(
+            decoder: "no", allowsSoftwareDecoding: true, hasSelectedVideo: false, presentedFreshFrame: true
+        ))
+        XCTAssertTrue(MPVForegroundVideoValidationPolicy.isHealthy(
+            decoder: "no", allowsSoftwareDecoding: true, hasSelectedVideo: true, presentedFreshFrame: true
+        ))
+    }
+
+    func testDefaultHardwareValidationRetainsExistingBehavior() {
+        for decoder in ["videotoolbox", " VideoToolbox-Copy "] {
+            XCTAssertTrue(MPVForegroundVideoValidationPolicy.canValidate(
+                decoder: decoder, allowsSoftwareDecoding: false, hasSelectedVideo: false
+            ))
+            XCTAssertTrue(MPVForegroundVideoValidationPolicy.isHealthy(
+                decoder: decoder,
+                allowsSoftwareDecoding: false,
+                hasSelectedVideo: false,
+                presentedFreshFrame: true
+            ))
+            XCTAssertFalse(MPVForegroundVideoValidationPolicy.isHealthy(
+                decoder: decoder,
+                allowsSoftwareDecoding: false,
+                hasSelectedVideo: true,
+                presentedFreshFrame: false
+            ))
+        }
+    }
+}
+
 final class MPVPlaybackEndGateTests: XCTestCase {
     func testRecoveredPlaybackCanReachEOFWithoutStaleResumeRearmingAnotherLoad() {
         var gate = MPVPlaybackEndGate()
