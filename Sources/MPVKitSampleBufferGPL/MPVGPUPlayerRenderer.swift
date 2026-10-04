@@ -431,6 +431,8 @@ private enum MPVGPUPlayerEvent: Sendable {
     case startFile(playlistEntryID: Int64)
     case fileLoaded(playlistEntryID: Int64?)
     case videoReconfigure(playlistEntryID: Int64?)
+    case seek(playlistEntryID: Int64?)
+    case playbackRestart(playlistEntryID: Int64?)
     case endFile(playlistEntryID: Int64, reachedEOF: Bool, error: String?)
     case propertyChange(String, value: MPVGPUObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
@@ -646,6 +648,10 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
             return .fileLoaded(playlistEntryID: activePlaylistEntryID)
         case MPV_EVENT_VIDEO_RECONFIG:
             return .videoReconfigure(playlistEntryID: activePlaylistEntryID)
+        case MPV_EVENT_SEEK:
+            return .seek(playlistEntryID: activePlaylistEntryID)
+        case MPV_EVENT_PLAYBACK_RESTART:
+            return .playbackRestart(playlistEntryID: activePlaylistEntryID)
         case MPV_EVENT_END_FILE:
             guard let data = event.data else { return nil }
             let endFile = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
@@ -2749,7 +2755,18 @@ public final class MPVGPUPlayerRenderer {
     private var nextHardwareDecoderRecoveryTransitionID: UInt64 = 0
     private var activeHardwareDecoderRecoveryTransitionID: UInt64?
     private var hardwareDecoderRecoveryInvalidationGeneration: UInt64 = 0
+    private var hardwareDecoderRecoveryVideoSelectionIntentGeneration: UInt64 = 0
     private var hardwareDecoderRecoveryTransitionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hardwareDecoderRecoveryTimeline: (epoch: UInt64, anchor: Double, invalidationGeneration: UInt64)?
+    private var hardwareDecoderRecoverySynchronization: (
+        epoch: UInt64,
+        loadIdentity: MPVLoadIdentityTracker.Identity,
+        invalidationGeneration: UInt64,
+        selectedVideoTrackID: Int,
+        sawSeek: Bool,
+        continuation: CheckedContinuation<Bool, Never>
+    )?
+    private var hardwareDecoderRecoverySynchronizationTimeoutTask: Task<Void, Never>?
     private var nextForegroundVideoValidationID: UInt64 = 0
     private var activeForegroundVideoValidationID: UInt64?
     private var activeForegroundVideoValidationGeneration: UInt64?
@@ -2885,6 +2902,7 @@ public final class MPVGPUPlayerRenderer {
             MPVApplePictureInPictureCallbackRegistry.unregister(context)
         }
         foregroundVideoValidationTimeoutTask?.cancel()
+        hardwareDecoderRecoverySynchronizationTimeoutTask?.cancel()
         pictureInPicturePreparationTimeoutTask?.cancel()
         inlineResizeWorkItem?.cancel()
         pictureInPictureResizeWorkItem?.cancel()
@@ -2893,7 +2911,9 @@ public final class MPVGPUPlayerRenderer {
         let pump = eventPump
         let compatibilityRenderer = pictureInPictureRendererStorage
         let asyncReplies = Array(pendingAsyncReplies.values)
+        let synchronizationContinuation = hardwareDecoderRecoverySynchronization?.continuation
         Task { @MainActor in
+            synchronizationContinuation?.resume(returning: false)
             for reply in asyncReplies { reply.complete(-1) }
             sink?.stop()
             await earlierShutdown?.value
@@ -3240,7 +3260,7 @@ public final class MPVGPUPlayerRenderer {
     /// can invalidate a decoder session while an app is backgrounded even though `hwdec-current`
     /// still briefly reports the old backend. MPVKit first waits for mpv to confirm that the old
     /// track was fully deselected, reapplies the requested VideoToolbox order, and then reselects
-    /// the same track without replacing the media, audio clock, subtitle state, or position.
+    /// the same track without replacing the media or subtitle state.
     ///
     /// A successful submission is not itself decoded-frame proof. Match its epoch against
     /// `onHardwareDecoderRecoveryOutput`; that callback now joins a post-epoch VIDEO_RECONFIG with
@@ -3281,6 +3301,10 @@ public final class MPVGPUPlayerRenderer {
 
         guard let expectedLoadIdentity = currentPrimaryLoadIdentity else { return .unavailable }
         let expectedInvalidationGeneration = hardwareDecoderRecoveryInvalidationGeneration
+        let expectedVideoSelectionIntentGeneration = hardwareDecoderRecoveryVideoSelectionIntentGeneration
+        guard isPaused, !cachedSeeking, getFlagProperty("seeking") != true,
+              getFlagProperty("pause") == true,
+              let timelineAnchor = hardwareDecoderRecoveryTimelineAnchor() else { return .transitionBusy }
         let selection = String(selectedVideoTrack)
 
         nextHardwareDecoderRecoveryTransitionID &+= 1
@@ -3293,7 +3317,8 @@ public final class MPVGPUPlayerRenderer {
             guard isRunning,
                   !isStopping,
                   currentURL != nil,
-                  currentPrimaryLoadIdentity == expectedLoadIdentity else { return }
+                  currentPrimaryLoadIdentity == expectedLoadIdentity,
+                  hardwareDecoderRecoveryVideoSelectionIntentGeneration == expectedVideoSelectionIntentGeneration else { return }
             _ = setHardwareDecoderRecoveryVideoSelection(selection)
         }
         guard !Task.isCancelled else { return .cancelled }
@@ -3376,6 +3401,7 @@ public final class MPVGPUPlayerRenderer {
         hardwareDecoderRecoveryProof.reset()
         activeHardwareDecoderRecoveryEpoch = epoch
         activeHardwareDecoderRecoveryGeneration = expectedLoadIdentity.clientGeneration
+        hardwareDecoderRecoveryTimeline = (epoch, timelineAnchor, expectedInvalidationGeneration)
         guard commandPrimary(["set", "hwdec", recoverySetting]) >= 0 else {
             _ = setHardwareDecoderRecoveryVideoSelection(selection)
             _ = finishHardwareDecoderRecoveryAttempt(epoch: epoch)
@@ -3387,6 +3413,123 @@ public final class MPVGPUPlayerRenderer {
             return .commandFailed
         }
         return .accepted(epoch: epoch)
+    }
+
+    private func hardwareDecoderRecoveryTimelineAnchor() -> Double? {
+        let duration = getDoubleProperty("duration")
+        let candidates = currentAudioTrackID() >= 0
+            ? [getDoubleProperty("audio-pts"), getDoubleProperty("time-pos")]
+            : [getDoubleProperty("time-pos")]
+        for case let candidate? in candidates {
+            guard candidate.isFinite, candidate >= 0 else { continue }
+            if let duration, duration.isFinite, duration > 0, candidate >= duration { continue }
+            return candidate
+        }
+        return nil
+    }
+
+    public func synchronizeHardwareDecoderRecoveryAfterSystemResume(
+        epoch: UInt64,
+        timeout: TimeInterval = 4
+    ) async -> Bool {
+        let selectedVideoTrackID = currentVideoTrackID()
+        guard !Task.isCancelled,
+              timeout.isFinite, timeout > 0,
+              selectedVideoTrackID >= 0,
+              isRunning, !isStopping, isPaused,
+              currentURL != nil,
+              activeHardwareDecoderRecoveryTransitionID == nil,
+              activeHardwareDecoderRecoveryEpoch == epoch,
+              hardwareDecoderRecoverySynchronization == nil,
+              let timeline = hardwareDecoderRecoveryTimeline,
+              timeline.epoch == epoch,
+              timeline.invalidationGeneration == hardwareDecoderRecoveryInvalidationGeneration,
+              let loadIdentity = currentPrimaryLoadIdentity,
+              activeHardwareDecoderRecoveryGeneration == loadIdentity.clientGeneration,
+              !isAwaitingPrimaryFileLoaded,
+              !isPrimaryLoadSubmissionPending,
+              !isPictureInPicturePrepared, !isPictureInPictureActive,
+              isPictureInPictureTrackOwnershipIdle,
+              pendingSingleSessionShutdown == nil,
+              activePictureInPictureRestore == nil,
+              !cachedSeeking, getFlagProperty("seeking") != true,
+              getFlagProperty("pause") == true,
+              getFlagProperty("seekable") == true else { return false }
+        var synchronizationAnchor = timeline.anchor
+        if currentAudioTrackID() >= 0,
+           let audioPosition = getDoubleProperty("audio-pts"),
+           audioPosition.isFinite, audioPosition >= 0 {
+            let duration = getDoubleProperty("duration")
+            if let duration, duration.isFinite, duration > 0 {
+                if audioPosition < duration { synchronizationAnchor = audioPosition }
+            } else {
+                synchronizationAnchor = audioPosition
+            }
+        }
+        let fenceStatus = await fencePrimaryVideoSelectionAsync()
+        guard fenceStatus >= 0, !Task.isCancelled,
+              isRunning, !isStopping, isPaused,
+              currentPrimaryLoadIdentity == loadIdentity,
+              activeHardwareDecoderRecoveryEpoch == epoch,
+              hardwareDecoderRecoverySynchronization == nil,
+              hardwareDecoderRecoveryInvalidationGeneration == timeline.invalidationGeneration,
+              !isAwaitingPrimaryFileLoaded, !isPrimaryLoadSubmissionPending,
+              !isPictureInPicturePrepared, !isPictureInPictureActive,
+              isPictureInPictureTrackOwnershipIdle,
+              pendingSingleSessionShutdown == nil, activePictureInPictureRestore == nil,
+              getFlagProperty("pause") == true,
+              getFlagProperty("seeking") != true,
+              currentVideoTrackID() == selectedVideoTrackID else { return false }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                hardwareDecoderRecoverySynchronization = (
+                    epoch, loadIdentity, timeline.invalidationGeneration, selectedVideoTrackID, false, continuation
+                )
+                hardwareDecoderRecoverySynchronizationTimeoutTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(min(15, timeout) * 1_000_000_000))
+                    guard !Task.isCancelled else { return }
+                    self?.finishHardwareDecoderRecoverySynchronization(epoch: epoch, succeeded: false)
+                }
+                guard commandPrimary(["seek", "\(synchronizationAnchor)", "absolute+exact"]) >= 0 else {
+                    finishHardwareDecoderRecoverySynchronization(epoch: epoch, succeeded: false)
+                    return
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.finishHardwareDecoderRecoverySynchronization(epoch: epoch, succeeded: false)
+            }
+        }
+    }
+
+    private func finishHardwareDecoderRecoverySynchronization(epoch: UInt64, succeeded: Bool) {
+        guard let synchronization = hardwareDecoderRecoverySynchronization,
+              synchronization.epoch == epoch else { return }
+        hardwareDecoderRecoverySynchronization = nil
+        hardwareDecoderRecoverySynchronizationTimeoutTask?.cancel()
+        hardwareDecoderRecoverySynchronizationTimeoutTask = nil
+        let isCurrent = isRunning && !isStopping && isPaused
+            && currentPrimaryLoadIdentity == synchronization.loadIdentity
+            && activeHardwareDecoderRecoveryEpoch == epoch
+            && hardwareDecoderRecoveryInvalidationGeneration == synchronization.invalidationGeneration
+            && !isAwaitingPrimaryFileLoaded && !isPrimaryLoadSubmissionPending
+            && !isPictureInPicturePrepared && !isPictureInPictureActive
+            && isPictureInPictureTrackOwnershipIdle
+            && pendingSingleSessionShutdown == nil && activePictureInPictureRestore == nil
+            && getFlagProperty("pause") == true
+            && currentVideoTrackID() == synchronization.selectedVideoTrackID
+        synchronization.continuation.resume(returning: succeeded && isCurrent)
+    }
+
+    private func invalidateHardwareDecoderRecoveryPlaybackIntent() {
+        hardwareDecoderRecoveryInvalidationGeneration &+= 1
+        if let synchronization = hardwareDecoderRecoverySynchronization {
+            finishHardwareDecoderRecoverySynchronization(epoch: synchronization.epoch, succeeded: false)
+        }
     }
 
     @discardableResult
@@ -3427,6 +3570,8 @@ public final class MPVGPUPlayerRenderer {
     @discardableResult
     public func finishHardwareDecoderRecoveryAttempt(epoch: UInt64) -> Bool {
         guard activeHardwareDecoderRecoveryEpoch == epoch else { return false }
+        finishHardwareDecoderRecoverySynchronization(epoch: epoch, succeeded: false)
+        hardwareDecoderRecoveryTimeline = nil
         activeHardwareDecoderRecoveryEpoch = nil
         activeHardwareDecoderRecoveryGeneration = nil
         hardwareDecoderRecoveryProof.reset()
@@ -3539,7 +3684,8 @@ public final class MPVGPUPlayerRenderer {
         }
         isStopping = true
         engineGeneration &+= 1
-        hardwareDecoderRecoveryInvalidationGeneration &+= 1
+        invalidateHardwareDecoderRecoveryPlaybackIntent()
+        hardwareDecoderRecoveryTimeline = nil
         activeHardwareDecoderRecoveryEpoch = nil
         activeHardwareDecoderRecoveryGeneration = nil
         hardwareDecoderRecoveryProof.reset()
@@ -3797,8 +3943,11 @@ public final class MPVGPUPlayerRenderer {
         }
     }
 
-    public func play() {
+    public func play(preservingHardwareDecoderRecovery: Bool = false) {
         performOnMain {
+            if !preservingHardwareDecoderRecovery {
+                self.invalidateHardwareDecoderRecoveryPlaybackIntent()
+            }
             self.isPaused = false
             guard !self.isPrimaryLoadSubmissionPending,
                   !self.isAwaitingPrimaryFileLoaded else {
@@ -3821,8 +3970,11 @@ public final class MPVGPUPlayerRenderer {
         }
     }
 
-    public func pause() {
+    public func pause(preservingHardwareDecoderRecovery: Bool = false) {
         performOnMain {
+            if !preservingHardwareDecoderRecovery {
+                self.invalidateHardwareDecoderRecoveryPlaybackIntent()
+            }
             self.isPaused = true
             guard !self.isPrimaryLoadSubmissionPending,
                   !self.isAwaitingPrimaryFileLoaded else {
@@ -4278,10 +4430,25 @@ public final class MPVGPUPlayerRenderer {
 
     @discardableResult
     public func command(_ args: [String]) -> Int32 {
+        if let operation = args.first?.lowercased(),
+           ["seek", "revert-seek", "frame-step", "frame-back-step"].contains(operation)
+            || (["set", "set_property", "cycle"].contains(operation)
+                && args.count > 1 && args[1].lowercased() == "pause") {
+            invalidateHardwareDecoderRecoveryPlaybackIntent()
+        }
         if let selection = explicitVideoTrackSelection(in: args) {
             return setDesiredVideoTrackSelection(selection)
         }
         let targetsVideoTrack = commandTargetsVideoTrack(args)
+        if targetsVideoTrack {
+            hardwareDecoderRecoveryVideoSelectionIntentGeneration &+= 1
+            invalidateHardwareDecoderRecoveryPlaybackIntent()
+        } else if args.count >= 2,
+                  ["set", "set_property", "add", "multiply", "cycle", "cycle-values"]
+                    .contains(args[0].lowercased()),
+                  args[1].lowercased() == "aid" {
+            invalidateHardwareDecoderRecoveryPlaybackIntent()
+        }
         if targetsVideoTrack, compatibilityVideoSelection.isInlineSuppressed {
             guard selectedPictureInPictureBackend == .compatibilityDualSession,
                   isPictureInPicturePrepared || isPictureInPictureActive else { return -1 }
@@ -4484,6 +4651,7 @@ public final class MPVGPUPlayerRenderer {
     }
 
     public func setAudioTrack(id: Int) {
+        invalidateHardwareDecoderRecoveryPlaybackIntent()
         guard !deferPrimaryLoadActionIfNeeded(.audioTrack(id)) else { return }
         applyAudioTrack(id)
     }
@@ -4571,6 +4739,8 @@ public final class MPVGPUPlayerRenderer {
 
     @discardableResult
     private func setDesiredVideoTrackSelection(_ selection: String) -> Int32 {
+        hardwareDecoderRecoveryVideoSelectionIntentGeneration &+= 1
+        invalidateHardwareDecoderRecoveryPlaybackIntent()
         _ = compatibilityVideoSelection.select(selection)
         let normalized = compatibilityVideoSelection.desiredSelection
         if deferPrimaryLoadActionIfNeeded(.videoTrack(normalized)) { return 0 }
@@ -6260,6 +6430,15 @@ public final class MPVGPUPlayerRenderer {
                 }
             }
             resumeNativePictureInPictureProbeIfReady(pendingNativeProbeGeneration)
+        case .seek(let playlistEntryID):
+            guard let synchronization = hardwareDecoderRecoverySynchronization,
+                  currentLoadIdentity(for: playlistEntryID) == synchronization.loadIdentity else { return }
+            hardwareDecoderRecoverySynchronization?.sawSeek = true
+        case .playbackRestart(let playlistEntryID):
+            guard let synchronization = hardwareDecoderRecoverySynchronization,
+                  synchronization.sawSeek,
+                  currentLoadIdentity(for: playlistEntryID) == synchronization.loadIdentity else { return }
+            finishHardwareDecoderRecoverySynchronization(epoch: synchronization.epoch, succeeded: true)
         case .endFile(let playlistEntryID, let reachedEOF, let error):
             let identity = loadIdentityTracker.didEnd(playlistEntryID: playlistEntryID)
             if reachedEOF { notifyPlaybackEnd(identity: identity) }
@@ -6814,6 +6993,10 @@ public final class MPVGPUPlayerRenderer {
         _ = strategy
         return .unavailable
     }
+    public func synchronizeHardwareDecoderRecoveryAfterSystemResume(
+        epoch: UInt64,
+        timeout: TimeInterval = 4
+    ) async -> Bool { _ = epoch; _ = timeout; return false }
     @discardableResult
     public func finishHardwareDecoderRecoveryAttempt(epoch: UInt64) -> Bool { _ = epoch; return false }
     public func yieldHardwareDecoderRecoveryToPictureInPicture() {}
@@ -6826,8 +7009,8 @@ public final class MPVGPUPlayerRenderer {
         _ = headers
         _ = generation
     }
-    public func play() {}
-    public func pause() {}
+    public func play(preservingHardwareDecoderRecovery: Bool = false) { _ = preservingHardwareDecoderRecovery }
+    public func pause(preservingHardwareDecoderRecovery: Bool = false) { _ = preservingHardwareDecoderRecovery }
     public func seek(to seconds: Double) { _ = seconds }
     public func seek(by seconds: Double) { _ = seconds }
     public func setSpeed(_ speed: Double) { _ = speed }
