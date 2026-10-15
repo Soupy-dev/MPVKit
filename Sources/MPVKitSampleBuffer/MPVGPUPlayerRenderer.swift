@@ -68,6 +68,7 @@ public enum MPVGPUPlayerForegroundVideoValidation: Equatable, Sendable {
     case playbackDeferred(decoder: String)
     case decoderUnavailable(current: String)
     case inlinePresentationTimedOut(decoder: String)
+    case timelineUnhealthy(decoder: String)
     case transitionBusy
     case unavailable
 }
@@ -437,6 +438,7 @@ private enum MPVGPUPlayerEvent: Sendable {
     case propertyChange(String, value: MPVGPUObservedPropertyValue, playlistEntryID: Int64?)
     case logError(String, playlistEntryID: Int64?)
     case inlineHitchDiagnostic(String, playlistEntryID: Int64?)
+    case videoTimelineDiscontinuity(playlistEntryID: Int64?)
     case asyncReply(requestID: UInt64, error: Int32)
     case shutdown
 }
@@ -690,7 +692,8 @@ private final class MPVGPUPlayerEventPump: @unchecked Sendable {
             if let last = lastForwardedInlineDiagnosticUptimeNanosecondsByCategory[category],
                now >= last,
                now - last < 5_000_000_000 {
-                return nil
+                return category == .decodeError || category == .videoTimestampReset
+                    ? .videoTimelineDiscontinuity(playlistEntryID: activePlaylistEntryID) : nil
             }
             lastForwardedInlineDiagnosticUptimeNanosecondsByCategory[category] = now
             return .inlineHitchDiagnostic(
@@ -2767,6 +2770,7 @@ public final class MPVGPUPlayerRenderer {
         continuation: CheckedContinuation<Bool, Never>
     )?
     private var hardwareDecoderRecoverySynchronizationTimeoutTask: Task<Void, Never>?
+    private var foregroundVideoTimelineDiscontinuityGeneration: UInt64 = 0
     private var nextForegroundVideoValidationID: UInt64 = 0
     private var activeForegroundVideoValidationID: UInt64?
     private var activeForegroundVideoValidationGeneration: UInt64?
@@ -3115,7 +3119,10 @@ public final class MPVGPUPlayerRenderer {
         }
 
         let decoder = refreshCurrentHardwareDecoder()
-        let expectedVideoTrackID = allowsSoftwareDecoding ? currentVideoTrackID() : -1
+        let expectedVideoTrackID = currentVideoTrackID()
+        let expectedAudioTrackID = currentAudioTrackID()
+        let expectedInvalidationGeneration = hardwareDecoderRecoveryInvalidationGeneration
+        let expectedDiscontinuityGeneration = foregroundVideoTimelineDiscontinuityGeneration
         guard MPVForegroundVideoValidationPolicy.canValidate(
             decoder: decoder,
             allowsSoftwareDecoding: allowsSoftwareDecoding,
@@ -3208,7 +3215,8 @@ public final class MPVGPUPlayerRenderer {
         guard !Task.isCancelled,
               isRunning,
               !isStopping,
-              currentPrimaryLoadIdentity == expectedLoadIdentity else {
+              currentPrimaryLoadIdentity == expectedLoadIdentity,
+              hardwareDecoderRecoveryInvalidationGeneration == expectedInvalidationGeneration else {
             return .unavailable
         }
         let confirmedDecoder = refreshCurrentHardwareDecoder()
@@ -3218,8 +3226,7 @@ public final class MPVGPUPlayerRenderer {
             }
             return .inlinePresentationTimedOut(decoder: confirmedDecoder)
         }
-        let hasSameSelectedVideo = allowsSoftwareDecoding
-            && expectedVideoTrackID >= 0
+        let hasSameSelectedVideo = expectedVideoTrackID >= 0
             && currentVideoTrackID() == expectedVideoTrackID
         guard MPVForegroundVideoValidationPolicy.isHealthy(
             decoder: confirmedDecoder,
@@ -3229,7 +3236,106 @@ public final class MPVGPUPlayerRenderer {
         ) else {
             return .decoderUnavailable(current: confirmedDecoder)
         }
-        return .healthy(decoder: confirmedDecoder)
+        let speed = getSpeed()
+        let observationDuration = min(1, max(0.15, queuedFrameWindow / max(0.1, speed)))
+        let tolerance = sourceFPS.isFinite && sourceFPS > 0 ? max(0.25, 2 / sourceFPS) : 0.25
+        let timelineHealthy = await validateForegroundPlaybackTimeline(
+            loadIdentity: expectedLoadIdentity,
+            invalidationGeneration: expectedInvalidationGeneration,
+            discontinuityGeneration: expectedDiscontinuityGeneration,
+            videoTrackID: expectedVideoTrackID,
+            audioTrackID: expectedAudioTrackID,
+            minimumObservationDuration: observationDuration,
+            synchronizationTolerance: tolerance,
+            timeout: max(boundedTimeout, observationDuration + 0.15)
+        )
+        guard !Task.isCancelled,
+              isRunning, !isStopping,
+              currentPrimaryLoadIdentity == expectedLoadIdentity,
+              hardwareDecoderRecoveryInvalidationGeneration == expectedInvalidationGeneration else {
+            return .unavailable
+        }
+        if isPaused || isBuffering || getFlagProperty("pause") == true
+            || getFlagProperty("paused-for-cache") == true {
+            return .playbackDeferred(decoder: refreshCurrentHardwareDecoder())
+        }
+        guard timelineHealthy else {
+            return .timelineUnhealthy(decoder: refreshCurrentHardwareDecoder())
+        }
+        let stableDecoder = refreshCurrentHardwareDecoder()
+        guard MPVForegroundVideoValidationPolicy.isHealthy(
+            decoder: stableDecoder,
+            allowsSoftwareDecoding: allowsSoftwareDecoding,
+            hasSelectedVideo: currentVideoTrackID() == expectedVideoTrackID,
+            presentedFreshFrame: presented
+        ) else { return .decoderUnavailable(current: stableDecoder) }
+        return .healthy(decoder: stableDecoder)
+    }
+
+    private func validateForegroundPlaybackTimeline(
+        loadIdentity: MPVLoadIdentityTracker.Identity,
+        invalidationGeneration: UInt64,
+        discontinuityGeneration: UInt64,
+        videoTrackID: Int,
+        audioTrackID: Int,
+        minimumObservationDuration: TimeInterval,
+        synchronizationTolerance: Double,
+        timeout: TimeInterval
+    ) async -> Bool {
+        guard timeout.isFinite, timeout > 0 else { return false }
+        let isCurrent = { [self] in
+            !Task.isCancelled && isRunning && !isStopping && currentURL != nil
+                && currentPrimaryLoadIdentity == loadIdentity
+                && hardwareDecoderRecoveryInvalidationGeneration == invalidationGeneration
+                && foregroundVideoTimelineDiscontinuityGeneration == discontinuityGeneration
+                && !isAwaitingPrimaryFileLoaded && !isPrimaryLoadSubmissionPending
+                && activeHardwareDecoderRecoveryEpoch == nil
+                && activeHardwareDecoderRecoveryTransitionID == nil
+                && !isPictureInPicturePrepared && !isPictureInPictureActive
+                && isPictureInPictureTrackOwnershipIdle
+                && pendingSingleSessionShutdown == nil && activePictureInPictureRestore == nil
+                && !isPaused && !isBuffering && !cachedSeeking
+                && getFlagProperty("pause") == false
+                && getFlagProperty("paused-for-cache") != true
+                && getFlagProperty("seeking") != true
+                && currentVideoTrackID() == videoTrackID
+                && currentAudioTrackID() == audioTrackID
+        }
+        var validation = MPVForegroundTimelineValidation(
+            minimumDuration: minimumObservationDuration,
+            synchronizationTolerance: synchronizationTolerance
+        )
+        let uptime = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
+        let deadline = uptime() + min(2, timeout)
+        while uptime() <= deadline {
+            guard isCurrent() else { return false }
+            let result = validation.observe(
+                uptime: uptime(),
+                videoPosition: getDoubleProperty("time-pos"),
+                audioPosition: getDoubleProperty("audio-pts"),
+                audioVideoDifference: getDoubleProperty("avsync"),
+                audioDelay: getDoubleProperty("audio-delay"),
+                hasSelectedAudio: audioTrackID >= 0
+            )
+            switch result {
+            case .unhealthy: return false
+            case .healthy:
+                guard await fencePrimaryVideoSelectionAsync() >= 0, isCurrent() else { return false }
+                return validation.observe(
+                    uptime: uptime(),
+                    videoPosition: getDoubleProperty("time-pos"),
+                    audioPosition: getDoubleProperty("audio-pts"),
+                    audioVideoDifference: getDoubleProperty("avsync"),
+                    audioDelay: getDoubleProperty("audio-delay"),
+                    hasSelectedAudio: audioTrackID >= 0
+                ) == .healthy
+            case .pending: break
+            }
+            do {
+                try await Task.sleep(nanoseconds: 25_000_000)
+            } catch { return false }
+        }
+        return false
     }
 
     private func finishForegroundVideoValidation(id: UInt64, presented: Bool) {
@@ -6480,7 +6586,18 @@ public final class MPVGPUPlayerRenderer {
             } else if isAwaitingPrimaryFileLoaded {
                 return
             }
+            let category = mpvGPUInlineDiagnosticCategory(message)
+            if category == .decodeError || category == .videoTimestampReset {
+                foregroundVideoTimelineDiscontinuityGeneration &+= 1
+            }
             onInlineHitchDiagnostic?(message)
+        case .videoTimelineDiscontinuity(let playlistEntryID):
+            if let playlistEntryID {
+                guard currentLoadIdentity(for: playlistEntryID) != nil else { return }
+            } else if isAwaitingPrimaryFileLoaded {
+                return
+            }
+            foregroundVideoTimelineDiscontinuityGeneration &+= 1
         case .asyncReply(let requestID, let error):
             pendingAsyncReplies.removeValue(forKey: requestID)?.complete(error)
         case .shutdown:

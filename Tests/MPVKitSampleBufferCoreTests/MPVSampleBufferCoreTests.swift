@@ -117,15 +117,18 @@ final class MPVForegroundVideoValidationPolicyTests: XCTestCase {
         ))
     }
 
-    func testDefaultHardwareValidationRetainsExistingBehavior() {
+    func testHardwareValidationRequiresSelectedVideoAndFreshPresentation() {
         for decoder in ["videotoolbox", " VideoToolbox-Copy "] {
-            XCTAssertTrue(MPVForegroundVideoValidationPolicy.canValidate(
+            XCTAssertFalse(MPVForegroundVideoValidationPolicy.canValidate(
                 decoder: decoder, allowsSoftwareDecoding: false, hasSelectedVideo: false
+            ))
+            XCTAssertTrue(MPVForegroundVideoValidationPolicy.canValidate(
+                decoder: decoder, allowsSoftwareDecoding: false, hasSelectedVideo: true
             ))
             XCTAssertTrue(MPVForegroundVideoValidationPolicy.isHealthy(
                 decoder: decoder,
                 allowsSoftwareDecoding: false,
-                hasSelectedVideo: false,
+                hasSelectedVideo: true,
                 presentedFreshFrame: true
             ))
             XCTAssertFalse(MPVForegroundVideoValidationPolicy.isHealthy(
@@ -135,6 +138,83 @@ final class MPVForegroundVideoValidationPolicyTests: XCTestCase {
                 presentedFreshFrame: false
             ))
         }
+    }
+}
+
+final class MPVForegroundTimelineValidationTests: XCTestCase {
+    private func sample(
+        _ validation: inout MPVForegroundTimelineValidation,
+        uptime: Double,
+        video: Double? = 10,
+        audio: Double? = 10,
+        difference: Double? = 0,
+        delay: Double? = 0,
+        hasAudio: Bool = true
+    ) -> MPVForegroundTimelineValidation.Result {
+        validation.observe(
+            uptime: uptime,
+            videoPosition: video,
+            audioPosition: audio,
+            audioVideoDifference: difference,
+            audioDelay: delay,
+            hasSelectedAudio: hasAudio
+        )
+    }
+
+    func testLoggedDesynchronizationIsRejectedInEitherDirection() {
+        for difference in [-7.413, -7.242, 7.247] {
+            var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+            XCTAssertEqual(sample(&validation, uptime: 1, difference: difference), .unhealthy)
+        }
+    }
+
+    func testMissingAndNonFiniteSelectedAudioTimingNeverProvesHealth() {
+        for invalid in [nil, Double.nan, Double.infinity, -Double.infinity] {
+            var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+            XCTAssertEqual(sample(&validation, uptime: 1, difference: invalid), .unhealthy)
+            XCTAssertEqual(sample(&validation, uptime: 1, audio: invalid), .unhealthy)
+            XCTAssertEqual(sample(&validation, uptime: 1, delay: invalid), .unhealthy)
+            XCTAssertEqual(sample(&validation, uptime: 1, video: invalid), .unhealthy)
+        }
+    }
+
+    func testRepeatedZeroSyncWithoutClockProgressDoesNotProveHealth() {
+        var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+        for uptime in [1.0, 1.1, 1.2, 1.3] {
+            XCTAssertEqual(sample(&validation, uptime: uptime), .pending)
+        }
+    }
+
+    func testBothSelectedClocksMustProgressAcrossTheObservationWindow() {
+        var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+        XCTAssertEqual(sample(&validation, uptime: 1), .pending)
+        XCTAssertEqual(sample(&validation, uptime: 1.1, video: 10.1, audio: 10.1), .pending)
+        XCTAssertEqual(sample(&validation, uptime: 1.3, video: 10.2, audio: 10.2), .healthy)
+        var frozenAudio = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+        XCTAssertEqual(sample(&frozenAudio, uptime: 1), .pending)
+        XCTAssertEqual(sample(&frozenAudio, uptime: 1.1, video: 10.1), .pending)
+        XCTAssertEqual(sample(&frozenAudio, uptime: 1.3, video: 10.2), .pending)
+    }
+
+    func testStaleZeroSyncCannotHideDivergedLiveClocks() {
+        var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+        XCTAssertEqual(sample(&validation, uptime: 1, video: 460.293, audio: 452.964), .unhealthy)
+    }
+
+    func testConfiguredDelayIsAppliedToRawClocksAndNotTwiceToNativeSync() {
+        for delay in [-2.0, 2.0] {
+            var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+            XCTAssertEqual(sample(&validation, uptime: 1, audio: 10 - delay, delay: delay), .pending)
+            XCTAssertEqual(sample(&validation, uptime: 1.1, video: 10.1, audio: 10.1 - delay, delay: delay), .pending)
+            XCTAssertEqual(sample(&validation, uptime: 1.3, video: 10.2, audio: 10.2 - delay, delay: delay), .healthy)
+        }
+    }
+
+    func testVideoOnlyRequiresProgressWithoutInventingAudioTiming() {
+        var validation = MPVForegroundTimelineValidation(minimumDuration: 0.2, synchronizationTolerance: 0.25)
+        XCTAssertEqual(sample(&validation, uptime: 1, audio: nil, difference: nil, delay: nil, hasAudio: false), .pending)
+        XCTAssertEqual(sample(&validation, uptime: 1.1, video: 10.1, audio: nil, difference: nil, delay: nil, hasAudio: false), .pending)
+        XCTAssertEqual(sample(&validation, uptime: 1.3, video: 10.2, audio: nil, difference: nil, delay: nil, hasAudio: false), .healthy)
     }
 }
 

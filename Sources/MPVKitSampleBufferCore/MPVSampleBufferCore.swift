@@ -590,12 +590,77 @@ public enum MPVPictureInPictureRenderSizePolicy {
     }
 }
 
+package struct MPVForegroundTimelineValidation {
+    package enum Result: Equatable {
+        case pending
+        case healthy
+        case unhealthy
+    }
+
+    private let minimumDuration: Double
+    private let synchronizationTolerance: Double
+    private var firstUptime: Double?
+    private var previousVideoPosition: Double?
+    private var previousAudioPosition: Double?
+    private var videoProgressSamples = 0
+    private var audioProgressSamples = 0
+
+    package init(minimumDuration: Double, synchronizationTolerance: Double) {
+        self.minimumDuration = minimumDuration
+        self.synchronizationTolerance = synchronizationTolerance
+    }
+
+    package mutating func observe(
+        uptime: Double,
+        videoPosition: Double?,
+        audioPosition: Double?,
+        audioVideoDifference: Double?,
+        audioDelay: Double?,
+        hasSelectedAudio: Bool
+    ) -> Result {
+        guard uptime.isFinite,
+              minimumDuration.isFinite, minimumDuration > 0,
+              synchronizationTolerance.isFinite, synchronizationTolerance > 0,
+              let videoPosition, videoPosition.isFinite else { return .unhealthy }
+        if hasSelectedAudio {
+            guard let audioPosition, audioPosition.isFinite,
+                  let audioVideoDifference, audioVideoDifference.isFinite,
+                  let audioDelay, audioDelay.isFinite,
+                  abs(audioVideoDifference) <= synchronizationTolerance,
+                  abs(audioPosition - videoPosition + audioDelay) <= synchronizationTolerance else {
+                return .unhealthy
+            }
+            if let previousAudioPosition {
+                guard audioPosition >= previousAudioPosition - synchronizationTolerance else { return .unhealthy }
+                if audioPosition > previousAudioPosition + 0.000_001 { audioProgressSamples += 1 }
+            } else {
+                audioProgressSamples = 1
+            }
+            previousAudioPosition = audioPosition
+        }
+        if let previousVideoPosition {
+            guard videoPosition >= previousVideoPosition - synchronizationTolerance else { return .unhealthy }
+            if videoPosition > previousVideoPosition + 0.000_001 { videoProgressSamples += 1 }
+        } else {
+            videoProgressSamples = 1
+        }
+        previousVideoPosition = videoPosition
+        if firstUptime == nil { firstUptime = uptime }
+        guard let firstUptime, uptime >= firstUptime else { return .unhealthy }
+        return uptime - firstUptime >= minimumDuration
+            && videoProgressSamples >= 3
+            && (!hasSelectedAudio || audioProgressSamples >= 3)
+            ? .healthy : .pending
+    }
+}
+
 package enum MPVForegroundVideoValidationPolicy {
     package static func canValidate(
         decoder: String,
         allowsSoftwareDecoding: Bool,
         hasSelectedVideo: Bool
     ) -> Bool {
+        guard hasSelectedVideo else { return false }
         if MPVVideoToolboxDecodePolicy.isEngaged(decoder) { return true }
         let normalized = decoder.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return allowsSoftwareDecoding && hasSelectedVideo && normalized == "no"
