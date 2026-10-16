@@ -118,7 +118,11 @@ public struct MPVMetalSampleBufferTrack: Equatable, Sendable {
     public let id: Int
     public let type: String
     public let title: String
+    public let sourceTitle: String
     public let language: String
+    public let isExternal: Bool
+    public let isDefault: Bool
+    public let isForced: Bool
     public let codec: String
     public let audioChannelLayout: String
     public let audioChannelCount: Int
@@ -4100,6 +4104,9 @@ public final class MPVMetalSampleBufferRenderer {
             var audioChannelLayout = ""
             var audioChannelCount = 0
             var selected = false
+            var external = false
+            var defaultTrack = false
+            var forced = false
             for entryIndex in 0..<Int(map.pointee.num) {
                 guard let keyPointer = map.pointee.keys[entryIndex] else { continue }
                 let key = String(cString: keyPointer)
@@ -4119,6 +4126,12 @@ public final class MPVMetalSampleBufferRenderer {
                     if value.format == MPV_FORMAT_STRING, let string = value.u.string { audioChannelLayout = String(cString: string) }
                 case "demux-channel-count":
                     if value.format == MPV_FORMAT_INT64 { audioChannelCount = Int(clamping: value.u.int64) }
+                case "external":
+                    if value.format == MPV_FORMAT_FLAG { external = value.u.flag != 0 }
+                case "default":
+                    if value.format == MPV_FORMAT_FLAG { defaultTrack = value.u.flag != 0 }
+                case "forced":
+                    if value.format == MPV_FORMAT_FLAG { forced = value.u.flag != 0 }
                 case "selected":
                     if value.format == MPV_FORMAT_FLAG { selected = value.u.flag != 0 }
                 default:
@@ -4130,7 +4143,11 @@ public final class MPVMetalSampleBufferRenderer {
                 id: id,
                 type: type,
                 title: title.isEmpty ? "Track \(id)" : title,
+                sourceTitle: title,
                 language: lang,
+                isExternal: external,
+                isDefault: defaultTrack,
+                isForced: forced,
                 codec: codec,
                 audioChannelLayout: audioChannelLayout,
                 audioChannelCount: audioChannelCount,
