@@ -1,0 +1,16 @@
+{
+  "mpv": {
+    "repository": "https://github.com/mpv-player/mpv.git",
+    "tag": "v0.41.0",
+    "commit": "41f6a645068483470267271e1d09966ca3b9f413"
+  },
+  "ffmpeg": {
+    "repository": "https://github.com/FFmpeg/FFmpeg.git",
+    "tag": "n8.1.2",
+    "commit": "38b88335f99e76ed89ff3c93f877fdefce736c13"
+  },
+  "architecture": "x86_64",
+  "toolchain": "MSYS2 UCRT64",
+  "runtimeLicense": "LGPL-3.0-or-later",
+  "dependencies": "MSYS2 signed packages; exact installed versions are recorded in every runtime manifest"
+}

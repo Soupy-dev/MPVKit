@@ -12,6 +12,101 @@ It includes scripts to build `mpv` native libraries.
 
 Forked from [kingslay/FFmpegKit](https://github.com/kingslay/FFmpegKit)
 
+## Windows
+
+`Windows/MPVKit.Windows` is the Windows x64 .NET 10 library. It uses a native
+child HWND, mpv `gpu-next`/libplacebo with Direct3D 11, D3D11VA decoding, and
+WASAPI audio. The Apple Swift package and renderers remain separate.
+
+The API includes local and HTTP(S) media, request headers, HLS/DASH through
+FFmpeg, exact seeks, rate/volume/mute, audio/video/subtitle selection, chapters,
+audio devices and filters, video filters, subtitle styling, and external
+subtitles with bounded prefetch and per-source headers. Metadata, track lists,
+position, buffering, errors, and generation-specific end state are available
+through immutable snapshots. Callbacks are coalesced onto the supplied
+`SynchronizationContext`, or the thread pool when no context is supplied.
+
+Hardware decoding is required by default. Unsupported video fails explicitly,
+including when mpv disables its video track after decoder initialization fails.
+`Preferred` and `Software` are explicit opt-ins; inspect the actual decoder in
+diagnostics. Rendering, decoding, output color, and audio format are reported
+separately. Scaling profiles select mpv's fast, balanced, or high-quality GPU
+configuration. HDR can follow the active output, tone-map to SDR, or require
+an active HDR display. The latter verifies the hosting monitor through DXGI
+Output6 as well as mpv's output target. Moving a host to another monitor should
+call `RefreshDisplayAsync()` after the move.
+
+`MpvVideoHost` creates the child HWND and can move that same surface into a
+resizable, topmost compact-overlay window. The media is never opened a second
+time for this transition. The host application owns its UI message loop,
+fullscreen policy, controls, remote commands, suspend/resume notifications,
+and window lifetime. `RecoverVideoAfterResumeAsync()` reconstructs the video
+decoder in the existing session and awaits a new native output frame; it does
+not reopen the URL. Native child-window airspace applies, so XAML controls must
+be arranged outside that HWND or placed in a separate host-owned overlay.
+
+### Build and run on Windows
+
+Install .NET 10 and an isolated, updated [MSYS2](https://www.msys2.org/)
+distribution with a root that contains no spaces. Run from a PowerShell prompt:
+
+```powershell
+./Windows/Build.ps1 -MsysRoot C:/Tools/msys64 -InstallDependencies
+./dist/windows-demo/MPVKit.Demo.exe
+```
+
+`-SelfContained` publishes the demo with its .NET runtime. For a managed-only
+rebuild after the native runtime exists, use `-SkipNative`. `-Dotnet` accepts a
+private SDK executable without changing the system installation.
+
+The build clones upstream mpv 0.41.0 and FFmpeg 8.1.2 at the commits in
+`Windows/native-lock.json`, builds both, verifies the selected FFmpeg dependency,
+and stages the native dependency closure. FFmpeg enables D3D11VA explicitly;
+no third-party mpv fork or downloaded libmpv binary is used. FFmpeg uses Windows
+Schannel for verified HTTPS and libxml2 for DASH manifests. Supporting libraries
+come from signed MSYS2 packages. Their exact versions and every shipped DLL's
+SHA-256 are recorded in `dist/windows-x64/runtime-manifest.json`. The native
+runtime is an LGPL build; preserve its accompanying dependency notices. Source
+and toolchain caches live in `.local`, and output lives in `dist`; keep both
+untracked. The Windows build workflow publishes build artifacts, and does not
+claim GPU playback validation on a hosted runner.
+
+The generated NuGet package contains the managed wrapper and transitive MSBuild
+targets. Supply `MpvKitRuntimeDirectory` pointing to the complete native runtime
+directory when building a consuming application. The targets copy its DLLs,
+manifest, and notices into `runtimes/win-x64/native` for build and publish. The
+player loads only from its explicit runtime directory; it does not search PATH
+for an arbitrary libmpv installation.
+
+```csharp
+var host = new MpvVideoHost(parentHwnd, widthInPixels, heightInPixels);
+await host.Player.Ready;
+host.Player.SnapshotChanged += (_, snapshot) => UpdateControls(snapshot);
+await host.Player.LoadAsync(new MpvMedia { Source = mediaUrl });
+await host.Player.PauseAsync();
+await host.Player.SeekAsync(120);
+host.ShowCompactOverlay();
+host.RestoreInline();
+await host.Player.DisposeAsync();
+host.Dispose();
+```
+
+Create, resize, reparent, restore, and destroy the host on its creating UI
+thread. Await player disposal before destroying either its HWND or its parent.
+`LoadAsync()` replaces the previous generation and waits for playback readiness;
+new loads supersede earlier loads, subtitle attachments, and decoder transitions.
+Loads have a configurable deadline; cancellation stops only the matching load.
+The event loop sleeps until signaled and uses no idle polling. Command queues,
+demuxer caches, subtitle downloads, decoded responses, and per-load external
+tracks have explicit bounds. Header values are not logged by default.
+
+Windows support is currently x64. Actual HDR display presentation, encoded
+audio passthrough, surround layouts, physical suspend/resume, other GPU/driver
+combinations, and long-run power behavior require their respective hardware
+checks. WASAPI shared/exclusive PCM and optional encoded passthrough do not
+establish Apple spatial-audio or Dolby Vision output parity. The compact
+overlay is a Windows window; it does not reproduce AVKit's system PiP API.
+
 ## About Metal support
 
 Metal support only a patch version ([#7857](https://github.com/mpv-player/mpv/pull/7857)) and does not officially support it yet. Encountering any issues is not strange. 

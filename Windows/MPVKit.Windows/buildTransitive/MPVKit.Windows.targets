@@ -1,0 +1,9 @@
+<Project>
+  <ItemGroup Condition="'$(MpvKitRuntimeDirectory)' != ''">
+    <Content Include="$(MpvKitRuntimeDirectory)\*.dll;$(MpvKitRuntimeDirectory)\runtime-manifest.json" Link="runtimes\win-x64\native\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="$(MpvKitRuntimeDirectory)\licenses\**\*" Link="runtimes\win-x64\native\licenses\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="ValidateMpvKitRuntime" BeforeTargets="PrepareForBuild" Condition="'$(MpvKitRuntimeDirectory)' != ''">
+    <Error Condition="!Exists('$(MpvKitRuntimeDirectory)\libmpv-2.dll')" Text="Build the Windows runtime first using Windows/Build-Runtime.ps1." />
+  </Target>
+</Project>

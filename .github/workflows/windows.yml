@@ -1,0 +1,41 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Windows/**'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'Windows/**'
+      - '.github/workflows/windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+      - name: Build native runtime and publish demo
+        shell: pwsh
+        run: ./Windows/Build.ps1 -MsysRoot '${{ steps.msys2.outputs.msys2-location }}' -InstallDependencies
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MPVKit-windows-x64
+          path: |
+            dist/windows-x64
+            dist/windows-demo
+            dist/windows-packages
+          if-no-files-found: error
